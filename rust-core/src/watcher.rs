@@ -231,10 +231,11 @@ impl FileManifest {
     pub fn from_existing_index(magento_root: &Path, indexed_paths: &std::collections::HashSet<String>) -> Self {
         let mut manifest = Self::new();
         // Walk the filesystem and record current mtimes for files we'd index
+        let ignore = Indexer::load_ignore_file(magento_root);
         let walker = WalkDir::new(magento_root)
             .follow_links(false)
             .into_iter()
-            .filter_entry(|e| !Indexer::should_skip_dir(e));
+            .filter_entry(|e| !Indexer::should_skip_entry(e, magento_root, &ignore));
 
         for entry in walker.flatten() {
             if !entry.file_type().is_file() {
@@ -284,10 +285,11 @@ impl FileManifest {
         let mut changes = ChangeSet::default();
         let mut seen = std::collections::HashSet::new();
 
+        let ignore = Indexer::load_ignore_file(magento_root);
         let walker = WalkDir::new(magento_root)
             .follow_links(false)
             .into_iter()
-            .filter_entry(|e| !Indexer::should_skip_dir(e));
+            .filter_entry(|e| !Indexer::should_skip_entry(e, magento_root, &ignore));
 
         for entry in walker.flatten() {
             if !entry.file_type().is_file() {
@@ -1096,6 +1098,31 @@ mod tests {
         assert!(changes.modified.is_empty());
         assert_eq!(changes.deleted.len(), 1);
         assert_eq!(changes.deleted[0], "gone.php");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_scans_skip_what_a_full_index_skips() {
+        // `discover_files` honours EXCLUDE_PATHS and .magectorignore; the resume and serve
+        // scans must too. Otherwise they index files a full index never saw (every Magento
+        // root has dev/tools/**/*.js) and `files_found - to_process.len()` underflows.
+        let dir = make_temp_dir();
+        let all = ["app/code/X/Y.php", "pub/static/a.js", "dev/tools/b.js", "vendor/bin/c.php", "custom/d.php"];
+        for rel in all {
+            let path = dir.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "// x").unwrap();
+        }
+        fs::write(dir.join(".magectorignore"), "# not indexed\ncustom\n").unwrap();
+
+        let changes = FileManifest::new().detect_changes(&dir).unwrap();
+        assert_eq!(rel_paths(&dir, &changes.added), vec!["app/code/X/Y.php"]);
+
+        let indexed: std::collections::HashSet<String> = all.iter().map(|p| p.to_string()).collect();
+        let manifest = FileManifest::from_existing_index(&dir, &indexed);
+        let tracked: Vec<String> = manifest.files.keys().cloned().collect();
+        assert_eq!(tracked, vec!["app/code/X/Y.php"]);
 
         let _ = fs::remove_dir_all(&dir);
     }

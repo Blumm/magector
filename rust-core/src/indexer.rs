@@ -697,16 +697,6 @@ impl Indexer {
         false
     }
 
-    /// Backwards-compatible check for external callers (watcher.rs).
-    /// Uses only built-in exclusions, no .magectorignore patterns.
-    pub(crate) fn should_skip_dir(entry: &walkdir::DirEntry) -> bool {
-        if entry.file_type().is_dir() {
-            let name = entry.file_name().to_string_lossy();
-            return EXCLUDE_DIRS.iter().any(|&d| name == *d);
-        }
-        false
-    }
-
     /// Load .magectorignore file from the project root.
     /// Returns a list of directory patterns to exclude.
     ///
@@ -716,24 +706,15 @@ impl Indexer {
     ///   - Trailing slashes are stripped
     ///   - Patterns without / match directory names anywhere
     ///   - Patterns with / match relative paths from project root
-    fn load_ignore_file(root: &Path) -> Vec<String> {
+    pub(crate) fn load_ignore_file(root: &Path) -> Vec<String> {
         let ignore_path = root.join(".magectorignore");
         match fs::read_to_string(&ignore_path) {
-            Ok(content) => {
-                let patterns: Vec<String> = content
-                    .lines()
-                    .map(|line| line.trim())
-                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                    .map(|line| line.trim_end_matches('/').to_string())
-                    .collect();
-                if !patterns.is_empty() {
-                    tracing::info!(
-                        "Loaded {} patterns from .magectorignore",
-                        patterns.len()
-                    );
-                }
-                patterns
-            }
+            Ok(content) => content
+                .lines()
+                .map(|line| line.trim())
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(|line| line.trim_end_matches('/').to_string())
+                .collect(),
             Err(_) => Vec::new(),
         }
     }
