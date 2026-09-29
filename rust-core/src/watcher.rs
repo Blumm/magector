@@ -108,8 +108,10 @@ struct FileManifestV1 {
     files: HashMap<String, FileRecordV1>,
 }
 
-/// Prefix of a v2 manifest file. A v1 file starts with a bincode varint map length
-/// followed by a path string, so it can never begin with these bytes.
+/// Prefix of a v2 manifest file. A v1 file starts with a bincode varint map length followed
+/// by a path string, so it could begin with these bytes only with exactly 77 entries and a
+/// 71-byte first path starting with `MF\x02` (no real path does); `load` would then read it
+/// as v2 and return None when that fails, as for a missing manifest.
 const MANIFEST_MAGIC: &[u8] = b"MGMF\x02";
 
 /// SHA-256 of a file's content; `None` when the file cannot be read.
@@ -162,6 +164,9 @@ impl FileManifest {
         let cfg = bincode::config::standard();
         if let Some(body) = data.strip_prefix(MANIFEST_MAGIC) {
             return bincode::serde::decode_from_slice(body, cfg).map(|(val, _)| val).ok();
+        }
+        if data.starts_with(&MANIFEST_MAGIC[..4]) {
+            return None; // a newer manifest version: rebuild rather than misread it
         }
         let (v1, _): (FileManifestV1, usize) = bincode::serde::decode_from_slice(&data, cfg).ok()?;
         Some(Self {
@@ -294,8 +299,8 @@ impl FileManifest {
                     if mtime != record.mtime || meta.len() != record.size {
                         // Stat changed. A checkout, `COPY` or `docker cp` rewrites the mtime
                         // of files whose content is identical — compare content first.
-                        match (record.sha256, file_sha256(path)) {
-                            (Some(old), Some(new)) if old == new => {
+                        match record.sha256 {
+                            Some(old) if file_sha256(path) == Some(old) => {
                                 changes.touched.push((relative.clone(), mtime, meta.len()));
                             }
                             _ => changes.modified.push(path.to_path_buf()),
@@ -780,6 +785,23 @@ mod tests {
     }
 
     #[test]
+    fn test_unknown_manifest_version_is_rejected() {
+        // `MGMF` + an unknown version byte is a newer format: rebuild, never misread it.
+        // The payload is deliberately also a well-formed v1 file (77 entries; the first has
+        // the 71-byte key `MF\x03` + zeros; every other field is zero), so only the explicit
+        // check stops `load` from returning a bogus manifest.
+        let mut bytes = b"MGMF\x03".to_vec();
+        bytes.resize(bytes.len() + 68 + 4 + 76 * 5, 0);
+
+        let dir = make_temp_dir();
+        let path = dir.join("index.manifest");
+        fs::write(&path, &bytes).unwrap();
+        assert!(FileManifest::load(&path).is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_lock_recover_from_poisoned_mutex() {
         // Reproduces Bug 2: a panic in another thread while holding the lock
         // poisons it. The watcher used to crash on `lock().unwrap()` and stop
@@ -956,6 +978,22 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_indexed_records_content_hash() {
+        let dir = make_temp_dir();
+        let php = dir.join("hashed.php");
+        fs::write(&php, "<?php echo 'hashed';").unwrap();
+
+        let mut manifest = FileManifest::new();
+        manifest.apply_indexed(&dir, &[("hashed.php".to_string(), vec![0])]);
+
+        let recorded = manifest.files["hashed.php"].sha256;
+        assert!(recorded.is_some(), "apply_indexed must record the content hash");
+        assert_eq!(recorded, file_sha256(&php));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_zero_entry_paths_excludes_indexed_files() {
         let root = PathBuf::from("/m");
         let chunk = vec![
@@ -1033,7 +1071,7 @@ mod tests {
             FileRecord {
                 mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1700000000),
                 size: 4096,
-                sha256: None,
+                sha256: Some([7u8; 32]),
                 vector_ids: vec![10, 11, 12],
             },
         );
@@ -1050,6 +1088,10 @@ mod tests {
         // Save
         manifest.save(&manifest_path).unwrap();
         assert!(manifest_path.exists());
+        assert!(
+            fs::read(&manifest_path).unwrap().starts_with(MANIFEST_MAGIC),
+            "saves write v2"
+        );
 
         // Load
         let loaded = FileManifest::load(&manifest_path).unwrap();
@@ -1057,10 +1099,12 @@ mod tests {
 
         let foo = loaded.files.get("app/code/Vendor/Module/Model/Foo.php").unwrap();
         assert_eq!(foo.size, 4096);
+        assert_eq!(foo.sha256, Some([7u8; 32]));
         assert_eq!(foo.vector_ids, vec![10, 11, 12]);
 
         let di = loaded.files.get("vendor/magento/module-catalog/etc/di.xml").unwrap();
         assert_eq!(di.size, 2048);
+        assert_eq!(di.sha256, None);
 
         let _ = fs::remove_dir_all(&dir);
     }
