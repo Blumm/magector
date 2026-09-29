@@ -448,16 +448,52 @@ All search tools return structured JSON:
 - `badges` -- role indicators: `plugin`, `controller`, `observer`, `repository`, `graphql-resolver`, `model`, `block`
 - `snippet` -- first 300 characters of indexed content for quick assessment
 
-### How DI and event results are resolved
+### How exact are the results?
 
-For a fully qualified class name, the DI and event tools (`find_plugin`, `find_preference`, `find_observer`, `find_di_wiring`, `trace_dependency`, `impact_analysis`, `find_event_flow`) answer from the configuration files themselves, the way Magento resolves them at runtime:
+Every answer is one of four kinds. The tables below say which kind each tool returns, and where it can
+return **less** than the codebase contains — the case to watch when you search for everything a change
+affects.
 
-- di.xml / events.xml are parsed as XML (comments ignored, self-closing elements handled); the DI area comes from the directory (`etc/<area>/di.xml`).
-- Plugins declared on parent classes and interfaces apply; a virtual type uses the plugins of its real class. A plugin's methods come from its declared type, the code that runs from the instantiated class (preference applied).
-- Declarations with the same name are merged in module load order (`app/etc/config.php`); the output shows the effective state, superseded declarations, declarations of disabled modules, and warns when the order between two modules is not fixed by `<sequence>` or composer `require` and matters.
-- Plugins that cannot run are marked: final class, `NoninterceptableInterface`, final / static / non-public / missing target method.
+| Kind | Meaning | Safe to conclude "nothing else"? |
+|------|---------|----------------------------------|
+| **Exact** | Structural, from the configuration / source files, resolved the way Magento resolves them at runtime | Yes, within the limits listed below |
+| **Superset (marked)** | Every declaration, including ones that do not take effect — each marked: *disabled*, *superseded*, *module disabled*, *does not run* (with the reason) | Yes — drop what is marked |
+| **Fuzzy** | Substring match on a short (non-namespaced) name; may include unrelated types | Yes, but filter the noise — pass a FQCN for an exact answer |
+| **Semantic** | Ranked candidates from the vector index | No — use them to find a starting point |
 
-A short class name keeps the fuzzy (substring) matching. The results are static analysis of the files — for a running installation, the object manager configuration read at runtime remains the reference (note that `bin/magento dev:di:info` lists plugins disabled with `disabled="true"` as active).
+#### DI and events (pass a fully qualified name)
+
+| Tool | Returns | Can return less when … |
+|------|---------|------------------------|
+| `magento_find_plugin` | *DI Plugin Registrations*: superset (marked) — declarations on the class, its parents and interfaces, the real class of a virtual type; *Effective state*: exact merge by plugin name in module load order; per plugin method: *does not run* when the target method is final / static / non-public / never intercepted / missing, the class is final or implements `NoninterceptableInterface`. First block: semantic | a parent or interface cannot be read (no PHP file); plugins are added at runtime without di.xml |
+| `magento_find_preference` | Exact: effective preference per area, superseded and ignored declarations, the class finally instantiated. Then semantic related files | `app/etc/config.php` is missing (load order is then approximated from `<sequence>`) |
+| `magento_find_observer` | Superset (marked): every declaration incl. ones that only disable or modify an observer, with area; *Effective state*: exact merge by observer name | — |
+| `magento_find_event_flow`, `magento_find_event_dispatchers` | Observers: as `find_observer`. Dispatchers: exact literal `dispatch('event')` calls | the event name is computed (`dispatch($prefix . '_save_after')`) |
+| `magento_trace_dependency`, `magento_find_di_wiring` | Exact: preferences, plugins (incl. inherited), virtual types resolving to the class (transitively), DI arguments that inject it (through virtual types, preferences, Factory, Proxy); plus the effective states above | the class is only type-hinted in a constructor without a di.xml argument (see `impact_analysis`) |
+| `magento_impact_analysis` | DI references: exact (as above); API exposure: exact (`webapi.xml` services incl. interface → preference, `schema.graphqls` resolvers); PHP files: exact FQCN occurrences + semantic candidates; runtime callers: constructor-typed properties | the class is reached through an untyped variable, `ObjectManager`, or a factory result stored in a local variable |
+| `magento_find_implementors` | Preferences: exact (FQCN) or fuzzy (short name); PHP implementors: superset — every class whose `implements` names the interface's short name | the class implements the interface only through a parent class or an extended interface |
+
+With a **short name** (no namespace) the DI tools fall back to fuzzy matching — useful for exploring,
+not for a complete impact list.
+
+Ambiguity is reported as a problem of the project, not of the tool: when two modules declare the same
+preference, plugin or observer, neither depends on the other (no `<sequence>`, no composer `require`)
+and swapping them changes the result, the outcome depends on incidental module order and can change
+with an update.
+
+#### Other structural answers
+
+| Tool | Returns | Can return less when … |
+|------|---------|------------------------|
+| `magento_find_table_usage` | Superset: every PHP file and `db_schema.xml` with the table name as a string literal (ResourceModel `_init`, `getTableName`, setup patches) + semantic | the table name is built dynamically |
+| `magento_find_controller` | Exact: `routes.xml` → module → controller class (admin routes under `Controller/Adminhtml`); then semantic | the route is registered by a custom router |
+| `magento_find_class` | A virtual type name resolves exactly to its di.xml declaration and real class; PHP classes: semantic + filesystem fallback | — |
+| `magento_trace_config` | system.xml definition and PHP readers (constant or literal path) | the path is concatenated at runtime |
+| `magento_grep`, `magento_ast_search` | Exact text / AST matches | — |
+
+The results are static analysis of the files. For a running installation, the object manager
+configuration read at runtime remains the reference — note that `bin/magento dev:di:info` lists plugins
+disabled with `disabled="true"` as active.
 
 ### Search Tools
 

@@ -195,6 +195,12 @@ async function main() {
       has: ['[global] → **`Acme\\Core\\Model\\DefaultPrice`**', '[graphql] → **`Acme\\Core\\Model\\GraphQlPrice`**'],
     });
 
+    t = await client.call('magento_find_implementors', { interfaceName: 'Acme\\Core\\Api\\FormatterInterface' });
+    check('find_implementors: preference in any attribute order, comments ignored', t, {
+      has: ['`Acme\\Core\\Api\\FormatterInterface` → `Acme\\Core\\Model\\Formatter`'],
+      hasNot: ['CommentedFormatter'],
+    });
+
     // ── Events ───────────────────────────────────────────────────
     t = await client.call('magento_find_observer', { eventName: 'acme_order_place_before' });
     check('find_observer: same-name declarations merged — re-declared observer stays disabled', t, {

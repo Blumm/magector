@@ -11,6 +11,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions corresp
 - **Ambiguous module order is reported.** When two modules declare the same preference, plugin or observer, neither depends on the other (no `<sequence>`, no composer `require`) and swapping them would change the result, the output warns that the outcome depends on incidental module order.
 - **Declarations of modules disabled in `app/etc/config.php`** are listed but marked as ignored.
 - **Interceptability.** `find_plugin` marks plugins that never run: final class, `Magento\Framework\ObjectManager\NoninterceptableInterface`, and per plugin method a final, static, non-public or never-intercepted target method (`__construct`, `_resetState`, …) or a method the class does not have.
+- **README: "How exact are the results?"** — per tool, whether the answer is exact, a marked superset, fuzzy or semantic, and when it can return less than the codebase contains.
 - `find_class` recognises a virtual type name and shows its di.xml declaration and the class it instantiates; `impact_analysis` lists API exposure (`webapi.xml` services, `schema.graphqls` resolvers) and the DI arguments that inject the class.
 
 ### Fixed
@@ -24,6 +25,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions corresp
 - **Observers:** declarations without `instance` (disabling or changing an observer) were dropped, area disables were not shown, and an observer class could be mapped to another module's file with the same short name. `find_event_flow` listed semantic neighbours as "dispatchers"; it now lists exact `dispatch('event')` calls. `find_event_dispatchers` counts only this event's observer declarations.
 - **`find_table_usage` missed the ResourceModel that owns the table** (`_init('table', …)`); PHP and `db_schema.xml` are also searched for the exact table name.
 - **`find_controller` returned nothing for admin routes** (the area filter compared `/adminhtml/` with `Controller/Adminhtml/`); routes are also resolved through `routes.xml` (frontName → module → controller class).
+- **`find_implementors` missed preferences whose attributes are in `type`/`for` order and counted commented-out ones**; it reads the parsed DI model.
 - **A relative `MAGENTO_ROOT` produced non-existent file paths** (the root segment was cut out). It is resolved to an absolute path at startup.
 
 ## [2.17.0] - 2026-09-29

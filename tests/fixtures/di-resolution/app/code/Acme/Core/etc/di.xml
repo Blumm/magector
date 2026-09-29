@@ -52,4 +52,7 @@
     <type name="Acme\Core\Model\NoIntercept">
         <plugin name="noninterceptable_plugin" type="Acme\Core\Plugin\GuardPlugin"/>
     </type>
+    <!-- attributes in type/for order, and a commented-out alternative -->
+    <preference type="Acme\Core\Model\Formatter" for="Acme\Core\Api\FormatterInterface"/>
+    <!-- <preference for="Acme\Core\Api\FormatterInterface" type="Acme\Core\Model\CommentedFormatter"/> -->
 </config>

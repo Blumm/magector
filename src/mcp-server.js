@@ -3886,21 +3886,15 @@ async function findImplementors(interfaceName) {
   };
 
   // 1. Search DI preferences for this interface
-  const diFiles = await glob('**/etc/**/di.xml', { cwd: root, absolute: true, nodir: true });
-  for (const diFile of diFiles) {
-    let content;
-    try { content = readFileSync(diFile, 'utf-8'); } catch { continue; }
-    const relativePath = diFile.replace(root + '/', '');
-
-    const prefRegex = /<preference\s+for="([^"]+)"\s+type="([^"]+)"\s*\/?>/g;
-    let m;
-    while ((m = prefRegex.exec(content)) !== null) {
-      const forClass = m[1];
-      if (forClass === interfaceName || forClass.endsWith('\\' + shortName) ||
-          forClass.toLowerCase() === interfaceName.toLowerCase()) {
-        result.diPreferences.push({ for: forClass, type: m[2], file: relativePath });
-      }
-    }
+  // Preferences from the parsed DI model (comments ignored, any attribute order). FQCN: exact;
+  // short name: every interface with that last segment.
+  const model = await getDiModel(root);
+  const wanted = normalizeClassName(interfaceName);
+  for (const p of model.preferences) {
+    const match = wanted.includes('\\')
+      ? p.for.toLowerCase() === wanted.toLowerCase()
+      : p.for === wanted || p.for.endsWith('\\' + shortName);
+    if (match) result.diPreferences.push({ for: p.for, type: p.type, file: p.file, area: p.area });
   }
 
   // 2. Grep PHP files for `implements ...InterfaceName`
