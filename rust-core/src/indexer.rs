@@ -216,8 +216,9 @@ impl Indexer {
     /// index.db nor the manifest. The caller saves index.db (if `stats.db_changed`),
     /// verifies it, and only then calls `save_manifest`: the manifest must never claim
     /// content that index.db on disk does not hold. (For the same reason a resume first
-    /// marks the paths it is about to change stale in the existing sidecar, so a run that
-    /// dies after a periodic save leaves no old hash claiming them.)
+    /// marks the paths it is about to change stale in the existing sidecar, and a full
+    /// rebuild removes it, so a run that dies after a periodic save leaves no old hash
+    /// claiming them.)
     pub fn index_with_options(&mut self, force: bool) -> Result<IndexStats> {
         let mut stats = IndexStats::default();
         self.pending_manifest = None;
@@ -412,6 +413,19 @@ impl Indexer {
 
             (to_process, skipped)
         } else {
+            // A full rebuild (--force, or no index yet) overwrites index.db through PHASE 2's
+            // periodic saves while an old sidecar keeps claiming every file. Remove it first:
+            // if the run dies, `index` rebuilds the sidecar from whatever index.db holds.
+            if let Some(ref mp) = manifest_path {
+                match fs::remove_file(mp) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => anyhow::bail!(
+                        "Could not remove {:?} ({}); not rebuilding index.db while it still claims the old content",
+                        mp, e
+                    ),
+                }
+            }
             (all_files, 0)
         };
 
