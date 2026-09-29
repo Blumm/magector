@@ -34,13 +34,22 @@ import {
 } from 'ruvector/dist/analysis/complexity.js';
 import { resolveBinary } from './binary.js';
 import { resolveModels } from './model.js';
+import {
+  buildDiModel, normalizeClassName, isVirtualType, resolveVirtualType, resolveInstance,
+  virtualTypesResolvingTo, argumentInjectionsOf, effectivePluginDeclarations, resolvePluginType,
+  parseEventsXml, parseXml, areaFromPath, createAncestorResolver,
+  buildModuleIndex, preferenceCascade, mergeNamedDeclarations, pluginDeclarationsOn,
+  createMemberResolver, interceptionStatus,
+} from './di-config.js';
 import { defaultDbPath, manifestPath, tempDbPathFor, swapInIndex } from './paths.js';
 import { createRequire } from 'module';
 const __pkg = createRequire(import.meta.url)('../package.json');
 
 const config = {
   dbPath: defaultDbPath(),
-  magentoRoot: process.env.MAGENTO_ROOT || process.cwd(),
+  // Absolute: file paths are derived by stripping `${magentoRoot}/` from glob results, which only
+  // works when the root is absolute (a relative MAGENTO_ROOT dropped its own path segment).
+  magentoRoot: path.resolve(process.env.MAGENTO_ROOT || process.cwd()),
   watchInterval: parseInt(process.env.MAGECTOR_WATCH_INTERVAL, 10) || 300,
   get rustBinary() { return resolveBinary(); },
   get modelCache() { return resolveModels() || process.env.MAGECTOR_MODELS || './models'; }
@@ -2400,6 +2409,9 @@ async function getDiXmlFiles(root) {
     let content = diXmlCache.files.get(absPath);
     if (content === undefined) {
       try { content = readFileSync(absPath, 'utf-8'); } catch { content = null; }
+      // Blank out XML comments (same length, newlines kept) so commented-out declarations are never
+      // matched by the regex-based scanners and offsets / line numbers stay valid.
+      if (content) content = content.replace(/<!--[\s\S]*?-->/g, m => m.replace(/[^\n]/g, ' '));
       diXmlCache.files.set(absPath, content);
     }
     if (content !== null) {
@@ -2407,6 +2419,247 @@ async function getDiXmlFiles(root) {
     }
   }
   return results;
+}
+
+// ─── Structural DI model ────────────────────────────────────────
+// Parsed once per di.xml file set (same lifetime as diXmlCache). See src/di-config.js.
+
+const diModelCache = { root: null, paths: null, model: null, ancestorsOf: null, membersOf: null };
+const psr4Cache = { root: null, prefixes: null };
+
+/**
+ * PSR-4 prefixes from vendor/composer/autoload_psr4.php, longest first. Resolves vendor classes
+ * regardless of the package name (magento/module-*, mage-os/module-*, third-party layouts).
+ */
+function getPsr4Prefixes(root) {
+  if (psr4Cache.root === root && psr4Cache.prefixes) return psr4Cache.prefixes;
+  const prefixes = [];
+  try {
+    const src = readFileSync(path.join(root, 'vendor', 'composer', 'autoload_psr4.php'), 'utf-8');
+    const entryRe = /'((?:[^'\\]|\\.)*)'\s*=>\s*array\s*\(([^)]*)\)/g;
+    let m;
+    while ((m = entryRe.exec(src)) !== null) {
+      const prefix = m[1].replace(/\\\\/g, '\\');
+      const dirs = [];
+      const dirRe = /\$(vendorDir|baseDir)\s*\.\s*'([^']*)'/g;
+      let d;
+      while ((d = dirRe.exec(m[2])) !== null) {
+        dirs.push(path.join(d[1] === 'vendorDir' ? path.join(root, 'vendor') : root, d[2]));
+      }
+      if (prefix && dirs.length) prefixes.push({ prefix, dirs });
+    }
+  } catch { /* no composer autoload map — fall back to path heuristics */ }
+  prefixes.sort((a, b) => b.prefix.length - a.prefix.length);
+  psr4Cache.root = root;
+  psr4Cache.prefixes = prefixes;
+  return prefixes;
+}
+
+/** PHP file of a class: composer PSR-4 map, then app/code, then findClassFile's heuristics. */
+function findClassFileFast(root, className) {
+  const fqcn = normalizeClassName(className);
+  if (!fqcn) return '';
+  for (const { prefix, dirs } of getPsr4Prefixes(root)) {
+    if (!fqcn.startsWith(prefix)) continue;
+    const rel = fqcn.slice(prefix.length).split('\\').join('/') + '.php';
+    for (const dir of dirs) {
+      const candidate = path.join(dir, rel);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  const appCode = path.join(root, 'app/code', fqcn.split('\\').join('/') + '.php');
+  if (existsSync(appCode)) return appCode;
+  return findClassFile(root, fqcn);
+}
+
+async function getDiModel(root) {
+  const files = await getDiXmlFiles(root);
+  if (diModelCache.root !== root || diModelCache.paths !== diXmlCache.paths || !diModelCache.model) {
+    diModelCache.root = root;
+    diModelCache.paths = diXmlCache.paths;
+    diModelCache.model = buildDiModel(files);
+    diModelCache.ancestorsOf = createAncestorResolver(fqcn => findClassFileFast(root, fqcn));
+    diModelCache.membersOf = createMemberResolver(fqcn => findClassFileFast(root, fqcn));
+  }
+  return diModelCache.model;
+}
+
+const moduleIndexCache = { root: null, idx: null };
+
+/** Modules, their load order (app/etc/config.php) and dependencies (<sequence>, composer require). */
+async function getModuleIndex(root) {
+  if (moduleIndexCache.root === root && moduleIndexCache.idx) return moduleIndexCache.idx;
+  let moduleXmls = [];
+  try {
+    const files = await glob('**/etc/module.xml', { cwd: root, nodir: true, ignore: ['**/dev/tests/**', '**/Test/**'] });
+    moduleXmls = files.map(rel => {
+      try { return { relPath: rel, content: readFileSync(path.join(root, rel), 'utf-8') }; } catch { return null; }
+    }).filter(Boolean);
+  } catch { /* no modules found */ }
+  let configPhp = null;
+  try { configPhp = readFileSync(path.join(root, 'app', 'etc', 'config.php'), 'utf-8'); } catch { /* not installed */ }
+  const composerJson = dir => {
+    try { return JSON.parse(readFileSync(path.join(root, dir, 'composer.json'), 'utf-8')); } catch { return null; }
+  };
+  moduleIndexCache.root = root;
+  moduleIndexCache.idx = buildModuleIndex(moduleXmls, configPhp, composerJson);
+  return moduleIndexCache.idx;
+}
+
+function declLabel(idx, d) {
+  const mod = idx.moduleOf(d.file);
+  return mod ? `${mod} (${d.file})` : d.file;
+}
+
+function ambiguityText(ambiguous, idx, what) {
+  let text = '';
+  const seen = new Set();
+  for (const { first, second } of ambiguous) {
+    const a = idx.moduleOf(first.file);
+    const b = idx.moduleOf(second.file);
+    const key = [a, b].sort().join('|') + what;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    text += `  ⚠ **Ambiguous order:** \`${a}\` and \`${b}\` both declare ${what}, and neither depends on the other ` +
+      `(no \`<sequence>\`, no composer \`require\`). The result depends on incidental module order ` +
+      `(${idx.orderSource}) and can change with an update — declare the dependency.\n`;
+  }
+  return text;
+}
+
+/**
+ * Effective state of named plugins on a class, the way Magento merges them: declarations on
+ * ancestors first, then the class; within a type by scope (global, then area) and module load order.
+ * Returns summary lines for plugins that are declared more than once, disabled, or come from a
+ * disabled module.
+ */
+async function pluginEffectiveSummary(root, className) {
+  const model = await getDiModel(root);
+  const idx = await getModuleIndex(root);
+  const ancestorsOf = await getAncestorResolver(root);
+  const target = normalizeClassName(className);
+  const real = isVirtualType(model, target) ? resolveVirtualType(model, target).real : target;
+  const levels = [real, ...ancestorsOf(real)].reverse();
+  const byName = new Map();
+  for (const type of levels) {
+    for (const d of pluginDeclarationsOn(model, type)) {
+      if (!byName.has(d.name)) byName.set(d.name, []);
+      byName.get(d.name).push({ ...d, level: levels.indexOf(type) });
+    }
+  }
+  let text = '';
+  for (const [name, decls] of byName) {
+    const areas = ['global', ...new Set(decls.map(d => d.area).filter(a => a !== 'global'))];
+    let prev = null;
+    for (const area of areas) {
+      // Merge level by level (ancestor declarations are overridden by the class's own)
+      let state = { instance: null, disabled: false, disabledBy: null, sortOrder: null, disabledModule: [], ambiguous: [], ordered: [] };
+      for (let lvl = 0; lvl < levels.length; lvl++) {
+        const atLevel = decls.filter(d => d.level === lvl);
+        if (!atLevel.length) continue;
+        const m = mergeNamedDeclarations(atLevel, idx, area, 'type');
+        if (m.instance) state.instance = m.instance;
+        const lastExplicit = [...m.ordered].reverse().find(d => d.disabledAttr !== null && d.disabledAttr !== undefined);
+        if (lastExplicit) { state.disabled = lastExplicit.disabledAttr; state.disabledBy = lastExplicit.disabledAttr ? lastExplicit : null; }
+        if (m.sortOrder !== null) state.sortOrder = m.sortOrder;
+        state.disabledModule.push(...m.disabledModule);
+        state.ambiguous.push(...m.ambiguous);
+        state.ordered.push(...m.ordered);
+      }
+      const interesting = decls.length > 1 || state.disabled || state.disabledModule.length || state.ambiguous.length;
+      if (!interesting || !state.ordered.length) continue;
+      const summary = `${state.instance || '(no type)'}|${state.disabled}`;
+      if (area !== 'global' && summary === prev) continue;
+      prev = area === 'global' ? summary : prev;
+      const status = state.disabled
+        ? `**disabled**${state.disabledBy ? ` by ${declLabel(idx, state.disabledBy)}` : ''}`
+        : 'active';
+      text += `- **${name}** [${area}]: \`${state.instance || '(no type)'}\` — ${status}` +
+        (state.sortOrder !== null ? `, sortOrder ${state.sortOrder}` : '') + '\n';
+      text += ambiguityText(state.ambiguous, idx, `plugin \`${name}\``);
+    }
+    const offMods = [...new Set(decls.filter(d => idx.isEnabled(idx.moduleOf(d.file)) === false).map(d => idx.moduleOf(d.file)))];
+    for (const mod of offMods) {
+      text += `- **${name}**: declaration in \`${mod}\` is ignored — module disabled in app/etc/config.php\n`;
+    }
+  }
+  return text;
+}
+
+async function classInterceptionNote(root, className) {
+  const target = normalizeClassName(className);
+  if (!target.includes('\\')) return '';
+  const model = await getDiModel(root);
+  const real = isVirtualType(model, target) ? resolveVirtualType(model, target).real : target;
+  const st = interceptionStatus(real, null, await getAncestorResolver(root), diModelCache.membersOf);
+  return st.interceptable === false ? `> ⛔ **No plugin on this class runs:** ${st.reason}.\n` : '';
+}
+
+/**
+ * Status lines for preferences of `forNames`: the effective one per area, superseded ones,
+ * declarations from disabled modules, and ambiguous orders.
+ */
+async function preferenceStatusText(root, forNames) {
+  const model = await getDiModel(root);
+  const idx = await getModuleIndex(root);
+  let text = '';
+  for (const forName of forNames) {
+    const decls = model.preferences.filter(p => p.for === forName);
+    if (!decls.length) continue;
+    const areas = ['global', ...new Set(decls.map(d => d.area).filter(a => a !== 'global'))];
+    for (const area of areas) {
+      const c = preferenceCascade(model, idx, forName, area);
+      if (!c.winner) continue;
+      if (area !== 'global' && c.winner.area === 'global') continue;
+      text += `- \`${forName}\` [${area}] → **\`${c.winner.type}\`** — ${declLabel(idx, c.winner)}\n`;
+      for (const sup of c.superseded.filter(x => x.area === area || area === 'global')) {
+        text += `  - superseded: \`${sup.type}\` — ${declLabel(idx, sup)}\n`;
+      }
+      text += ambiguityText(c.ambiguous, idx, `a preference for \`${forName}\``);
+      if (area === 'global') {
+        for (const off of c.disabledModule) {
+          text += `  - ignored (module disabled): \`${off.type}\` — ${declLabel(idx, off)}\n`;
+        }
+      }
+    }
+  }
+  return text;
+}
+
+/** Effective observers of an event per area (merged by observer name). */
+async function observerEffectiveText(root, observers) {
+  const idx = await getModuleIndex(root);
+  const byName = new Map();
+  for (const o of observers) {
+    if (!byName.has(o.name)) byName.set(o.name, []);
+    byName.get(o.name).push(o);
+  }
+  let text = '';
+  for (const [name, decls] of byName) {
+    const areas = ['global', ...new Set(decls.map(d => d.area).filter(a => a !== 'global'))];
+    let prev = null;
+    for (const area of areas) {
+      const m = mergeNamedDeclarations(decls, idx, area, 'instance');
+      const interesting = decls.length > 1 || m.disabled || m.disabledModule.length || m.ambiguous.length;
+      if (!interesting || !m.ordered.length) continue;
+      const summary = `${m.instance}|${m.disabled}`;
+      if (area !== 'global' && summary === prev) continue;
+      if (area === 'global') prev = summary;
+      const status = m.disabled ? `**disabled**${m.disabledBy ? ` by ${declLabel(idx, m.disabledBy)}` : ''}` : 'active';
+      text += `- **${name}** [${area}]: \`${m.instance || '(no instance)'}\` — ${status}\n`;
+      text += ambiguityText(m.ambiguous, idx, `observer \`${name}\``);
+    }
+    const offMods = [...new Set(decls.filter(d => idx.isEnabled(idx.moduleOf(d.file)) === false).map(d => idx.moduleOf(d.file)))];
+    for (const mod of offMods) {
+      text += `- **${name}**: declaration in \`${mod}\` is ignored — module disabled in app/etc/config.php\n`;
+    }
+  }
+  return text;
+}
+
+async function getAncestorResolver(root) {
+  await getDiModel(root);
+  return diModelCache.ancestorsOf;
 }
 
 // ─── DI Dependency Tracing ─────────────────────────────────────
@@ -2418,8 +2671,15 @@ async function getDiXmlFiles(root) {
 async function traceDependency(className, direction = 'both') {
   const root = config.magentoRoot;
   const diFiles = await getDiXmlFiles(root);
+  if (normalizeClassName(className).includes('\\')) {
+    return traceDependencyExact(normalizeClassName(className), direction, diFiles.length);
+  }
+  // Short name: fuzzy (substring) matching by design, on the parsed model (comments, self-closing
+  // elements and attribute order handled).
   const classLower = className.toLowerCase();
   const classShort = className.split('\\').pop().toLowerCase();
+  const hit = name => { const n = (name || '').toLowerCase(); return n.includes(classLower) || n.includes(classShort); };
+  const model = await getDiModel(root);
 
   const result = {
     className,
@@ -2431,122 +2691,213 @@ async function traceDependency(className, direction = 'both') {
     totalDiFiles: diFiles.length
   };
 
-  for (const { content, relPath: relativePath } of diFiles) {
+  if (direction === 'resolve' || direction === 'both') {
+    for (const p of model.preferences) {
+      if (hit(p.for)) result.preferences.push({ for: p.for, type: p.type, file: p.file });
+    }
+    for (const v of model.virtualTypes) {
+      if (hit(v.type)) result.virtualTypes.push({ name: v.name, type: v.type, file: v.file });
+    }
+  }
 
-    if (direction === 'resolve' || direction === 'both') {
-      // Find preferences: <preference for="ClassName" type="Implementation"/>
-      const prefRegex = /<preference\s+for="([^"]+)"\s+type="([^"]+)"\s*\/?>/g;
-      let match;
-      while ((match = prefRegex.exec(content)) !== null) {
-        const forClass = match[1];
-        if (forClass.toLowerCase().includes(classLower) || forClass.toLowerCase().includes(classShort)) {
-          result.preferences.push({
-            for: forClass,
-            type: match[2],
-            file: relativePath
-          });
-        }
+  if (direction === 'dependents' || direction === 'both') {
+    for (const t of model.types) {
+      if (!hit(t.name)) continue;
+      for (const pl of t.plugins) {
+        if (!pl.type) continue;
+        result.plugins.push({ target: t.name, pluginName: pl.name, pluginClass: pl.type, file: t.file });
       }
-
-      // Find virtualTypes: <virtualType name="..." type="ClassName"/>
-      const vtRegex = /<virtualType\s+name="([^"]+)"[^>]*type="([^"]+)"[^>]*\/?>/g;
-      while ((match = vtRegex.exec(content)) !== null) {
-        const vtType = match[2];
-        if (vtType.toLowerCase().includes(classLower) || vtType.toLowerCase().includes(classShort)) {
-          result.virtualTypes.push({
-            name: match[1],
-            type: vtType,
-            file: relativePath
-          });
-        }
+      for (const a of t.args) {
+        if (a.xsiType === 'array') continue;
+        result.argumentOverrides.push({ target: t.name, argumentName: a.name, argumentType: a.xsiType, value: a.value, file: t.file });
       }
     }
-
-    if (direction === 'dependents' || direction === 'both') {
-      // Find plugins targeting this class: <type name="ClassName"><plugin ... type="PluginClass"/></type>
-      const typeBlockRegex = /<type\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/type>/g;
-      let typeMatch;
-      while ((typeMatch = typeBlockRegex.exec(content)) !== null) {
-        const typeName = typeMatch[1];
-        const typeBlock = typeMatch[2];
-        if (typeName.toLowerCase().includes(classLower) || typeName.toLowerCase().includes(classShort)) {
-          const pluginRegex = /<plugin\s+name="([^"]+)"[^>]*type="([^"]+)"[^>]*\/?>/g;
-          let pMatch;
-          while ((pMatch = pluginRegex.exec(typeBlock)) !== null) {
-            result.plugins.push({
-              target: typeName,
-              pluginName: pMatch[1],
-              pluginClass: pMatch[2],
-              file: relativePath
-            });
-          }
-
-          // Find argument overrides
-          const argRegex = /<argument\s+name="([^"]+)"[^>]*xsi:type="([^"]+)"[^>]*>([^<]*)<\/argument>/g;
-          let aMatch;
-          while ((aMatch = argRegex.exec(typeBlock)) !== null) {
-            result.argumentOverrides.push({
-              target: typeName,
-              argumentName: aMatch[1],
-              argumentType: aMatch[2],
-              value: aMatch[3].trim().slice(0, 200),
-              file: relativePath
-            });
-          }
-        }
-      }
-
-      // Find argument injections: className used as an argument VALUE in any <type> or <virtualType> block.
-      // Catches cases where an interface is injected via constructor argument, e.g.:
-      //   <virtualType name="SomeVT" type="SomeClass">
-      //     <argument name="validator" xsi:type="object">My\Interface</argument>
-      //   </virtualType>
-      const allBlockRegex = /<(?:type|virtualType)\s+name="([^"]+)"[^>]*(?:type="([^"]+)")?[^>]*>([\s\S]*?)<\/(?:type|virtualType)>/g;
-      let blockMatch;
-      while ((blockMatch = allBlockRegex.exec(content)) !== null) {
-        const blockName = blockMatch[1];
-        const blockType = blockMatch[2] || null;
-        const blockBody = blockMatch[3];
-        // Skip if this block IS the target (already covered above)
-        if (blockName.toLowerCase().includes(classLower)) continue;
-
-        // Search argument values for the className
-        const objArgRegex = /<argument\s+name="([^"]+)"[^>]*xsi:type="object"[^>]*>([^<]*)<\/argument>/g;
-        let oMatch;
-        while ((oMatch = objArgRegex.exec(blockBody)) !== null) {
-          const argValue = oMatch[2].trim();
-          if (argValue.toLowerCase().includes(classLower) || argValue.toLowerCase().includes(classShort)) {
-            result.argumentInjections.push({
-              injectedAs: argValue,
-              intoBlock: blockName,
-              blockType: blockType,
-              argumentName: oMatch[1],
-              file: relativePath
-            });
-          }
-        }
-
-        // Also check <item> values inside array arguments
-        const itemRegex = /<item\s+name="([^"]+)"[^>]*xsi:type="object"[^>]*>([^<]*)<\/item>/g;
-        let iMatch;
-        while ((iMatch = itemRegex.exec(blockBody)) !== null) {
-          const itemValue = iMatch[2].trim();
-          if (itemValue.toLowerCase().includes(classLower) || itemValue.toLowerCase().includes(classShort)) {
-            result.argumentInjections.push({
-              injectedAs: itemValue,
-              intoBlock: blockName,
-              blockType: blockType,
-              argumentName: iMatch[1],
-              isArrayItem: true,
-              file: relativePath
-            });
-          }
-        }
+    for (const owner of [...model.types.map(t => ({ ...t, kind: 'type' })), ...model.virtualTypes.map(v => ({ ...v, kind: 'virtualType' }))]) {
+      if (owner.name.toLowerCase().includes(classLower)) continue;
+      for (const ref of owner.objectRefs) {
+        if (!hit(ref.value)) continue;
+        result.argumentInjections.push({
+          injectedAs: ref.value, intoBlock: owner.name, blockType: owner.kind === 'virtualType' ? owner.type : null,
+          argumentName: ref.path, isArrayItem: ref.path.includes('.'), file: owner.file
+        });
       }
     }
   }
 
   return result;
+}
+
+/**
+ * traceDependency for a fully qualified name: exact matches, resolved the way Magento resolves them
+ * — plugins inherited from parents and interfaces, virtual types followed transitively, DI arguments
+ * resolved through virtual types, preferences, Factory and Proxy.
+ */
+async function traceDependencyExact(className, direction, totalDiFiles) {
+  const root = config.magentoRoot;
+  const model = await getDiModel(root);
+  const result = {
+    className,
+    preferences: [],
+    plugins: [],
+    virtualTypes: [],
+    argumentOverrides: [],
+    argumentInjections: [],
+    totalDiFiles,
+    exact: true
+  };
+
+  if (direction === 'resolve' || direction === 'both') {
+    for (const p of model.preferences) {
+      if (p.for === className || p.type === className) {
+        result.preferences.push({ for: p.for, type: p.type, file: p.file, area: p.area });
+      }
+    }
+    for (const v of virtualTypesResolvingTo(model, className)) {
+      result.virtualTypes.push({ name: v.name, type: v.type, file: v.file, area: v.area, chain: v.chain });
+    }
+  }
+
+  if (direction === 'dependents' || direction === 'both') {
+    const eff = effectivePluginDeclarations(model, className, await getAncestorResolver(root));
+    for (const d of eff.declarations) {
+      result.plugins.push({
+        target: d.target, pluginName: d.name, pluginClass: d.type, file: d.file, area: d.area,
+        disabled: d.disabled, inheritedFrom: d.inheritedFrom || null, onVirtualType: !!d.onVirtualType
+      });
+    }
+    for (const t of [...model.types, ...model.virtualTypes]) {
+      if (t.name !== className) continue;
+      for (const a of t.args) {
+        result.argumentOverrides.push({
+          target: t.name, argumentName: a.name, argumentType: a.xsiType,
+          value: a.items.length ? `[${a.items.length} items]` : a.value, file: t.file
+        });
+      }
+    }
+    for (const inj of argumentInjectionsOf(model, className)) {
+      if (inj.owner === className) continue;
+      const ownerDecl = inj.ownerKind === 'virtualType' ? model.virtualByName.get(inj.owner)?.[0] : null;
+      result.argumentInjections.push({
+        injectedAs: inj.value,
+        intoBlock: inj.owner,
+        blockType: ownerDecl ? ownerDecl.type : null,
+        argumentName: inj.argument,
+        isArrayItem: inj.argument.includes('.'),
+        chain: inj.chain,
+        via: inj.via,
+        file: inj.file,
+        area: inj.area
+      });
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Plugin declarations for find_plugin / batch: structural, with the plugin type resolved
+ * (virtual type → base class for the methods, preference → the class that runs).
+ */
+async function collectPluginRegistrations(targetClass, targetMethod) {
+  // If targetClass provided, also read di.xml declarations (structural model, session cache).
+  // FQCN: plugins declared on the class, its parents and interfaces, and — for a virtual type —
+  // on its real class. Short name: declarations on any type whose last segment or a namespace
+  // segment matches (sub-namespace search).
+  let diRegistrations = [];
+  let virtualOf = null;
+  if (targetClass) {
+    const fpRoot = config.magentoRoot;
+    const model = await getDiModel(fpRoot);
+    const normalizedTarget = normalizeClassName(targetClass);
+    if (normalizedTarget.includes('\\')) {
+      const eff = effectivePluginDeclarations(model, normalizedTarget, await getAncestorResolver(fpRoot));
+      if (eff.virtual) virtualOf = eff.real;
+      for (const d of eff.declarations) {
+        diRegistrations.push({
+          target: d.target,
+          pluginName: d.name,
+          pluginClass: d.type,
+          disabled: d.disabled,
+          sortOrder: d.sortOrder,
+          isSubNamespace: false,
+          inheritedFrom: d.inheritedFrom || null,
+          onVirtualType: !!d.onVirtualType,
+          area: d.area,
+          file: d.file
+        });
+      }
+    } else {
+      const shortTarget = normalizedTarget.toLowerCase();
+      for (const t of [...model.types, ...model.virtualTypes]) {
+        const typeSegments = t.name.split('\\').map(seg => seg.toLowerCase());
+        const isExactMatch = typeSegments[typeSegments.length - 1] === shortTarget;
+        const isSubNamespace = !isExactMatch && typeSegments.includes(shortTarget);
+        if (!isExactMatch && !isSubNamespace) continue;
+        for (const pl of t.plugins) {
+          diRegistrations.push({
+            target: t.name,
+            pluginName: pl.name,
+            pluginClass: pl.type,
+            disabled: pl.disabled,
+            sortOrder: pl.sortOrder,
+            isSubNamespace,
+            area: t.area,
+            file: t.file
+          });
+        }
+      }
+    }
+  }
+
+  // Resolve plugin methods + method bodies for DI registrations. Magento registers a plugin's
+  // before/after/around methods from the declared type (a virtual type → its base class) and
+  // creates the instance through the object manager (a preference on the plugin type applies),
+  // so the listed methods and the code that runs can come from different classes.
+  const fpRoot2 = targetClass ? config.magentoRoot : null;
+  const fpModel = fpRoot2 ? await getDiModel(fpRoot2) : null;
+  for (const reg of diRegistrations) {
+    if (reg.pluginClass && fpRoot2) {
+      const rp = resolvePluginType(fpModel, reg.pluginClass);
+      if (rp.methodsFrom !== rp.declared) reg.virtualOf = rp.methodsFrom;
+      if (rp.runs !== rp.methodsFrom) reg.runs = rp.runs;
+      const methodsFile = findClassFileFast(fpRoot2, rp.methodsFrom);
+      const runsFile = reg.runs ? findClassFileFast(fpRoot2, rp.runs) : methodsFile;
+      if (methodsFile) {
+        reg.methods = extractPluginMethods(methodsFile);
+        reg.resolvedFile = (runsFile || methodsFile).replace(fpRoot2 + '/', '');
+        // Read method bodies — for exact matches, filter by targetMethod to reduce bloat
+        // For sub-namespace matches, read ALL bodies (intercepted method name may differ)
+        const methodsToRead = (targetMethod && !reg.isSubNamespace)
+          ? reg.methods.filter(m => m.targetMethod === targetMethod)
+          : reg.methods;
+        for (const m of methodsToRead) {
+          const body = (runsFile && readFullMethodBody(runsFile, m.name)) || readFullMethodBody(methodsFile, m.name);
+          if (body) m.body = body;
+        }
+      }
+    }
+  }
+
+  // Interceptability of the target: final class / NoninterceptableInterface, and per plugin
+  // method whether the intercepted method exists and is public, non-static, non-final.
+  let classStatus = null;
+  if (targetClass && normalizeClassName(targetClass).includes('\\')) {
+    const root = config.magentoRoot;
+    const model = await getDiModel(root);
+    const target = normalizeClassName(targetClass);
+    const real = isVirtualType(model, target) ? resolveVirtualType(model, target).real : target;
+    const ancestorsOf = await getAncestorResolver(root);
+    const membersOf = diModelCache.membersOf;
+    classStatus = interceptionStatus(real, null, ancestorsOf, membersOf);
+    for (const reg of diRegistrations) {
+      for (const m of reg.methods || []) {
+        const st = interceptionStatus(real, m.targetMethod, ancestorsOf, membersOf);
+        if (st.interceptable === false) m.notIntercepted = st.reason;
+      }
+    }
+  }
+
+  return { diRegistrations, virtualOf, classStatus };
 }
 
 // ─── Error Message Parser ─────────────────────────────────────
@@ -3135,14 +3486,39 @@ async function analyzeImpact(className) {
     } catch {}
   }
 
+  // Exact: PHP files that mention the fully qualified name (use statements, type hints, ::class),
+  // so direct consumers are found without — or beyond — the vector index.
+  if (root && normalizeClassName(className).includes('\\')) {
+    const known = new Set(relatedPaths.map(r => r.path));
+    for (const hit of grepFixedFiles(root, normalizeClassName(className), '*.php')) {
+      if (!known.has(hit)) { relatedPaths.push({ path: hit, className: path.basename(hit, '.php'), score: 0.4, exact: true }); known.add(hit); }
+    }
+  }
+
   // Check DI references via xml parsing
   const diTrace = await traceDependency(className, 'both');
   references.diXmlReferences = [
     ...diTrace.preferences.map(p => ({ type: 'preference', file: p.file, detail: `${p.for} → ${p.type}` })),
-    ...diTrace.plugins.map(p => ({ type: 'plugin', file: p.file, detail: `${p.pluginName}: ${p.pluginClass}` })),
-    ...diTrace.virtualTypes.map(v => ({ type: 'virtualType', file: v.file, detail: `${v.name} extends ${v.type}` })),
-    ...diTrace.argumentOverrides.map(a => ({ type: 'argument', file: a.file, detail: `${a.target}.${a.argumentName}` }))
+    ...diTrace.plugins.map(p => ({
+      type: 'plugin', file: p.file,
+      detail: `${p.pluginName}: ${p.pluginClass || '(no type)'}` +
+        (p.inheritedFrom ? ` (declared on ${p.inheritedFrom})` : '') +
+        (p.disabled ? ' [DISABLED]' : '') +
+        (p.onVirtualType ? ' (declared on the virtual type — does not run)' : '')
+    })),
+    ...diTrace.virtualTypes.map(v => ({
+      type: 'virtualType', file: v.file,
+      detail: `${v.name} extends ${v.type}` + (v.chain && v.chain.length > 2 ? ` (via ${v.chain.slice(1, -1).join(' → ')})` : '')
+    })),
+    ...diTrace.argumentOverrides.map(a => ({ type: 'argument', file: a.file, detail: `${a.target}.${a.argumentName}` })),
+    ...(diTrace.argumentInjections || []).map(a => ({
+      type: 'injected-into', file: a.file,
+      detail: `${a.intoBlock}.${a.argumentName} = ${a.injectedAs}` +
+        (a.via ? ` [${a.via}]` : '') +
+        (a.chain ? ` (→ ${a.chain.slice(1).join(' → ')})` : '')
+    }))
   ];
+  references.apiReferences = await findApiReferences(root, className);
   // Also find where this class is used AS a plugin/preference/virtualType implementation
   if (references.diXmlReferences.length === 0 && root) {
     const diFiles = await getDiXmlFiles(root);
@@ -3173,7 +3549,7 @@ async function analyzeImpact(className) {
 
   // Check PHP files for direct references
   const escapedShort = shortName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  for (const r of relatedPaths.slice(0, 40)) {
+  for (const r of [...relatedPaths.filter(x => x.exact), ...relatedPaths.filter(x => !x.exact).slice(0, 40)]) {
     const absPath = path.join(root, r.path);
     if (!existsSync(absPath) || !r.path.endsWith('.php')) continue;
     let content;
@@ -3218,12 +3594,161 @@ async function analyzeImpact(className) {
 
   references.total = references.useStatements.length + references.diXmlReferences.length +
                      references.instantiations.length + references.typeHints.length +
-                     references.runtimeCallers.length;
+                     references.runtimeCallers.length + references.apiReferences.length;
 
   return references;
 }
 
+/**
+ * Where a class is exposed as an API: webapi.xml services (the class itself, or an interface whose
+ * preference resolves to it) and schema.graphqls resolvers.
+ */
+const apiFilesCache = { root: null, webapi: [], graphql: [] };
+
+async function findApiReferences(root, className) {
+  const target = normalizeClassName(className);
+  const out = [];
+  if (!root || !target.includes('\\')) return out;
+  const model = await getDiModel(root);
+  if (apiFilesCache.root !== root) {
+    try {
+      apiFilesCache.webapi = await glob('**/etc/webapi.xml', { cwd: root, absolute: true, nodir: true });
+      apiFilesCache.graphql = await glob('**/etc/*.graphqls', { cwd: root, absolute: true, nodir: true });
+      apiFilesCache.root = root;
+    } catch { return out; }
+  }
+  const webapiFiles = apiFilesCache.webapi;
+  const graphqlFiles = apiFilesCache.graphql;
+  for (const file of webapiFiles) {
+    let content;
+    try { content = readFileSync(file, 'utf-8'); } catch { continue; }
+    if (!content.includes(target.split('\\').pop()) && !content.includes('Interface')) continue;
+    const rel = file.replace(root + '/', '');
+    const doc = parseXml(content);
+    const routes = (doc.children.find(c => c.name === 'routes') || doc).children.filter(c => c.name === 'route');
+    for (const route of routes) {
+      const service = route.children.find(c => c.name === 'service');
+      if (!service) continue;
+      const serviceClass = normalizeClassName(service.attrs.class);
+      const resolved = resolveInstance(model, serviceClass).real;
+      if (serviceClass === target || resolved === target) {
+        out.push({
+          type: 'webapi', file: rel,
+          detail: `${route.attrs.method || ''} ${route.attrs.url || ''} → ${serviceClass}::${service.attrs.method || ''}` +
+            (serviceClass !== target ? ` (preference → ${target})` : '')
+        });
+      }
+    }
+  }
+  for (const file of graphqlFiles) {
+    let content;
+    try { content = readFileSync(file, 'utf-8'); } catch { continue; }
+    if (!content.includes(target.split('\\').pop())) continue;
+    const rel = file.replace(root + '/', '');
+    const lines = content.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const re = /@resolver\s*\(\s*class\s*:\s*"([^"]+)"/g;
+      let m;
+      while ((m = re.exec(lines[i])) !== null) {
+        if (normalizeClassName(m[1]) === target) {
+          const field = (/^\s*(\w+)\s*[(:]/.exec(lines[i]) || [])[1] || '';
+          out.push({ type: 'graphql', file: rel, detail: `${field ? `field ${field} ` : ''}(line ${i + 1}) → ${target}` });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Resolve `frontName/controller/action` through routes.xml: router `admin` → adminhtml
+ * (Controller/Adminhtml/…), `standard` → frontend. Underscores map to sub-directories.
+ */
+async function resolveControllerRoute(root, route, area) {
+  const out = [];
+  const parts = String(route || '').split('/').filter(Boolean);
+  if (!root || !parts.length) return out;
+  const [frontName, ctrl = 'index', action = 'index'] = parts;
+  const camel = seg => seg.split('_').map(p => p.charAt(0).toUpperCase() + p.slice(1)).join('/');
+  let files = [];
+  try { files = await glob('**/etc/{adminhtml,frontend}/routes.xml', { cwd: root, nodir: true }); } catch { return out; }
+  const idx = await getModuleIndex(root);
+  for (const rel of files) {
+    const fileArea = areaFromPath(rel);
+    if (area && fileArea !== area) continue;
+    let content;
+    try { content = readFileSync(path.join(root, rel), 'utf-8'); } catch { continue; }
+    if (!content.includes(frontName)) continue;
+    const doc = parseXml(content);
+    const configNode = doc.children.find(c => c.name === 'config') || doc;
+    for (const router of configNode.children.filter(c => c.name === 'router')) {
+      for (const r of router.children.filter(c => c.name === 'route' && c.attrs.frontName === frontName)) {
+        for (const m of r.children.filter(c => c.name === 'module' && c.attrs.name)) {
+          const moduleName = m.attrs.name;
+          const [vendor, mod] = moduleName.split('_');
+          const isAdmin = router.attrs.id === 'admin';
+          const className = `${vendor}\\${mod}\\Controller\\${isAdmin ? 'Adminhtml\\' : ''}${camel(ctrl).replace(/\//g, '\\')}\\${camel(action).replace(/\//g, '\\')}`;
+          const moduleDir = idx.modules.get(moduleName)?.dir;
+          let file = moduleDir
+            ? path.join(root, moduleDir, 'Controller', ...(isAdmin ? ['Adminhtml'] : []), ...camel(ctrl).split('/'), ...camel(action).split('/')) + '.php'
+            : '';
+          if (!file || !existsSync(file)) file = findClassFileFast(root, className);
+          out.push({
+            area: isAdmin ? 'adminhtml' : fileArea, frontName, module: moduleName, className,
+            path: file && existsSync(file) ? file.replace(root + '/', '') : '', routesFile: rel
+          });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/** Files containing the fixed string `needle` (grep -F), relative to root. */
+function grepFixedFiles(root, needle, include) {
+  if (!root || !needle) return [];
+  let out = '';
+  try {
+    out = execFileSync('grep', [
+      '-rlF', needle, `--include=${include}`,
+      '--exclude-dir=node_modules', '--exclude-dir=.git', '--exclude-dir=generated',
+      '--exclude-dir=var', '--exclude-dir=pub', '--exclude-dir=.magector', '.'
+    ], { cwd: root, encoding: 'utf-8', maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
+  } catch (e) {
+    out = typeof e.stdout === 'string' ? e.stdout : '';
+  }
+  return out.split('\n').filter(Boolean).slice(0, 200).map(l => l.replace(/^\.\//, ''));
+}
+
+/**
+ * Files containing `name` as a quoted string literal ('name' or "name"), with the first matching line.
+ * Uses grep for speed; returns [] when grep is unavailable.
+ */
+function grepLiteralFiles(root, name, include) {
+  if (!root || !/^[\w.-]+$/.test(name)) return [];
+  let out = '';
+  try {
+    out = execFileSync('grep', [
+      '-rnE', '-m', '1', `['"]${name.replace(/\./g, '\\.')}['"]`, `--include=${include}`,
+      '--exclude-dir=node_modules', '--exclude-dir=.git', '--exclude-dir=generated',
+      '--exclude-dir=var', '--exclude-dir=pub', '--exclude-dir=.magector', '.'
+    ], { cwd: root, encoding: 'utf-8', maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
+  } catch (e) {
+    out = typeof e.stdout === 'string' ? e.stdout : '';   // exit 1 = no match
+  }
+  return out.split('\n').filter(Boolean).slice(0, 200).map(l => {
+    const m = /^\.\/(.+?):(\d+):(.*)$/.exec(l);
+    return m ? { path: m[1], lineNo: Number(m[2]), line: m[3].trim().slice(0, 200) } : null;
+  }).filter(Boolean);
+}
+
 // ─── Event Flow Tracing ─────────────────────────────────────────
+
+function formatObserverLine(obs) {
+  const target = obs.instance ? `\`${obs.instance}::${obs.method}()\`` : '_(no instance — changes the declaration of the same name)_';
+  const tags = (obs.area && obs.area !== 'global' ? ` [${obs.area}]` : '') + (obs.disabled ? ' **[DISABLED]**' : '');
+  return `- **${obs.name}** → ${target}${tags} (${obs.file})\n`;
+}
 
 async function traceEventFlow(eventName) {
   const root = config.magentoRoot;
@@ -3235,64 +3760,44 @@ async function traceEventFlow(eventName) {
     observerDetails: []
   };
 
-  // 1. Parse all events.xml for observer declarations
+  // 1. Parse all events.xml for observer declarations — every declaration, including the ones that
+  // only disable or modify an observer declared elsewhere (no `instance`), with the DI area.
   const eventsFiles = await glob('**/etc/**/events.xml', { cwd: root, absolute: true, nodir: true });
-  const escapedEvent = eventName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
   for (const file of eventsFiles) {
     let content;
     try { content = readFileSync(file, 'utf-8'); } catch { continue; }
+    if (!content.includes(eventName)) continue;
     const relativePath = file.replace(root + '/', '');
-
-    const eventBlockRegex = new RegExp(`<event\\s+name="${escapedEvent}"[^>]*>([\\s\\S]*?)<\\/event>`, 'g');
-    let eventMatch;
-    while ((eventMatch = eventBlockRegex.exec(content)) !== null) {
-      const block = eventMatch[1];
-      const obsRegex = /<observer\s+[^>]*name="([^"]+)"[^>]*instance="([^"]+)"[^>]*(?:method="([^"]+)")?[^>]*\/?>/g;
-      let obsMatch;
-      while ((obsMatch = obsRegex.exec(block)) !== null) {
-        result.observers.push({
-          name: obsMatch[1],
-          instance: obsMatch[2],
-          method: obsMatch[3] || 'execute',
-          file: relativePath
-        });
-      }
+    for (const obs of parseEventsXml(content, relativePath, eventName)) {
+      result.observers.push(obs);
     }
   }
 
-  // 2. Find dispatch() calls via vector search
+  // 2. Dispatchers: exact dispatch('event_name') call sites (not semantic neighbours)
   try {
-    const dispatchSearch = await rustSearchAsync(`dispatch ${eventName} eventManager`, 20);
-    const dispatchRaw = Array.isArray(dispatchSearch) ? dispatchSearch : [];
-    const dispatchers = dispatchRaw.map(normalizeResult).filter(r =>
-      r.searchText?.includes(eventName) || r.path?.endsWith('.php')
-    );
-    result.dispatchers = dispatchers.slice(0, 10).map(r => ({
-      path: r.path,
-      className: r.className,
-      snippet: (r.searchText || '').slice(0, 200)
+    const exact = await findEventDispatchers(eventName);
+    result.dispatchers = exact.dispatchers.slice(0, 20).map(d => ({
+      path: d.path,
+      className: d.class,
+      method: d.method,
+      line: d.line,
+      snippet: d.snippet
     }));
-  } catch { /* index may not be ready */ }
+  } catch { /* non-fatal */ }
 
-  // 3. Resolve observer PHP classes
-  for (const obs of result.observers.slice(0, 10)) {
-    const shortName = obs.instance.split('\\').pop();
+  // 3. Resolve observer PHP classes by FQCN (not by short name)
+  const seen = new Set();
+  for (const obs of result.observers) {
+    if (!obs.instance || seen.has(obs.instance)) continue;
+    seen.add(obs.instance);
+    const file = findClassFileFast(root, obs.instance);
+    if (!file) continue;
+    let methods = [];
     try {
-      const obsSearch = await rustSearchAsync(shortName, 5);
-      const obsRaw = Array.isArray(obsSearch) ? obsSearch : [];
-      const matches = obsRaw.map(normalizeResult).filter(r =>
-        r.className?.includes(shortName)
-      );
-      if (matches[0]) {
-        result.observerDetails.push({
-          name: obs.name,
-          instance: obs.instance,
-          path: matches[0].path,
-          methods: matches[0].methods || []
-        });
-      }
-    } catch { /* non-fatal */ }
+      const src = readFileSync(file, 'utf-8');
+      methods = [...src.matchAll(/public\s+function\s+(\w+)\s*\(/g)].map(m => m[1]).filter(m => m !== '__construct');
+    } catch { /* unreadable */ }
+    result.observerDetails.push({ name: obs.name, instance: obs.instance, path: file.replace(root + '/', ''), methods });
   }
 
   return result;
@@ -3559,87 +4064,67 @@ async function findDiWiring(className) {
   const diFiles = await getDiXmlFiles(root);
   result.totalDiFiles = diFiles.length;
 
-  for (const { content, relPath: relativePath } of diFiles) {
-    const contentLower = content.toLowerCase();
-
-    // Quick pre-filter: skip files that don't contain the short name at all
-    if (!contentLower.includes(shortLower)) continue;
-
-    // 1. Preferences where this class is the "for" or "type"
-    const prefRegex = /<preference\s+for="([^"]+)"\s+type="([^"]+)"\s*\/?>/g;
-    let m;
-    while ((m = prefRegex.exec(content)) !== null) {
-      if (matchesClass(m[1]) || matchesClass(m[2])) {
-        result.preferences.push({ for: m[1], type: m[2], file: relativePath });
-      }
+  if (fqcnNormalized) {
+    // Exact, structural: preferences for/to the class, plugins incl. inherited from parents and
+    // interfaces, DI arguments of the type, virtual types resolving to it (transitively) and the
+    // DI arguments that inject it (through virtual types, preferences, Factory, Proxy).
+    const model = await getDiModel(root);
+    const target = normalizeClassName(fqcnNormalized);
+    for (const p of model.preferences) {
+      if (p.for === target || p.type === target) result.preferences.push({ for: p.for, type: p.type, file: p.file, area: p.area });
     }
-
-    // 2. Plugins and type arguments
-    const typeBlockRegex = /<type\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/type>/g;
-    let typeMatch;
-    while ((typeMatch = typeBlockRegex.exec(content)) !== null) {
-      const typeName = typeMatch[1];
-      const typeBlock = typeMatch[2];
-
-      if (!matchesClass(typeName)) continue;
-
-      // Plugins
-      const pluginRegex = /<plugin\s+name="([^"]+)"[^>]*type="([^"]+)"[^>]*/g;
-      let pMatch;
-      while ((pMatch = pluginRegex.exec(typeBlock)) !== null) {
-        result.plugins.push({
-          target: typeName, pluginName: pMatch[1],
-          pluginClass: pMatch[2], file: relativePath
-        });
-      }
-
-      // Simple arguments
-      const argSimpleRegex = /<argument\s+name="([^"]+)"[^>]*xsi:type="([^"]+)"[^>]*>([^<]*)<\/argument>/g;
-      let aMatch;
-      while ((aMatch = argSimpleRegex.exec(typeBlock)) !== null) {
-        result.typeArguments.push({
-          target: typeName, name: aMatch[1],
-          type: aMatch[2], value: aMatch[3].trim().slice(0, 200), file: relativePath
-        });
-      }
-
-      // Array arguments
-      const argArrayRegex = /<argument\s+name="([^"]+)"[^>]*xsi:type="array"[^>]*>([\s\S]*?)<\/argument>/g;
-      let arrMatch;
-      while ((arrMatch = argArrayRegex.exec(typeBlock)) !== null) {
-        const argName = arrMatch[1];
-        const argBlock = arrMatch[2];
-        const itemRegex = /<item\s+name="([^"]+)"[^>]*xsi:type="([^"]+)"[^>]*>([^<]*)<\/item>/g;
-        let iMatch;
-        const items = [];
-        while ((iMatch = itemRegex.exec(argBlock)) !== null) {
-          items.push({ name: iMatch[1], type: iMatch[2], value: iMatch[3].trim().slice(0, 200) });
-        }
-        if (items.length > 0) {
-          result.typeArguments.push({
-            target: typeName, name: argName,
-            type: 'array', items, file: relativePath
-          });
+    const eff = effectivePluginDeclarations(model, target, await getAncestorResolver(root));
+    for (const d of eff.declarations) {
+      result.plugins.push({
+        target: d.target, pluginName: d.name, pluginClass: d.type, file: d.file, area: d.area,
+        disabled: d.disabled, inheritedFrom: d.inheritedFrom || null, onVirtualType: !!d.onVirtualType
+      });
+    }
+    for (const t of [...model.types, ...model.virtualTypes]) {
+      if (t.name !== target) continue;
+      for (const a of t.args) {
+        if (a.xsiType === 'array' && a.items.length) {
+          result.typeArguments.push({ target: t.name, name: a.name, type: 'array', items: a.items, file: t.file });
+        } else {
+          result.typeArguments.push({ target: t.name, name: a.name, type: a.xsiType, value: a.value, file: t.file });
         }
       }
     }
+    for (const v of virtualTypesResolvingTo(model, target)) {
+      const entry = { name: v.name, type: v.type, file: v.file, chain: v.chain };
+      const simpleArgs = v.args.filter(a => a.xsiType !== 'array').map(a => ({ name: a.name, type: a.xsiType, value: a.value }));
+      if (simpleArgs.length) entry.arguments = simpleArgs;
+      result.virtualTypes.push(entry);
+    }
+    result.argumentInjections = argumentInjectionsOf(model, target).filter(i => i.owner !== target);
+    result.exact = true;
+  }
 
-    // 3. Virtual types extending this class
-    const vtRegex = /<virtualType\s+name="([^"]+)"[^>]*type="([^"]+)"[^>]*(?:\/>|>([\s\S]*?)<\/virtualType>)/g;
-    while ((m = vtRegex.exec(content)) !== null) {
-      const vtType = m[2];
-      if (!matchesClass(vtType)) continue;
-      const vtEntry = { name: m[1], type: vtType, file: relativePath };
-      if (m[3]) {
-        const argRegex = /<argument\s+name="([^"]+)"[^>]*xsi:type="([^"]+)"[^>]*>([^<]*)<\/argument>/g;
-        const vtArgs = [];
-        let vam;
-        while ((vam = argRegex.exec(m[3])) !== null) {
-          vtArgs.push({ name: vam[1], type: vam[2], value: vam[3].trim().slice(0, 200) });
-        }
-        if (vtArgs.length > 0) vtEntry.arguments = vtArgs;
+  if (!fqcnNormalized) {
+    // Short name: substring matching (matchesClass), on the parsed model.
+    const model = await getDiModel(root);
+    for (const p of model.preferences) {
+      if (matchesClass(p.for) || matchesClass(p.type)) result.preferences.push({ for: p.for, type: p.type, file: p.file });
+    }
+    for (const t of model.types) {
+      if (!matchesClass(t.name)) continue;
+      for (const pl of t.plugins) {
+        if (pl.type) result.plugins.push({ target: t.name, pluginName: pl.name, pluginClass: pl.type, file: t.file, disabled: pl.disabled });
       }
-      result.virtualTypes.push(vtEntry);
+      for (const a of t.args) {
+        if (a.xsiType === 'array' && a.items.length) {
+          result.typeArguments.push({ target: t.name, name: a.name, type: 'array', items: a.items, file: t.file });
+        } else if (a.xsiType !== 'array') {
+          result.typeArguments.push({ target: t.name, name: a.name, type: a.xsiType, value: a.value, file: t.file });
+        }
+      }
+    }
+    for (const v of model.virtualTypes) {
+      if (!matchesClass(v.type)) continue;
+      const entry = { name: v.name, type: v.type, file: v.file };
+      const simpleArgs = v.args.filter(a => a.xsiType !== 'array').map(a => ({ name: a.name, type: a.xsiType, value: a.value }));
+      if (simpleArgs.length) entry.arguments = simpleArgs;
+      result.virtualTypes.push(entry);
     }
   }
 
@@ -3909,8 +4394,7 @@ async function findEventDispatchers(eventName) {
     let content;
     try { content = readFileSync(file, 'utf-8'); } catch { continue; }
     if (!content.includes(eventName)) continue;
-    const obsMatches = content.match(/<observer\s+/g);
-    if (obsMatches) result.observerCount += obsMatches.length;
+    result.observerCount += parseEventsXml(content, file.replace(root + '/', ''), eventName).length;
   }
 
   return result;
@@ -5403,7 +5887,9 @@ const _callToolHandler = async (request) => {
     // These tools have filesystem/di.xml fallbacks — work without serve process
     'magento_find_class', 'magento_find_method', 'magento_find_plugin',
     'magento_find_observer', 'magento_find_di_wiring', 'magento_module_structure',
-    'magento_batch', 'magento_find_config', 'magento_find_callers', 'magento_grep', 'magento_read', 'magento_trace_api', 'magento_trace_flow', 'magento_ast_search', 'magento_find_null_risks', 'magento_find_dataobject_issues'];
+    'magento_batch', 'magento_find_config', 'magento_find_callers', 'magento_grep', 'magento_read', 'magento_trace_api', 'magento_trace_flow', 'magento_ast_search', 'magento_find_null_risks', 'magento_find_dataobject_issues',
+    // Structural answers first, semantic results only as an addition
+    'magento_find_preference', 'magento_find_table_usage', 'magento_find_controller'];
   if (warmupInProgress && !indexFreeTools.includes(name)) {
     logToFile('REQ', `${name} → blocked (warmup: loading index)`);
     return {
@@ -5526,10 +6012,26 @@ const _callToolHandler = async (request) => {
           } catch {}
         }
 
+        // A virtual type is a DI type name, not a PHP class: report its di.xml definition
+        let vtText = '';
+        const vtName = normalizeClassName(args.className);
+        if (vtName.includes('\\') && config.magentoRoot) {
+          const model = await getDiModel(config.magentoRoot);
+          if (isVirtualType(model, vtName)) {
+            const { real, chain } = resolveVirtualType(model, vtName);
+            const decl = model.virtualByName.get(vtName)[0];
+            const realFile = findClassFileFast(config.magentoRoot, real);
+            vtText = `### \`${vtName}\` is a virtual type\n` +
+              `- Declared in \`${decl.file}\` [${decl.area}] as \`type="${decl.type}"\`\n` +
+              `- Instantiates \`${real}\`${chain.length > 2 ? ` (via ${chain.slice(1, -1).join(' → ')})` : ''}` +
+              (realFile ? ` — \`${realFile.replace(config.magentoRoot + '/', '')}\`` : '') + '\n\n';
+          }
+        }
+
         return {
           content: [{
             type: 'text',
-            text: formatSearchResults(results.slice(0, 3))
+            text: vtText + formatSearchResults(results.slice(0, 3))
           }]
         };
       }
@@ -5728,79 +6230,9 @@ const _callToolHandler = async (request) => {
           return { ...r, diArea };
         });
 
-        // If targetClass provided, also scan di.xml for explicit registrations (using session cache)
-        let diRegistrations = [];
-        if (args.targetClass) {
-          const fpRoot = config.magentoRoot;
-          const diFiles = await getDiXmlFiles(fpRoot);
-          // Normalize target class for matching (both \ and \\)
-          const normalizedTarget = args.targetClass.replace(/\\\\/g, '\\');
-          const isFqcn = normalizedTarget.includes('\\');
-          const shortTarget = normalizedTarget.split('\\').pop().toLowerCase();
-          for (const { content, relPath } of diFiles) {
-            if (!content.includes(isFqcn ? normalizedTarget : args.targetClass)) continue;
-            // Find plugin registrations for this target
-            const typeBlockRegex = /<type\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/type>/g;
-            let tm;
-            while ((tm = typeBlockRegex.exec(content)) !== null) {
-              const typeName = tm[1].replace(/\\\\/g, '\\');
-              // FQCN: exact match. Short name: match last segment OR any namespace segment
-              // (catches sub-namespace types like Payment\State\CaptureCommand when searching for "Payment")
-              const typeSegments = typeName.split('\\').map(s => s.toLowerCase());
-              const isExactMatch = isFqcn
-                ? typeName === normalizedTarget
-                : typeSegments[typeSegments.length - 1] === shortTarget;
-              const isSubNamespace = !isFqcn && !isExactMatch && typeSegments.includes(shortTarget);
-              if (!isExactMatch && !isSubNamespace) continue;
-              const block = tm[2];
-              const pluginRegex = /<plugin\s+([^/>]*)\/?>/g;
-              let pm;
-              while ((pm = pluginRegex.exec(block)) !== null) {
-                const attrs = {};
-                const localAttrRe = /(\w+)="([^"]*)"/g;
-                let am;
-                while ((am = localAttrRe.exec(pm[1])) !== null) {
-                  attrs[am[1]] = am[2];
-                }
-                let area = 'global';
-                if (relPath.includes('/etc/adminhtml/')) area = 'adminhtml';
-                else if (relPath.includes('/etc/frontend/')) area = 'frontend';
-                else if (relPath.includes('/etc/graphql/')) area = 'graphql';
-                diRegistrations.push({
-                  target: typeName,
-                  pluginName: attrs.name || '',
-                  pluginClass: attrs.type || '',
-                  disabled: attrs.disabled === 'true',
-                  sortOrder: attrs.sortOrder || null,
-                  isSubNamespace,
-                  area,
-                  file: relPath
-                });
-              }
-            }
-          }
-        }
-
-        // Resolve plugin methods + method bodies for DI registrations
-        const fpRoot2 = args.targetClass ? config.magentoRoot : null;
-        for (const reg of diRegistrations) {
-          if (reg.pluginClass && fpRoot2) {
-            const pluginFile = findClassFile(fpRoot2, reg.pluginClass);
-            if (pluginFile) {
-              reg.methods = extractPluginMethods(pluginFile);
-              reg.resolvedFile = pluginFile.replace(fpRoot2 + '/', '');
-              // Read method bodies — for exact matches, filter by targetMethod to reduce bloat
-              // For sub-namespace matches, read ALL bodies (intercepted method name may differ)
-              const methodsToRead = (args.targetMethod && !reg.isSubNamespace)
-                ? reg.methods.filter(m => m.targetMethod === args.targetMethod)
-                : reg.methods;
-              for (const m of methodsToRead) {
-                const body = readFullMethodBody(pluginFile, m.name);
-                if (body) m.body = body;
-              }
-            }
-          }
-        }
+        const { diRegistrations, virtualOf, classStatus } = args.targetClass
+          ? await collectPluginRegistrations(args.targetClass, args.targetMethod)
+          : { diRegistrations: [], virtualOf: null, classStatus: null };
 
         let text = formatSearchResults(enrichedResults);
         const exactRegs = diRegistrations.filter(r => !r.isSubNamespace);
@@ -5808,6 +6240,12 @@ const _callToolHandler = async (request) => {
         if (diRegistrations.length > 0) {
           if (exactRegs.length > 0) {
             text += `\n\n### DI Plugin Registrations for ${args.targetClass} (${exactRegs.length})\n`;
+            if (virtualOf) {
+              text += `> \`${normalizeClassName(args.targetClass)}\` is a virtual type of \`${virtualOf}\`: the plugins of the real class apply; plugins declared on the virtual type name do not run.\n`;
+            }
+            if (classStatus && classStatus.interceptable === false) {
+              text += `> ⛔ **No plugin on this class runs:** ${classStatus.reason}.\n`;
+            }
           }
           if (subNsRegs.length > 0) {
             if (exactRegs.length === 0) text += '\n';
@@ -5823,19 +6261,35 @@ const _callToolHandler = async (request) => {
             const disabledTag = reg.disabled ? ' **[DISABLED]**' : '';
             const sortTag = reg.sortOrder ? ` (sortOrder: ${reg.sortOrder})` : '';
             const targetTag = reg.isSubNamespace ? ` on \`${reg.target.split('\\').pop()}\`` : '';
-            text += `- **${reg.pluginName}**${targetTag} → \`${reg.pluginClass}\` [${reg.area}]${sortTag}${disabledTag} (${reg.file})\n`;
+            const inheritedTag = reg.inheritedFrom ? ` (declared on \`${reg.inheritedFrom}\`)` : '';
+            const virtualTag = reg.onVirtualType ? ' **[declared on the virtual type — does not run]**' : '';
+            const typeLabel = reg.pluginClass
+              ? `\`${reg.pluginClass}\`${reg.virtualOf ? ` (virtual type of \`${reg.virtualOf}\`)` : ''}`
+              : '_(no type — changes the declaration of the same name)_';
+            text += `- **${reg.pluginName}**${targetTag} → ${typeLabel} [${reg.area}]${sortTag}${disabledTag}${inheritedTag}${virtualTag} (${reg.file})\n`;
+            if (reg.runs) {
+              text += `  Runs: \`${reg.runs}\` (preference on the plugin type; methods are registered from \`${reg.virtualOf || reg.pluginClass}\`)\n`;
+            }
             if (reg.resolvedFile) {
               text += `  PHP: \`${reg.resolvedFile}\`\n`;
             }
             if (reg.methods?.length > 0) {
               for (const m of reg.methods) {
-                text += `  - \`${m.type}\` **${m.targetMethod}** → \`${m.name}()\`\n`;
+                const niTag = m.notIntercepted ? ` **[does not run: ${m.notIntercepted}]**` : '';
+                text += `  - \`${m.type}\` **${m.targetMethod}** → \`${m.name}()\`${niTag}\n`;
                 if (m.body) {
                   const indentedBody = m.body.split('\n').join('\n    ');
                   text += '    ' + '```php\n    ' + indentedBody + '\n    ' + '```\n';
                 }
               }
             }
+          }
+        }
+
+        if (args.targetClass && normalizeClassName(args.targetClass).includes('\\') && diRegistrations.length > 0) {
+          const eff = await pluginEffectiveSummary(config.magentoRoot, args.targetClass);
+          if (eff) {
+            text += `\n#### Effective state (merged by plugin name in module load order)\n${eff}`;
           }
         }
 
@@ -5850,7 +6304,11 @@ const _callToolHandler = async (request) => {
         if (eventFlow.observers.length > 0) {
           text += `### Observers for \`${args.eventName}\` (${eventFlow.observers.length})\n\n`;
           for (const obs of eventFlow.observers) {
-            text += `- **${obs.name}** → \`${obs.instance}::${obs.method}()\` (${obs.file})\n`;
+            text += formatObserverLine(obs);
+          }
+          const eff = await observerEffectiveText(config.magentoRoot, eventFlow.observers);
+          if (eff) {
+            text += `\n#### Effective state (merged by observer name in module load order)\n${eff}`;
           }
           if (eventFlow.observerDetails.length > 0) {
             text += `\n### Observer PHP Files\n`;
@@ -5875,17 +6333,43 @@ const _callToolHandler = async (request) => {
       }
 
       case 'magento_find_preference': {
-        const query = `preference ${args.interfaceName} di.xml type`;
-        const raw = await rustSearchAsync(query, 30);
-        let results = raw.map(normalizeResult).filter(r =>
-          r.path?.includes('di.xml')
-        );
-        results = rerank(results, { fileType: 'xml', pathContains: ['di.xml'] });
+        // Structural first (FQCN): the effective preference per area in module load order, the
+        // superseded and ignored declarations, ambiguous orders, and the class that is finally
+        // instantiated (virtual types resolved). Semantic results follow as related files.
+        let structural = '';
+        const prefTarget = normalizeClassName(args.interfaceName || '');
+        if (prefTarget.includes('\\')) {
+          const model = await getDiModel(config.magentoRoot);
+          const status = await preferenceStatusText(config.magentoRoot, [prefTarget]);
+          if (status) {
+            const inst = resolveInstance(model, prefTarget);
+            structural += `### Preference for \`${prefTarget}\`\n${status}`;
+            if (inst.real !== prefTarget) {
+              structural += `\nInstantiated class (global): \`${inst.real}\`${inst.steps.length ? ` (${inst.steps.join(', ')})` : ''}\n`;
+            }
+          } else if (isVirtualType(model, prefTarget)) {
+            const { real, chain } = resolveVirtualType(model, prefTarget);
+            structural += `### \`${prefTarget}\` is a virtual type\n- Resolves to \`${real}\`${chain.length > 2 ? ` (via ${chain.slice(1, -1).join(' → ')})` : ''}\n`;
+          } else {
+            structural += `### Preference for \`${prefTarget}\`\n_No <preference> declared — Magento instantiates the class itself (an interface without a preference cannot be instantiated)._\n`;
+          }
+        }
+        let results = [];
+        try {
+          const query = `preference ${args.interfaceName} di.xml type`;
+          const raw = await rustSearchAsync(query, 30);
+          results = raw.map(normalizeResult).filter(r =>
+            r.path?.includes('di.xml')
+          );
+          results = rerank(results, { fileType: 'xml', pathContains: ['di.xml'] });
+        } catch { /* index not available: structural answer only */ }
 
         return {
           content: [{
             type: 'text',
-            text: formatSearchResults(results.slice(0, 15))
+            text: structural
+              ? `${structural}\n### Related di.xml files (semantic)\n${formatSearchResults(results.slice(0, 10))}`
+              : formatSearchResults(results.slice(0, 15))
           }]
         };
       }
@@ -5911,7 +6395,9 @@ const _callToolHandler = async (request) => {
         const namespaceParts = parts.map(p => p.charAt(0).toUpperCase() + p.slice(1));
         const query = `${namespaceParts.join(' ')} controller execute action`;
 
-        const raw = await rustSearchAsync(query, 50);
+        const structuralCtrl = await resolveControllerRoute(config.magentoRoot, args.route, args.area);
+        let raw = [];
+        try { raw = await rustSearchAsync(query, 50); } catch { raw = []; }
         // Prefer path-based controller detection, fall back to isController flag
         let results = raw.map(normalizeResult).filter(r =>
           r.path?.includes('/Controller/')
@@ -5937,13 +6423,24 @@ const _callToolHandler = async (request) => {
         }
 
         if (args.area) {
-          results = results.filter(r => r.area === args.area || r.path?.includes(`/${args.area}/`));
+          // Admin controllers live in Controller/Adminhtml/ (capitalised) — compare case-insensitively
+          const areaSeg = `/${String(args.area).toLowerCase()}/`;
+          results = results.filter(r => r.area === args.area || r.path?.toLowerCase().includes(areaSeg));
         }
 
+        let ctrlText = '';
+        if (structuralCtrl.length) {
+          ctrlText += `### Route \`${args.route}\` (routes.xml)\n`;
+          for (const c of structuralCtrl) {
+            ctrlText += `- [${c.area}] frontName \`${c.frontName}\` → module \`${c.module}\` → \`${c.className}\`` +
+              (c.path ? ` (\`${c.path}\`)` : ' _(file not found)_') + ` — declared in ${c.routesFile}\n`;
+          }
+          ctrlText += '\n### Related controllers (semantic)\n';
+        }
         return {
           content: [{
             type: 'text',
-            text: formatSearchResults(results)
+            text: ctrlText + formatSearchResults(results)
           }]
         };
       }
@@ -6098,8 +6595,12 @@ const _callToolHandler = async (request) => {
           `${table.replace(/_/g, ' ')} resource model collection`,
         ];
 
-        const rawResults = await Promise.all(queries.map(q => rustSearchAsync(q, 25)));
+        let rawResults = [];
+        try { rawResults = await Promise.all(queries.map(q => rustSearchAsync(q, 25))); } catch { rawResults = []; }
         const allResults = rawResults.flat().map(normalizeResult);
+        // Exact: every PHP file with the table name as a string literal — ResourceModel _init('t', …),
+        // getTableName('t'), select()->from('t'), setup patches. Semantic search misses these.
+        const exactPhp = [...grepLiteralFiles(config.magentoRoot, table, '*.php'), ...grepLiteralFiles(config.magentoRoot, table, 'db_schema.xml')];
 
         // Deduplicate by path
         const pathMap = new Map();
@@ -6111,6 +6612,9 @@ const _callToolHandler = async (request) => {
               pathMap.set(r.path, r);
             }
           }
+        }
+        for (const hit of exactPhp) {
+          if (!pathMap.has(hit.path)) pathMap.set(hit.path, { path: hit.path, snippet: hit.line, score: 1, exact: true });
         }
         const unique = Array.from(pathMap.values());
 
@@ -6550,23 +7054,39 @@ const _callToolHandler = async (request) => {
         if (diResult.preferences.length > 0) {
           text += `### Preferences (${diResult.preferences.length})\n`;
           for (const p of diResult.preferences) {
-            text += `- \`${p.for}\` → \`${p.type}\` (${p.file})\n`;
+            const areaTag = p.area && p.area !== 'global' ? ` [${p.area}]` : '';
+            text += `- \`${p.for}\` → \`${p.type}\`${areaTag} (${p.file})\n`;
           }
           text += '\n';
+        }
+
+        if (diResult.exact && diResult.preferences.length > 0) {
+          const status = await preferenceStatusText(config.magentoRoot, [...new Set(diResult.preferences.map(p => p.for))]);
+          if (status) text += `#### Effective preferences (module load order)\n${status}\n`;
         }
 
         if (diResult.plugins.length > 0) {
           text += `### Plugins (${diResult.plugins.length})\n`;
           for (const p of diResult.plugins) {
-            text += `- \`${p.pluginName}\`: \`${p.pluginClass}\` on \`${p.target}\` (${p.file})\n`;
+            const tags = (p.area && p.area !== 'global' ? ` [${p.area}]` : '') +
+              (p.disabled ? ' [DISABLED]' : '') +
+              (p.inheritedFrom ? ` (inherited from \`${p.inheritedFrom}\`)` : '') +
+              (p.onVirtualType ? ' [declared on the virtual type — does not run]' : '');
+            text += `- \`${p.pluginName}\`: \`${p.pluginClass || '(no type)'}\` on \`${p.target}\`${tags} (${p.file})\n`;
           }
           text += '\n';
+          if (diResult.exact) {
+            text += await classInterceptionNote(config.magentoRoot, args.className);
+            const eff = await pluginEffectiveSummary(config.magentoRoot, args.className);
+            if (eff) text += `#### Effective plugin state (module load order)\n${eff}\n`;
+          }
         }
 
         if (diResult.virtualTypes.length > 0) {
           text += `### Virtual Types (${diResult.virtualTypes.length})\n`;
           for (const v of diResult.virtualTypes) {
-            text += `- \`${v.name}\` extends \`${v.type}\` (${v.file})\n`;
+            const via = v.chain && v.chain.length > 2 ? ` (via ${v.chain.slice(1, -1).map(c => `\`${c}\``).join(' → ')})` : '';
+            text += `- \`${v.name}\` extends \`${v.type}\`${via} (${v.file})\n`;
           }
           text += '\n';
         }
@@ -6585,7 +7105,9 @@ const _callToolHandler = async (request) => {
           for (const a of diResult.argumentInjections) {
             const blockLabel = a.blockType ? `\`${a.intoBlock}\` (type: \`${a.blockType}\`)` : `\`${a.intoBlock}\``;
             const itemTag = a.isArrayItem ? ' [array item]' : '';
-            text += `- ${blockLabel} → argument \`${a.argumentName}\`${itemTag} = \`${a.injectedAs}\` (${a.file})\n`;
+            const resolves = a.chain ? ` (resolves via ${a.chain.slice(1).map(c => `\`${c}\``).join(' → ')})` : '';
+            const viaTag = a.via ? ` [${a.via}]` : '';
+            text += `- ${blockLabel} → argument \`${a.argumentName}\`${itemTag} = \`${a.injectedAs}\`${viaTag}${resolves} (${a.file})\n`;
           }
           text += '\n';
         }
@@ -6726,6 +7248,14 @@ const _callToolHandler = async (request) => {
           text += '\n';
         }
 
+        if (impact.apiReferences && impact.apiReferences.length > 0) {
+          text += `### API Exposure (${impact.apiReferences.length})\n`;
+          for (const a of impact.apiReferences) {
+            text += `- [${a.type}] ${a.detail} (\`${a.file}\`)\n`;
+          }
+          text += '\n';
+        }
+
         if (impact.instantiations.length > 0) {
           text += `### Direct Instantiations (${impact.instantiations.length})\n`;
           for (const i of impact.instantiations) {
@@ -6776,17 +7306,22 @@ const _callToolHandler = async (request) => {
         if (flow.dispatchers.length > 0) {
           text += `### Dispatchers (${flow.dispatchers.length})\n`;
           for (const d of flow.dispatchers) {
-            text += `- \`${d.path}\`${d.className ? ` (${d.className})` : ''}\n`;
-            if (d.snippet) text += `  _${d.snippet.slice(0, 150)}_\n`;
+            const where = d.method ? `${d.className}::${d.method}()` : d.className;
+            text += `- \`${d.path}:${d.line}\`${where ? ` (${where})` : ''}\n`;
+            if (d.snippet) text += `  \`${d.snippet.slice(0, 150)}\`\n`;
           }
           text += '\n';
+        } else {
+          text += '### Dispatchers\n_No `dispatch(\'' + flow.eventName + '\')` call found in the scanned code (the event may be dispatched with a computed name or from outside the scanned path)._\n\n';
         }
 
         if (flow.observers.length > 0) {
           text += `### Observers (${flow.observers.length})\n`;
           for (const o of flow.observers) {
-            text += `- **${o.name}**: \`${o.instance}::${o.method}\` (${o.file})\n`;
+            text += formatObserverLine(o);
           }
+          const eff = await observerEffectiveText(config.magentoRoot, flow.observers);
+          if (eff) text += `\n#### Effective state (merged by observer name in module load order)\n${eff}`;
           text += '\n';
         }
 
@@ -6916,12 +7451,26 @@ const _callToolHandler = async (request) => {
           text += '\n';
         }
 
+        if (diResult.exact && diResult.preferences.length > 0) {
+          const status = await preferenceStatusText(config.magentoRoot, [...new Set(diResult.preferences.map(p => p.for))]);
+          if (status) text += `#### Effective preferences (module load order)\n${status}\n`;
+        }
+
         if (diResult.plugins.length > 0) {
           text += `### Plugins (${diResult.plugins.length})\n`;
           for (const p of diResult.plugins) {
-            text += `- \`${p.pluginName}\`: \`${p.pluginClass}\` on \`${p.target}\` (${p.file})\n`;
+            const tags = (p.area && p.area !== 'global' ? ` [${p.area}]` : '') +
+              (p.disabled ? ' [DISABLED]' : '') +
+              (p.inheritedFrom ? ` (inherited from \`${p.inheritedFrom}\`)` : '') +
+              (p.onVirtualType ? ' [declared on the virtual type — does not run]' : '');
+            text += `- \`${p.pluginName}\`: \`${p.pluginClass || '(no type)'}\` on \`${p.target}\`${tags} (${p.file})\n`;
           }
           text += '\n';
+          if (diResult.exact) {
+            text += await classInterceptionNote(config.magentoRoot, diResult.className);
+            const eff = await pluginEffectiveSummary(config.magentoRoot, diResult.className);
+            if (eff) text += `#### Effective plugin state (module load order)\n${eff}\n`;
+          }
         }
 
         if (diResult.typeArguments.length > 0) {
@@ -6942,12 +7491,24 @@ const _callToolHandler = async (request) => {
         if (diResult.virtualTypes.length > 0) {
           text += `### Virtual Types (${diResult.virtualTypes.length})\n`;
           for (const v of diResult.virtualTypes) {
-            text += `- \`${v.name}\` extends \`${v.type}\` (${v.file})\n`;
+            const via = v.chain && v.chain.length > 2 ? ` (via ${v.chain.slice(1, -1).map(c => `\`${c}\``).join(' → ')})` : '';
+            text += `- \`${v.name}\` extends \`${v.type}\`${via} (${v.file})\n`;
             if (v.arguments) {
               for (const a of v.arguments) {
                 text += `  - ${a.name}: \`${a.value}\`\n`;
               }
             }
+          }
+          text += '\n';
+        }
+
+        if (diResult.argumentInjections && diResult.argumentInjections.length > 0) {
+          text += `### Injected Into (${diResult.argumentInjections.length})\n`;
+          text += '_DI arguments whose configured object resolves to this class:_\n';
+          for (const a of diResult.argumentInjections) {
+            const resolves = a.chain ? ` (resolves via ${a.chain.slice(1).map(c => `\`${c}\``).join(' → ')})` : '';
+            const viaTag = a.via ? ` [${a.via}]` : '';
+            text += `- \`${a.owner}\` → argument \`${a.argument}\` = \`${a.value}\`${viaTag}${resolves} (${a.file})\n`;
           }
           text += '\n';
         }
@@ -7128,53 +7689,19 @@ const _callToolHandler = async (request) => {
                 text = formatSearchResults(res.slice(0, 3));
                 // DI registrations + method bodies (compact: only targetMethod bodies)
                 if (a.targetClass) {
-                  const diFiles = await getDiXmlFiles(config.magentoRoot);
-                  const normalizedTarget = a.targetClass.replace(/\\\\/g, '\\');
-                  const isFqcn = normalizedTarget.includes('\\');
-                  const shortTarget = normalizedTarget.split('\\').pop().toLowerCase();
-                  let regCount = 0;
+                  const { diRegistrations: regs, classStatus: cs } = await collectPluginRegistrations(a.targetClass, a.targetMethod);
                   text += '\n\n### DI Registrations\n';
-                  for (const { content: diContent, relPath } of diFiles) {
-                    if (regCount >= 8) break;
-                    if (!diContent.includes(isFqcn ? normalizedTarget : a.targetClass)) continue;
-                    const typeBlockRegex = /<type\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/type>/g;
-                    let tm;
-                    while ((tm = typeBlockRegex.exec(diContent)) !== null) {
-                      if (regCount >= 8) break;
-                      const typeName = tm[1].replace(/\\\\/g, '\\');
-                      const batchSegs = typeName.split('\\').map(s => s.toLowerCase());
-                      const isExact = isFqcn ? typeName === normalizedTarget : batchSegs[batchSegs.length - 1] === shortTarget;
-                      const isSubNs = !isFqcn && !isExact && batchSegs.includes(shortTarget);
-                      if (!isExact && !isSubNs) continue;
-                      const block = tm[2];
-                      const pluginRegex2 = /<plugin\s+([^/>]*)\/?>/g;
-                      let pm;
-                      while ((pm = pluginRegex2.exec(block)) !== null) {
-                        if (regCount >= 12) break;
-                        const attrs = {};
-                        const localAttrRe = /(\w+)="([^"]*)"/g;
-                        let am2;
-                        while ((am2 = localAttrRe.exec(pm[1])) !== null) attrs[am2[1]] = am2[2];
-                        const disabled = attrs.disabled === 'true' ? ' [DISABLED]' : '';
-                        const subTag = isSubNs ? ` on \`${typeName.split('\\').pop()}\`` : '';
-                        text += `- **${attrs.name || '?'}**${subTag} → \`${attrs.type || '?'}\`${disabled} (${relPath})\n`;
-                        // Read method bodies: exact matches filter by targetMethod; sub-namespace reads ALL
-                        if (attrs.type) {
-                          const pFile = findClassFile(config.magentoRoot, attrs.type);
-                          if (pFile) {
-                            const methods = extractPluginMethods(pFile);
-                            const relevant = (a.targetMethod && !isSubNs)
-                              ? methods.filter(m => m.targetMethod === a.targetMethod)
-                              : methods;
-                            for (const m of relevant) {
-                              const body = readFullMethodBody(pFile, m.name);
-                              text += `  - \`${m.type}\` **${m.targetMethod}** → \`${m.name}()\`\n`;
-                              if (body) text += '    ' + '```php\n    ' + body.split('\n').join('\n    ') + '\n    ' + '```\n';
-                            }
-                          }
-                        }
-                        regCount++;
-                      }
+                  if (cs && cs.interceptable === false) text += `> ⛔ No plugin on this class runs: ${cs.reason}.\n`;
+                  for (const reg of regs.slice(0, 12)) {
+                    const disabled = reg.disabled ? ' [DISABLED]' : '';
+                    const subTag = reg.isSubNamespace ? ` on \`${reg.target.split('\\').pop()}\`` : '';
+                    const inh = reg.inheritedFrom ? ` (declared on \`${reg.inheritedFrom}\`)` : '';
+                    const vt = reg.onVirtualType ? ' [declared on the virtual type — does not run]' : '';
+                    text += `- **${reg.pluginName || '?'}**${subTag} → \`${reg.pluginClass || '(no type)'}\` [${reg.area}]${disabled}${inh}${vt} (${reg.file})\n`;
+                    if (reg.runs) text += `  Runs: \`${reg.runs}\`\n`;
+                    for (const m of (reg.methods || []).filter(m => !a.targetMethod || reg.isSubNamespace || m.targetMethod === a.targetMethod)) {
+                      text += `  - \`${m.type}\` **${m.targetMethod}** → \`${m.name}()\`${m.notIntercepted ? ` [does not run: ${m.notIntercepted}]` : ''}\n`;
+                      if (m.body) text += '    ' + '```php\n    ' + m.body.split('\n').join('\n    ') + '\n    ' + '```\n';
                     }
                   }
                 }
