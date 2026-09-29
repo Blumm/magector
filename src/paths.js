@@ -48,7 +48,9 @@ export function tempDbPathFor(dbPath) {
  * which `index` would trust for content the new DB may not hold. Throws on failure — before
  * touching anything when there is no temp DB (a re-index that saved nothing), and putting
  * the old DB back if the new one cannot be renamed into place, so the current index stays
- * live rather than being stranded as .bak. `rename` is injectable for tests.
+ * live rather than being stranded as .bak. Once the new DB is live the swap has succeeded:
+ * a manifest that then cannot be moved is returned as `manifestError` instead of thrown
+ * (no manifest is safe, `index` rebuilds it). `rename` is injectable for tests.
  */
 export function swapInIndex(dbPath, tempDbPath, log = () => {}, rename = renameSync) {
   if (!existsSync(tempDbPath)) {
@@ -74,7 +76,11 @@ export function swapInIndex(dbPath, tempDbPath, log = () => {}, rename = renameS
     log('Old DB restored from .bak');
     throw e;
   }
+  let manifestError = null;
   const tempManifest = manifestPath(tempDbPath);
-  if (existsSync(tempManifest)) rename(tempManifest, manifestPath(dbPath));
+  if (existsSync(tempManifest)) {
+    try { rename(tempManifest, manifestPath(dbPath)); } catch (e) { manifestError = e; }
+  }
   log('New index swapped into place.');
+  return { manifestError };
 }

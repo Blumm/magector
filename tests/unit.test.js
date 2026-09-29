@@ -5356,7 +5356,8 @@ function testSwapInIndex() {
     // Old index with its manifest, new index built beside it: the manifest follows its DB.
     seed({ [db]: 'old db', [manifest]: 'old manifest', [tempDb]: 'new db', [tempManifest]: 'new manifest' });
     const logged = [];
-    swapInIndex(db, tempDb, (m) => logged.push(m));
+    const swapped = swapInIndex(db, tempDb, (m) => logged.push(m));
+    assertEq(swapped.manifestError, null, 'A complete swap reports no manifest error');
     assertEq(read(db), 'new db', 'New DB is live');
     assertEq(read(manifest), 'new manifest', "The new DB's manifest replaces the old one, not left beside the new DB");
     assert(!existsSync(tempManifest), 'No orphaned index.db.manifest is left behind');
@@ -5430,6 +5431,20 @@ function testSwapInIndex() {
     try { swapInIndex(db, tempDb, () => {}, failing(tempDb)); } catch (e) { failed = e; }
     assertIncludes(failed?.message, 'simulated rename failure', 'First index, failed rename: rethrown');
     assertEq(read(tempDb), 'new db', 'First index, failed rename: the new DB stays at its temp path');
+
+    // The new DB is live but its manifest cannot be moved: not a failed swap, reported separately
+    // (no manifest is safe: the next `index` rebuilds it).
+    seed({ [db]: 'old db', [manifest]: 'old manifest', [tempDb]: 'new db', [tempManifest]: 'new manifest' });
+    const partialLog = [];
+    let partial = null;
+    let threw = false;
+    try { partial = swapInIndex(db, tempDb, (m) => partialLog.push(m), failing(tempManifest)); } catch { threw = true; }
+    assert(!threw, 'Manifest not moved: the swap does not throw, the new DB is live');
+    assertIncludes(partial?.manifestError?.message, 'simulated rename failure', 'Manifest not moved: the error is reported to the caller');
+    assertEq(read(db), 'new db', 'Manifest not moved: new DB is live');
+    assert(!existsSync(manifest), 'Manifest not moved: no manifest beside the new DB (the old one is gone)');
+    assertEq(read(db + '.bak'), 'old db', 'Manifest not moved: old DB kept as .bak');
+    assertEq(partialLog.join('|'), 'Old DB moved to .bak|New index swapped into place.', 'Manifest not moved: the DB swap is still logged');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
