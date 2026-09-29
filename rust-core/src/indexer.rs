@@ -293,10 +293,12 @@ impl Indexer {
             manifest_path.as_ref()
                 .and_then(|p| crate::watcher::FileManifest::load(p))
                 .unwrap_or_else(|| {
-                    // No manifest on disk — first run after upgrade.
-                    // Build from filesystem (treats all indexed files as current).
+                    // No usable manifest: missing (first run after upgrade), or present but
+                    // unreadable. Build from filesystem (treats all indexed files as current).
+                    let present = manifest_path.as_ref().is_some_and(|p| !matches!(p.try_exists(), Ok(false)));
                     println!(
-                        "⚠️  No manifest found — treating the {} indexed files as current (run with --force to rebuild from scratch)",
+                        "⚠️  {} — treating the {} indexed files as current (run with --force to rebuild from scratch)",
+                        if present { "No usable manifest (unreadable, or written by a newer magector)" } else { "No manifest found" },
                         already_indexed.len()
                     );
                     crate::watcher::FileManifest::from_existing_index(&self.magento_root, &already_indexed)
