@@ -95,6 +95,15 @@ pub struct FileRecord {
     pub vector_ids: Vec<usize>,
 }
 
+impl FileRecord {
+    /// A record `index` always re-embeds: no real file has this size, and without a
+    /// hash it can never be classified touched; `backfill_hashes` skips it because the
+    /// stat never matches. For a path that is gone, `index` still reports it deleted.
+    pub fn stale() -> Self {
+        FileRecord { mtime: SystemTime::UNIX_EPOCH, size: u64::MAX, sha256: None, vector_ids: Vec::new() }
+    }
+}
+
 /// On-disk record before 2.17.0 (mtime + size only), decoded for migration.
 #[derive(Deserialize)]
 struct FileRecordV1 {
@@ -195,6 +204,25 @@ impl FileManifest {
     /// e.g. `.magector/index.db` → `.magector/index.manifest`
     pub fn sidecar_path(db_path: &Path) -> PathBuf {
         db_path.with_extension("manifest")
+    }
+
+    /// Mark `paths` stale in the sidecar manifest at `sidecar`: its records stop claiming
+    /// that index.db holds their content, so the next `index` re-embeds them (or reports
+    /// them deleted) instead of trusting an old hash. Only an existing, readable sidecar
+    /// is updated — without one, `index` rebuilds it from the index anyway, and a partial
+    /// one would make `index` re-add every other file. Returns whether it was updated.
+    pub fn mark_stale_in_sidecar(sidecar: &Path, paths: &[String]) -> Result<bool> {
+        if paths.is_empty() {
+            return Ok(false);
+        }
+        let Some(mut manifest) = Self::load(sidecar) else {
+            return Ok(false);
+        };
+        for path in paths {
+            manifest.files.insert(path.clone(), FileRecord::stale());
+        }
+        manifest.save(sidecar)?;
+        Ok(true)
     }
 
     /// Build initial manifest from the current index metadata.
@@ -506,6 +534,30 @@ pub fn watcher_loop(
             continue;
         }
 
+        // `index` trusts the sidecar manifest to describe index.db: a matching content
+        // hash there means "these vectors are current". This loop is about to change
+        // index.db without rewriting those records, so mark every path it touches stale
+        // there first (a stale record only withdraws a claim, so doing it before the DB
+        // write is safe at any crash point). If that fails, remove the sidecar — `index`
+        // rebuilds a missing one; if even that fails, leave index.db alone this tick.
+        let sidecar = FileManifest::sidecar_path(&db_path);
+        let changing: Vec<String> = changes
+            .added
+            .iter()
+            .chain(changes.modified.iter())
+            .map(|p| p.strip_prefix(&magento_root).unwrap_or(p).to_string_lossy().to_string())
+            .chain(changes.deleted.iter().cloned())
+            .collect();
+        if let Err(e) = FileManifest::mark_stale_in_sidecar(&sidecar, &changing) {
+            tracing::warn!("Watcher: could not mark changed files stale in {:?} ({}); removing it", sidecar, e);
+            if let Err(e) = std::fs::remove_file(&sidecar) {
+                if sidecar.exists() {
+                    tracing::error!("Watcher: could not remove stale sidecar {:?} ({}); skipping this cycle", sidecar, e);
+                    continue;
+                }
+            }
+        }
+
         // 1. Tombstone modified and deleted files under a short-lived lock.
         let mut removed_any = false;
         {
@@ -588,6 +640,13 @@ pub fn watcher_loop(
                         dirty = true;
                         let attempted = zero_entry_paths(&magento_root, chunk, &[]);
                         manifest.apply_indexed(&magento_root, &attempted);
+                        // Nothing was embedded, so no hash: a later stat change must retry
+                        // these files, not pass them off as "touched".
+                        for (rel, _) in &attempted {
+                            if let Some(rec) = manifest.files.get_mut(rel) {
+                                rec.sha256 = None;
+                            }
+                        }
                     }
                 }
                 // Lock dropped here at end of scope, before the next chunk.
@@ -743,6 +802,130 @@ mod tests {
             manifest.files["changed.php"].sha256.is_none(),
             "a changed file must stay modified — never hashed into 'touched'"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Manifest keys of `paths` (relative to `root`), sorted.
+    fn rel_paths(root: &Path, paths: &[PathBuf]) -> Vec<String> {
+        let mut rel: Vec<String> = paths
+            .iter()
+            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().to_string())
+            .collect();
+        rel.sort();
+        rel
+    }
+
+    #[test]
+    fn test_mark_stale_defeats_unchanged_and_touched() {
+        // The serve watcher changes index.db without rewriting the sidecar, and `index`
+        // trusts a matching hash there. Once a path is marked stale, neither an equal stat
+        // ("unchanged") nor an equal hash ("touched") may pass for "index.db holds this".
+        let dir = make_temp_dir();
+        let same = dir.join("same.php");
+        let restored = dir.join("restored.php");
+        fs::write(&same, "<?php echo 'same';").unwrap();
+        fs::write(&restored, "<?php echo 'restored';").unwrap();
+        let mut manifest = FileManifest::new();
+        manifest.files.insert("same.php".to_string(), record_for(&same, vec![0]));
+        let mut rec = record_for(&restored, vec![1]);
+        rec.mtime = SystemTime::UNIX_EPOCH; // a checkout rewrote the mtime; content is C1 again
+        manifest.files.insert("restored.php".to_string(), rec);
+        let sidecar = dir.join("index.manifest");
+        manifest.save(&sidecar).unwrap();
+
+        let before = FileManifest::load(&sidecar).unwrap().detect_changes(&dir).unwrap();
+        assert!(before.modified.is_empty() && before.added.is_empty(), "precondition: both records are trusted");
+        assert_eq!(before.touched.len(), 1, "precondition: the restored file passes for touched");
+
+        let paths = vec!["same.php".to_string(), "restored.php".to_string()];
+        assert!(FileManifest::mark_stale_in_sidecar(&sidecar, &paths).unwrap());
+
+        let after = FileManifest::load(&sidecar).unwrap().detect_changes(&dir).unwrap();
+        assert_eq!(
+            rel_paths(&dir, &after.modified),
+            vec!["restored.php", "same.php"],
+            "stale records are re-embedded, never trusted"
+        );
+        assert!(after.touched.is_empty());
+        assert!(after.added.is_empty() && after.deleted.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_mark_stale_covers_added_and_deleted_paths() {
+        // Added paths (no record yet) get one; deleted paths must not keep their old one.
+        let dir = make_temp_dir();
+        let kept = dir.join("kept.php");
+        let gone = dir.join("gone.php");
+        fs::write(&kept, "<?php // kept").unwrap();
+        fs::write(&gone, "<?php // gone").unwrap();
+        fs::write(dir.join("added.php"), "<?php // added").unwrap(); // on disk, not in the manifest
+        let mut manifest = FileManifest::new();
+        manifest.files.insert("kept.php".to_string(), record_for(&kept, vec![0]));
+        manifest.files.insert("gone.php".to_string(), record_for(&gone, vec![1]));
+        fs::remove_file(&gone).unwrap();
+        let sidecar = dir.join("index.manifest");
+        manifest.save(&sidecar).unwrap();
+
+        let paths = vec!["added.php".to_string(), "gone.php".to_string()];
+        assert!(FileManifest::mark_stale_in_sidecar(&sidecar, &paths).unwrap());
+
+        let updated = FileManifest::load(&sidecar).unwrap();
+        for rel in ["added.php", "gone.php"] {
+            let rec = &updated.files[rel];
+            assert_eq!((rec.size, rec.sha256), (u64::MAX, None), "{rel} must hold a stale record");
+        }
+        assert!(updated.files["kept.php"].sha256.is_some(), "an unmarked path keeps its claim");
+
+        let changes = updated.detect_changes(&dir).unwrap();
+        assert_eq!(changes.deleted, vec!["gone.php".to_string()], "index still reports it deleted");
+        assert_eq!(rel_paths(&dir, &changes.modified), vec!["added.php"]);
+        assert!(changes.added.is_empty() && changes.touched.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_mark_stale_without_a_usable_sidecar_writes_nothing() {
+        let dir = make_temp_dir();
+        let sidecar = dir.join("index.manifest");
+        let paths = vec!["a.php".to_string()];
+
+        // No sidecar: `index` rebuilds it from the index, a partial one would make it
+        // re-add every other file.
+        assert!(!FileManifest::mark_stale_in_sidecar(&sidecar, &paths).unwrap());
+        assert!(!sidecar.exists());
+
+        // An unreadable sidecar (here: a newer format) is left as it is.
+        fs::write(&sidecar, b"MGMF\x09junk").unwrap();
+        assert!(!FileManifest::mark_stale_in_sidecar(&sidecar, &paths).unwrap());
+        assert_eq!(fs::read(&sidecar).unwrap(), b"MGMF\x09junk");
+
+        // Nothing to mark: no rewrite of a good sidecar either.
+        let mut manifest = FileManifest::new();
+        manifest.files.insert("a.php".to_string(), FileRecord::stale());
+        manifest.save(&sidecar).unwrap();
+        let bytes = fs::read(&sidecar).unwrap();
+        assert!(!FileManifest::mark_stale_in_sidecar(&sidecar, &[]).unwrap());
+        assert_eq!(fs::read(&sidecar).unwrap(), bytes);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_backfill_never_fills_a_stale_record() {
+        // backfill_hashes would otherwise hash the current file into the stale record and
+        // hand `index` a matching hash for content the DB does not hold.
+        let dir = make_temp_dir();
+        fs::write(dir.join("f.php"), "<?php // f").unwrap();
+        let mut manifest = FileManifest::new();
+        manifest.files.insert("f.php".to_string(), FileRecord::stale());
+
+        assert_eq!(manifest.backfill_hashes(&dir), 0);
+        assert!(manifest.files["f.php"].sha256.is_none());
+        assert_eq!(manifest.detect_changes(&dir).unwrap().modified.len(), 1);
 
         let _ = fs::remove_dir_all(&dir);
     }
