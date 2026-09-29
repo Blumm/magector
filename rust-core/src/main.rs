@@ -397,7 +397,7 @@ fn run_index(
     // hold. If a step above failed, the previous manifest stays and the next run embeds
     // again what this one did not persist. (It is also written when only stats changed —
     // touched files, backfilled hashes — since index.db on disk is what this run loaded.)
-    indexer.save_manifest()?;
+    manifest_save_is_best_effort(indexer.save_manifest(), database);
 
     println!("Files found:    {}", stats.files_found);
     println!("Files indexed:  {}", stats.files_indexed);
@@ -410,6 +410,21 @@ fn run_index(
     println!("Errors:         {}", stats.errors);
 
     Ok(())
+}
+
+/// No manifest is the safe state — the next `index` rebuilds it from index.db — so one that
+/// cannot be written is a warning, not a failed run: failing here would make the MCP
+/// background re-index delete a complete, verified `index.db.new`. A sidecar still on disk
+/// describes the index.db from before this run, so it is removed rather than left to claim it.
+fn manifest_save_is_best_effort(saved: Result<()>, database: &std::path::Path) {
+    let Err(err) = saved else { return };
+    println!("⚠️  Could not save the manifest ({err:#}) — the next run rebuilds it");
+    let sidecar = magector_core::watcher::FileManifest::sidecar_path(database);
+    match fs::remove_file(&sidecar) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => println!("⚠️  Could not remove the old manifest {sidecar:?} ({e})"),
+    }
 }
 
 fn run_validation(
@@ -1847,5 +1862,27 @@ class Helper
         assert!(glob_match_simple("a.b.c", "*.b.*"));
         assert!(glob_match_simple("test", "????"));
         assert!(!glob_match_simple("test", "???"));
+    }
+}
+
+#[cfg(test)]
+mod manifest_save_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_manifest_save_withdraws_the_old_sidecar_and_does_not_fail() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("index.db");
+        let sidecar = magector_core::watcher::FileManifest::sidecar_path(&db);
+        fs::write(&sidecar, b"an old manifest").unwrap();
+
+        manifest_save_is_best_effort(Err(anyhow::anyhow!("disk full")), &db);
+        assert!(!sidecar.exists(), "an old sidecar must not be left claiming the previous index");
+
+        // no sidecar to remove, and a saved manifest: nothing to do, nothing to fail
+        manifest_save_is_best_effort(Err(anyhow::anyhow!("disk full")), &db);
+        fs::write(&sidecar, b"the new manifest").unwrap();
+        manifest_save_is_best_effort(Ok(()), &db);
+        assert!(sidecar.exists());
     }
 }
