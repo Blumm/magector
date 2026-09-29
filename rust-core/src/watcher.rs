@@ -474,6 +474,10 @@ pub fn watcher_loop(
             }
         };
 
+        // Record the new stat of files whose content is unchanged before the empty check:
+        // a touched-only scan needs no indexing, but must not be re-reported every tick.
+        manifest.apply_touched(&changes.touched);
+
         if changes.is_empty() {
             continue;
         }
