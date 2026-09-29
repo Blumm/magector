@@ -15,7 +15,7 @@ import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'fs';
 import { syncOptionalDeps } from '../scripts/sync-optional-deps.mjs';
 import { getRunningIndexPid, writeIndexPidFile, removeIndexPidFile, lockPathFor } from '../src/index-lock.js';
 import { shouldRespawnServe, MAX_RESPAWNS_PER_WINDOW, RESPAWN_WINDOW_MS, RESPAWN_BASE_DELAY_MS } from '../src/serve-respawn.js';
-import { defaultDbPath, manifestPath, swapInIndex } from '../src/paths.js';
+import { defaultDbPath, dbPathForRoot, manifestPath, swapInIndex } from '../src/paths.js';
 import { modelDownloadDir } from '../src/model.js';
 import { mcpServerEnv } from '../src/init.js';
 
@@ -4832,6 +4832,7 @@ async function main() {
   testSocketQueryDefaultTimeout();
   testIndexLockConcurrencyGuard();
   testDefaultDbPath();
+  testDbPathForRoot();
   testManifestPath();
   testSwapInIndex();
   testModelDownloadDir();
@@ -5295,6 +5296,14 @@ function testDefaultDbPath() {
     'Derives from MAGENTO_ROOT, not from the process cwd'
   );
   assertEq(defaultDbPath({}, '/cwd'), path.join('/cwd', '.magector', 'index.db'), 'Falls back to cwd');
+}
+
+function testDbPathForRoot() {
+  console.log('\n📂 dbPathForRoot() (`index <path>` keeps its database under that path)');
+  const under = path.join('/srv/shop', '.magector', 'index.db');
+  assertEq(dbPathForRoot('/srv/shop', {}), under, 'Derives from <path>');
+  assertEq(dbPathForRoot('/srv/shop', { MAGENTO_ROOT: '/srv/other' }), under, '<path> wins over MAGENTO_ROOT');
+  assertEq(dbPathForRoot('/srv/shop', { MAGECTOR_DB: '/x/index.db' }), '/x/index.db', 'MAGECTOR_DB still wins');
 }
 
 // ─── Manifest Pairing Tests ──────────────────────────────────

@@ -15,6 +15,15 @@ export function defaultDbPath(env = process.env, cwd = process.cwd()) {
 }
 
 /**
+ * Index database path when indexing `root` (`index <path>`): MAGECTOR_DB still wins, else
+ * <root>/.magector/index.db — the index stays with the code it describes, not with
+ * MAGENTO_ROOT or the cwd.
+ */
+export function dbPathForRoot(root, env = process.env) {
+  return defaultDbPath({ ...env, MAGENTO_ROOT: root });
+}
+
+/**
  * The manifest sidecar the Rust core keeps beside an index DB: the file name with its last
  * extension replaced by `.manifest` (Rust's Path::with_extension), so `index.db` pairs with
  * `index.manifest` and `index.db.new` with `index.db.manifest`.
