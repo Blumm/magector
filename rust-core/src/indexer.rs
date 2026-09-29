@@ -215,7 +215,9 @@ impl Indexer {
     /// Apart from the periodic crash-safety saves of PHASE 2, this writes neither
     /// index.db nor the manifest. The caller saves index.db (if `stats.db_changed`),
     /// verifies it, and only then calls `save_manifest`: the manifest must never claim
-    /// content that index.db on disk does not hold.
+    /// content that index.db on disk does not hold. (For the same reason a resume first
+    /// marks the paths it is about to change stale in the existing sidecar, so a run that
+    /// dies after a periodic save leaves no old hash claiming them.)
     pub fn index_with_options(&mut self, force: bool) -> Result<IndexStats> {
         let mut stats = IndexStats::default();
         self.pending_manifest = None;
@@ -302,6 +304,39 @@ impl Indexer {
             let modified_count = changes.modified.len();
             let deleted_count = changes.deleted.len();
             let added_count = changes.added.len();
+
+            // The periodic saves of PHASE 2 write index.db, tombstones included, long before
+            // the manifest reaches disk, and `index` trusts a matching hash in the on-disk
+            // sidecar. So before anything is tombstoned, withdraw the sidecar's claims on
+            // every path this run is about to change — as the serve watcher does: if the run
+            // dies mid-way, the next one re-embeds those files instead of taking a file
+            // restored to its old content for "touched". `save_manifest` replaces the
+            // sentinels with real records. Touched files change nothing in index.db.
+            if let Some(ref mp) = manifest_path {
+                let root = &self.magento_root;
+                let changing: Vec<String> = changes
+                    .modified
+                    .iter()
+                    .chain(changes.added.iter())
+                    .map(|p| p.strip_prefix(root).unwrap_or(p).to_string_lossy().to_string())
+                    .chain(changes.deleted.iter().cloned())
+                    .collect();
+                match crate::watcher::FileManifest::mark_stale_in_sidecar(mp, &changing) {
+                    Ok(true) => tracing::info!("Marked {} changing files stale in {:?} until index.db is saved", changing.len(), mp),
+                    Ok(false) => {}
+                    Err(e) => {
+                        println!("⚠️  Could not mark the changing files stale in {:?} ({}) — removing it", mp, e);
+                        if let Err(e) = fs::remove_file(mp) {
+                            if mp.exists() {
+                                anyhow::bail!(
+                                    "Could not remove {:?} ({}); not changing index.db while that file may claim content this run drops",
+                                    mp, e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
 
             // Tombstone vectors for modified files (will be re-indexed)
             for path in &changes.modified {
