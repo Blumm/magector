@@ -39,7 +39,7 @@ import {
   virtualTypesResolvingTo, argumentInjectionsOf, effectivePluginDeclarations, resolvePluginType,
   parseEventsXml, parseXml, areaFromPath, createAncestorResolver,
   buildModuleIndex, preferenceCascade, mergeNamedDeclarations, pluginDeclarationsOn,
-  createMemberResolver, interceptionStatus,
+  createMemberResolver, interceptionStatus, buildClassHierarchy, instancesOf,
 } from './di-config.js';
 import { defaultDbPath, manifestPath, tempDbPathFor, swapInIndex } from './paths.js';
 import { createRequire } from 'module';
@@ -3875,6 +3875,27 @@ async function findTests(className, methodName) {
 // ─── Find Implementors ──────────────────────────────────────────
 // Find all classes implementing a given interface: PHP `implements` + DI preferences
 
+const classHierarchyCache = { root: null, hierarchy: null };
+
+/** Reverse class hierarchy of all PHP classes / interfaces under root (tests excluded). */
+async function getClassHierarchy(root) {
+  if (classHierarchyCache.root === root && classHierarchyCache.hierarchy) return classHierarchyCache.hierarchy;
+  const files = await glob('**/*.php', {
+    cwd: root, nodir: true,
+    ignore: ['**/test/**', '**/tests/**', '**/Test/**', '**/Tests/**', '**/node_modules/**', 'generated/**', 'var/**', 'pub/**', 'setup/**', 'dev/**']
+  });
+  const entries = [];
+  for (const rel of files) {
+    let source;
+    try { source = readFileSync(path.join(root, rel), 'utf-8'); } catch { continue; }
+    if (!/\b(?:extends|implements)\b/.test(source)) continue;
+    entries.push({ relPath: rel, source });
+  }
+  classHierarchyCache.root = root;
+  classHierarchyCache.hierarchy = buildClassHierarchy(entries);
+  return classHierarchyCache.hierarchy;
+}
+
 async function findImplementors(interfaceName) {
   const root = config.magentoRoot;
   const shortName = interfaceName.split('\\').pop();
@@ -3898,6 +3919,17 @@ async function findImplementors(interfaceName) {
   }
 
   // 2. Grep PHP files for `implements ...InterfaceName`
+  // FQCN: everything that is `instanceof` the type — implementors, extending interfaces, their
+  // implementors and all subclasses, transitively (reverse class hierarchy, built once per session).
+  if (wanted.includes('\\')) {
+    const hierarchy = await getClassHierarchy(root);
+    result.exact = true;
+    result.implementors = instancesOf(hierarchy, wanted).map(e => ({
+      class: e.fqcn, file: e.file, kind: e.kind, relation: e.relation, via: e.via, depth: e.depth
+    }));
+    return result;
+  }
+
   const phpFiles = await glob('**/*.php', {
     cwd: root, absolute: true, nodir: true,
     ignore: ['**/test/**', '**/tests/**', '**/Test/**', '**/Tests/**']
@@ -5883,7 +5915,7 @@ const _callToolHandler = async (request) => {
     'magento_find_observer', 'magento_find_di_wiring', 'magento_module_structure',
     'magento_batch', 'magento_find_config', 'magento_find_callers', 'magento_grep', 'magento_read', 'magento_trace_api', 'magento_trace_flow', 'magento_ast_search', 'magento_find_null_risks', 'magento_find_dataobject_issues',
     // Structural answers first, semantic results only as an addition
-    'magento_find_preference', 'magento_find_table_usage', 'magento_find_controller'];
+    'magento_find_preference', 'magento_find_table_usage', 'magento_find_controller', 'magento_find_implementors'];
   if (warmupInProgress && !indexFreeTools.includes(name)) {
     logToFile('REQ', `${name} → blocked (warmup: loading index)`);
     return {
@@ -7372,7 +7404,25 @@ const _callToolHandler = async (request) => {
           text += '\n';
         }
 
-        if (implResult.implementors.length > 0) {
+        if (implResult.exact && implResult.implementors.length > 0) {
+          const groups = [
+            ['Implement directly', i => i.depth === 1 && i.kind !== 'interface'],
+            ['Extending interfaces', i => i.kind === 'interface'],
+            ['Through a parent class or an extending interface', i => i.depth > 1 && i.kind !== 'interface'],
+          ];
+          text += `### instanceof \`${implResult.interface}\` (${implResult.implementors.length})\n`;
+          for (const [title, pick] of groups) {
+            const items = implResult.implementors.filter(pick);
+            if (!items.length) continue;
+            text += `#### ${title} (${items.length})\n`;
+            for (const impl of items) {
+              const via = impl.depth > 1 ? ` — ${impl.relation} \`${impl.via}\`` : '';
+              const kind = impl.kind !== 'class' ? ` [${impl.kind}]` : '';
+              text += `- \`${impl.class}\`${kind}${via} (${impl.file})\n`;
+            }
+          }
+          text += '\n';
+        } else if (implResult.implementors.length > 0) {
           text += `### PHP Implementors (${implResult.implementors.length})\n`;
           for (const impl of implResult.implementors) {
             const suffix = impl.matchType === 'shortName' ? ' _(short name match)_' : '';

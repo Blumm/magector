@@ -56,3 +56,6 @@ tests/tmp_*
 
 # Stray/compat local core binaries
 rust-core/magector-core-*-compat
+
+# Log written by the MCP server when tests run against a fixture
+tests/fixtures/*/.magector/

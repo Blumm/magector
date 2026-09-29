@@ -471,7 +471,7 @@ affects.
 | `magento_find_event_flow`, `magento_find_event_dispatchers` | Observers: as `find_observer`. Dispatchers: exact literal `dispatch('event')` calls | the event name is computed (`dispatch($prefix . '_save_after')`) |
 | `magento_trace_dependency`, `magento_find_di_wiring` | Exact: preferences, plugins (incl. inherited), virtual types resolving to the class (transitively), DI arguments that inject it (through virtual types, preferences, Factory, Proxy); plus the effective states above | the class is only type-hinted in a constructor without a di.xml argument (see `impact_analysis`) |
 | `magento_impact_analysis` | DI references: exact (as above); API exposure: exact (`webapi.xml` services incl. interface → preference, `schema.graphqls` resolvers); PHP files: exact FQCN occurrences + semantic candidates; runtime callers: constructor-typed properties | the class is reached through an untyped variable, `ObjectManager`, or a factory result stored in a local variable |
-| `magento_find_implementors` | Preferences: exact (FQCN) or fuzzy (short name); PHP implementors: superset — every class whose `implements` names the interface's short name | the class implements the interface only through a parent class or an extended interface |
+| `magento_find_implementors` | Exact (FQCN): everything that is `instanceof` the type — direct implementors, extending interfaces, their implementors and all subclasses, transitively, with the path; preferences per area. Short name: fuzzy (`implements` naming the short name) | a class in the chain has no readable PHP file (e.g. generated code) |
 
 With a **short name** (no namespace) the DI tools fall back to fuzzy matching — useful for exploring,
 not for a complete impact list.

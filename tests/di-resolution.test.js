@@ -201,6 +201,52 @@ async function main() {
       hasNot: ['CommentedFormatter'],
     });
 
+    t = await client.call('magento_find_implementors', { interfaceName: 'Acme\\Core\\Api\\FormatterInterface' });
+    check('find_implementors: instanceof — direct, via extending interface, via parent classes', t, {
+      has: [
+        '`Acme\\Core\\Model\\Formatter` (',
+        '`Acme\\Core\\Api\\RichFormatterInterface` [interface]',
+        '`Acme\\Core\\Model\\RichFormatter` — implements `Acme\\Core\\Api\\RichFormatterInterface`',
+        '`Acme\\Core\\Model\\HtmlFormatter` — extends `Acme\\Core\\Model\\Formatter`',
+        '`Acme\\Ext\\Model\\SpecialHtmlFormatter` — extends `Acme\\Core\\Model\\HtmlFormatter`',
+      ],
+    });
+    check('find_implementors: several interfaces per class, use-alias, listed once, no same-short-name type', t, {
+      has: ['`Acme\\Core\\Model\\MultiFormatter` (', '`Acme\\Core\\Model\\DiamondFormatter` ('],
+      hasNot: ['FakeFormatter', 'Acme\\Ext\\Api\\FormatterInterface'],
+    });
+    if ((t.match(/Acme\\Core\\Model\\DiamondFormatter`/g) || []).length !== 1) {
+      log('FAIL', 'find_implementors: a class reached twice is listed once');
+    } else {
+      log('PASS', 'find_implementors: a class reached twice is listed once');
+    }
+    t = await client.call('magento_find_implementors', { interfaceName: 'Acme\\Core\\Api\\NotifierInterface' });
+    check('find_implementors: the same class is instanceof each of its interfaces', t, {
+      has: ['`Acme\\Core\\Model\\MultiFormatter` (', '`Acme\\Core\\Model\\Notifier` (', '`Acme\\Ext\\Model\\Notifier` ('],
+    });
+
+    t = await client.call('magento_find_plugin', { targetClass: 'Acme\\Core\\Model\\MultiRepo' });
+    check('find_plugin: plugins of every implemented interface (implements A,B; one use statement)', t, {
+      has: ['core_repo_logger', 'declared on `Acme\\Core\\Api\\RepoInterface`', 'formatter_plugin', 'declared on `Acme\\Core\\Api\\FormatterInterface`'],
+    });
+    t = await client.call('magento_find_plugin', { targetClass: 'Acme\\Core\\Model\\RichFormatter' });
+    check('find_plugin: plugin on an interface reached through an interface extending several', t, {
+      has: ['formatter_plugin', 'declared on `Acme\\Core\\Api\\FormatterInterface`'],
+    });
+    t = await client.call('magento_find_plugin', { targetClass: 'Acme\\Core\\Model\\OddlyFormatted' });
+    check('find_plugin: unusual but valid layout (group use + alias, split declaration, comments)', t, {
+      has: ['formatter_plugin', 'declared on `Acme\\Core\\Api\\FormatterInterface`'],
+      hasNot: ['NotThisOne', 'OddlyFormattedTrait', 'no `format()` method'],
+    });
+    t = await client.call('magento_find_implementors', { interfaceName: 'Acme\\Core\\Api\\NotifierInterface' });
+    check('find_implementors: unusual layout, group use alias', t, {
+      has: ['`Acme\\Core\\Model\\OddlyFormatted` ('],
+    });
+    t = await client.call('magento_find_implementors', { interfaceName: 'Acme\\Core\\Api\\RepoInterface' });
+    check('find_implementors: implements A,B without spaces', t, {
+      has: ['`Acme\\Core\\Model\\MultiRepo` ('],
+    });
+
     // ── Events ───────────────────────────────────────────────────
     t = await client.call('magento_find_observer', { eventName: 'acme_order_place_before' });
     check('find_observer: same-name declarations merged — re-declared observer stays disabled', t, {

@@ -55,4 +55,13 @@
     <!-- attributes in type/for order, and a commented-out alternative -->
     <preference type="Acme\Core\Model\Formatter" for="Acme\Core\Api\FormatterInterface"/>
     <!-- <preference for="Acme\Core\Api\FormatterInterface" type="Acme\Core\Model\CommentedFormatter"/> -->
+    <type
+        name="Acme\Core\Api\FormatterInterface"
+    >
+        <plugin
+            name="formatter_plugin"
+            type="Acme\Core\Plugin\FormatterPlugin"
+            sortOrder="10"
+        />
+    </type>
 </config>

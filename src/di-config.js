@@ -339,17 +339,46 @@ function resolvePhpName(name, namespace, uses) {
   return namespace ? `${namespace}\\${n}` : n;
 }
 
+/** PHP source without comments; string contents kept (declarations never live in strings). */
+function stripPhpComments(source) {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/(^|[^:\\'"])\/\/[^\n]*/gm, '$1')
+    .replace(/(^|\s)#(?!\[)[^\n]*/gm, '$1');
+}
+
+/**
+ * Import map of a PHP file: `use A\B;`, `use A\B as C;`, group uses `use A\{B, C as D, E\F};`,
+ * several imports per statement. `use function` / `use const` are ignored. Only the code before the
+ * first class-like declaration is read, so `use SomeTrait;` inside a class body is not an import.
+ */
+function parsePhpUses(code) {
+  const firstDecl = /(?:^|[\s;{}])(?:(?:final|abstract|readonly)\s+)*(?:class|interface|trait|enum)\s+\w+/.exec(code);
+  const head = firstDecl ? code.slice(0, firstDecl.index) : code;
+  const uses = new Map();
+  const add = (fq, alias) => {
+    const clean = fq.trim().replace(/^\\/, '');
+    if (clean) uses.set((alias || clean.split('\\').pop()).trim(), clean);
+  };
+  const stmtRe = /(?:^|[;{}\s])use\s+(?!function\b|const\b)([^;]+);/g;
+  let m;
+  while ((m = stmtRe.exec(head)) !== null) {
+    const body = m[1].replace(/\s+/g, ' ').trim();
+    const group = /^([\w\\]+)\\\s*\{([^}]*)\}$/.exec(body);
+    const items = group ? group[2].split(',').map(x => [group[1], x]) : body.split(',').map(x => ['', x]);
+    for (const [prefix, item] of items) {
+      const im = /^\s*([\w\\]+)(?:\s+as\s+(\w+))?\s*$/i.exec(item);
+      if (im) add(prefix ? `${prefix}\\${im[1]}` : im[1], im[2]);
+    }
+  }
+  return uses;
+}
+
 /** Direct parent class and interfaces declared in a PHP source file for `shortName`. */
 export function parsePhpDeclaration(source, shortName) {
-  const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+  const code = stripPhpComments(source);
   const ns = (/^\s*namespace\s+([\w\\]+)\s*;/m.exec(code) || [])[1] || '';
-  const uses = new Map();
-  const useRe = /^\s*use\s+([\w\\]+)(?:\s+as\s+(\w+))?\s*;/gm;
-  let u;
-  while ((u = useRe.exec(code)) !== null) {
-    const fq = u[1].replace(/^\\/, '');
-    uses.set(u[2] || fq.split('\\').pop(), fq);
-  }
+  const uses = parsePhpUses(code);
   const declRe = new RegExp(`\\b(class|interface)\\s+${shortName}\\b([^{]*)\\{`);
   const d = declRe.exec(code);
   if (!d) return { namespace: ns, parents: [], interfaces: [] };
@@ -608,7 +637,7 @@ const NOT_INTERCEPTED_METHODS = ['__construct', '__destruct', '__sleep', '__wake
 
 /** Class modifiers and method signatures (visibility, static, final) of `shortName` in a PHP file. */
 export function parsePhpMembers(source, shortName) {
-  const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+  const code = stripPhpComments(source);
   const decl = new RegExp(`((?:\\b(?:final|abstract|readonly)\\s+)*)\\b(class|interface|trait|enum)\\s+${shortName}\\b`).exec(code);
   if (!decl) return null;
   const methods = new Map();
@@ -675,4 +704,71 @@ export function interceptionStatus(className, methodName, ancestorsOf, membersOf
   }
   if (unknown) return { interceptable: null };
   return { interceptable: false, reason: `no \`${methodName}()\` method on the class or its parents — the plugin method never runs (magic __call methods are not intercepted)` };
+}
+
+// ─── Reverse class hierarchy (instanceof) ───────────────────────
+
+/** All class / interface declarations in a PHP file with their resolved parents and interfaces. */
+export function parsePhpTypes(source) {
+  const code = stripPhpComments(source);
+  const ns = (/^\s*namespace\s+([\w\\]+)\s*;/m.exec(code) || [])[1] || '';
+  const uses = parsePhpUses(code);
+  const out = [];
+  const declRe = /(?:^|[\s;{}])((?:(?:final|abstract|readonly)\s+)*)(class|interface)\s+(\w+)([^{;]*)\{/g;
+  let d;
+  while ((d = declRe.exec(code)) !== null) {
+    const tail = d[4];
+    const ext = (/\bextends\s+([\w\\\s,]+?)(?=\bimplements\b|$)/.exec(tail) || [])[1] || '';
+    const impl = (/\bimplements\s+([\w\\\s,]+)$/.exec(tail.trim()) || [])[1] || '';
+    const list = s => s.split(',').map(x => resolvePhpName(x, ns, uses)).filter(Boolean);
+    const fqcn = ns ? `${ns}\\${d[3]}` : d[3];
+    out.push(d[2] === 'interface'
+      ? { fqcn, kind: 'interface', parents: [], interfaces: list(ext) }
+      : { fqcn, kind: /\babstract\b/.test(d[1]) ? 'abstract class' : 'class', parents: list(ext).slice(0, 1), interfaces: list(impl) });
+  }
+  return out;
+}
+
+/** Build { types: Map fqcn → decl+file, children: Map fqcn → [{ child, relation }] }. */
+export function buildClassHierarchy(entries) {
+  const types = new Map();
+  const children = new Map();
+  const add = (parent, child, relation) => {
+    if (!children.has(parent)) children.set(parent, []);
+    children.get(parent).push({ child, relation });
+  };
+  for (const { relPath, source } of entries) {
+    let decls;
+    try { decls = parsePhpTypes(source); } catch { continue; }
+    for (const t of decls) {
+      if (types.has(t.fqcn)) continue;
+      types.set(t.fqcn, { ...t, file: relPath });
+      for (const p of t.parents) add(p, t.fqcn, 'extends');
+      for (const i of t.interfaces) add(i, t.fqcn, t.kind === 'interface' ? 'extends' : 'implements');
+    }
+  }
+  return { types, children };
+}
+
+/**
+ * Everything that is `instanceof` `fqcn`: implementors, extending interfaces, their implementors
+ * and all subclasses, transitively. Each entry carries the path from `fqcn`.
+ */
+export function instancesOf(hierarchy, fqcn) {
+  const root = normalizeClassName(fqcn);
+  const out = [];
+  const seen = new Set([root]);
+  const queue = [{ name: root, path: [root] }];
+  while (queue.length) {
+    const { name, path } = queue.shift();
+    for (const { child, relation } of hierarchy.children.get(name) || []) {
+      if (seen.has(child)) continue;
+      seen.add(child);
+      const decl = hierarchy.types.get(child);
+      const childPath = [...path, child];
+      out.push({ fqcn: child, kind: decl?.kind || 'class', file: decl?.file || null, relation, via: name, depth: path.length, path: childPath });
+      queue.push({ name: child, path: childPath });
+    }
+  }
+  return out;
 }
