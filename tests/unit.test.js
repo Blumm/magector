@@ -14,6 +14,7 @@ import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'fs';
 import { syncOptionalDeps } from '../scripts/sync-optional-deps.mjs';
 import { getRunningIndexPid, writeIndexPidFile, removeIndexPidFile, lockPathFor } from '../src/index-lock.js';
 import { shouldRespawnServe, MAX_RESPAWNS_PER_WINDOW, RESPAWN_WINDOW_MS, RESPAWN_BASE_DELAY_MS } from '../src/serve-respawn.js';
+import { defaultDbPath } from '../src/paths.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -4827,6 +4828,7 @@ async function main() {
   testToolCountIncludesTraceConfig();
   testSocketQueryDefaultTimeout();
   testIndexLockConcurrencyGuard();
+  testDefaultDbPath();
   testShouldRespawnServe();
   await testRustStatsAsyncSocketFirst();
 
@@ -5273,6 +5275,19 @@ async function testRustStatsAsyncSocketFirst() {
   const failingQueryFn = async () => { throw new Error('Socket query timeout'); };
   await rustStatsAsync(failingQueryFn, coldPathFn);
   assertEq(coldPathCalled, true, 'Cold path invoked as fallback when socket query throws');
+}
+
+// ─── Default DB Path Tests ───────────────────────────────────
+
+function testDefaultDbPath() {
+  console.log('\n📂 defaultDbPath()');
+  assertEq(defaultDbPath({ MAGECTOR_DB: '/x/index.db' }, '/cwd'), '/x/index.db', 'MAGECTOR_DB wins');
+  assertEq(
+    defaultDbPath({ MAGENTO_ROOT: '/srv/magento' }, '/cwd'),
+    path.join('/srv/magento', '.magector', 'index.db'),
+    'Derives from MAGENTO_ROOT, not from the process cwd'
+  );
+  assertEq(defaultDbPath({}, '/cwd'), path.join('/cwd', '.magector', 'index.db'), 'Falls back to cwd');
 }
 
 // ─── Serve Respawn Rate-Limit Policy Tests ───────────────────

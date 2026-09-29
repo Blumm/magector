@@ -34,11 +34,12 @@ import {
 } from 'ruvector/dist/analysis/complexity.js';
 import { resolveBinary } from './binary.js';
 import { resolveModels } from './model.js';
+import { defaultDbPath } from './paths.js';
 import { createRequire } from 'module';
 const __pkg = createRequire(import.meta.url)('../package.json');
 
 const config = {
-  dbPath: process.env.MAGECTOR_DB || './.magector/index.db',
+  dbPath: defaultDbPath(),
   magentoRoot: process.env.MAGENTO_ROOT || process.cwd(),
   watchInterval: parseInt(process.env.MAGECTOR_WATCH_INTERVAL, 10) || 300,
   get rustBinary() { return resolveBinary(); },
@@ -650,7 +651,7 @@ function startBackgroundReindex() {
 
   const hadExistingDb = existsSync(config.dbPath);
   logToFile('WARN', `Starting background re-index to temp path. Old DB ${hadExistingDb ? 'preserved for queries' : 'not found'}.`);
-  console.error(`Database format incompatible. Starting background re-index (log: ${LOG_PATH})`);
+  console.error(`${hadExistingDb ? 'Database format incompatible' : 'No index found'}. Starting background re-index (log: ${LOG_PATH})`);
 
   const reindexArgs = [
     'index',

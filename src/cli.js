@@ -14,6 +14,7 @@ import { init, setup } from './init.js';
 import { checkForUpdate } from './update.js';
 import { createRequire } from 'module';
 import { getRunningIndexPid, writeIndexPidFile, removeIndexPidFile } from './index-lock.js';
+import { defaultDbPath } from './paths.js';
 const __cliPkg = createRequire(import.meta.url)('../package.json');
 
 const args = process.argv.slice(2);
@@ -49,7 +50,7 @@ Index options:
 
 Environment Variables:
   MAGENTO_ROOT             Path to Magento installation (default: cwd)
-  MAGECTOR_DB              Path to index database (default: ./.magector/index.db)
+  MAGECTOR_DB              Path to index database (default: $MAGENTO_ROOT/.magector/index.db)
   MAGECTOR_BIN             Path to magector-core binary
   MAGECTOR_MODELS          Path to ONNX model directory
   MAGECTOR_THREADS         Max threads (overridden by --threads)
@@ -70,7 +71,7 @@ Examples:
 
 function getConfig() {
   return {
-    dbPath: process.env.MAGECTOR_DB || './.magector/index.db',
+    dbPath: defaultDbPath(),
     magentoRoot: process.env.MAGENTO_ROOT || process.cwd()
   };
 }
