@@ -680,12 +680,16 @@ impl Indexer {
                 let root = &self.magento_root;
                 for f in &files {
                     let rel = f.strip_prefix(root).unwrap_or(f).to_string_lossy().to_string();
+                    // Hash first, stat second (as `apply_indexed` does): an edit landing between
+                    // the two is then {new stat, old hash}, re-checked on the next stat change,
+                    // never {old stat, new hash}, which would pass that edit off as "touched".
+                    let sha256 = crate::watcher::file_sha256(f);
                     if let Ok(meta) = std::fs::metadata(f) {
                         let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
                         manifest.files.insert(rel, crate::watcher::FileRecord {
                             mtime,
                             size: meta.len(),
-                            sha256: crate::watcher::file_sha256(f),
+                            sha256,
                             vector_ids: Vec::new(),
                         });
                     }
