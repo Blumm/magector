@@ -6,7 +6,8 @@
  * 2. ~/.magector/models/ (global cache)
  * 3. rust-core/models/ (dev fallback)
  *
- * Downloads from HuggingFace if not found.
+ * Downloads from HuggingFace if not found — into MAGECTOR_MODELS when set, else the
+ * global cache.
  */
 import { existsSync, statSync, mkdirSync, createWriteStream, unlinkSync } from 'fs';
 import { get as httpsGet } from 'https';
@@ -31,6 +32,14 @@ const MODEL_FILES = [
 
 function getGlobalCacheDir() {
   return path.join(os.homedir(), '.magector', 'models');
+}
+
+/**
+ * Where a missing model is downloaded: MAGECTOR_MODELS when set (the directory the user
+ * chose, and the first place resolveModels() looks), else the global cache.
+ */
+export function modelDownloadDir(env = process.env) {
+  return env.MAGECTOR_MODELS || getGlobalCacheDir();
 }
 
 /**
@@ -73,7 +82,7 @@ export async function ensureModels({ silent = false } = {}) {
   const existing = resolveModels();
   if (existing) return existing;
 
-  const targetDir = getGlobalCacheDir();
+  const targetDir = modelDownloadDir();
   mkdirSync(targetDir, { recursive: true });
 
   if (!silent) {

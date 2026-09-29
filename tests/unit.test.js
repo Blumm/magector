@@ -8,6 +8,7 @@
  *   node tests/unit.test.js
  */
 
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'fs';
@@ -15,6 +16,7 @@ import { syncOptionalDeps } from '../scripts/sync-optional-deps.mjs';
 import { getRunningIndexPid, writeIndexPidFile, removeIndexPidFile, lockPathFor } from '../src/index-lock.js';
 import { shouldRespawnServe, MAX_RESPAWNS_PER_WINDOW, RESPAWN_WINDOW_MS, RESPAWN_BASE_DELAY_MS } from '../src/serve-respawn.js';
 import { defaultDbPath, manifestPath, swapInIndex } from '../src/paths.js';
+import { modelDownloadDir } from '../src/model.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -4831,6 +4833,7 @@ async function main() {
   testDefaultDbPath();
   testManifestPath();
   testSwapInIndex();
+  testModelDownloadDir();
   testShouldRespawnServe();
   await testRustStatsAsyncSocketFirst();
 
@@ -5357,6 +5360,20 @@ function testSwapInIndex() {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+}
+
+// ─── Model Download Dir Tests ────────────────────────────────
+
+function testModelDownloadDir() {
+  console.log('\n📦 modelDownloadDir()');
+  const globalCache = path.join(os.homedir(), '.magector', 'models');
+  assertEq(
+    modelDownloadDir({ MAGECTOR_MODELS: '/srv/magento/.magector/models' }),
+    '/srv/magento/.magector/models',
+    'Downloads into MAGECTOR_MODELS when it is set'
+  );
+  assertEq(modelDownloadDir({}), globalCache, 'Falls back to the global cache');
+  assertEq(modelDownloadDir({ MAGECTOR_MODELS: '' }), globalCache, 'An empty MAGECTOR_MODELS counts as unset');
 }
 
 // ─── Serve Respawn Rate-Limit Policy Tests ───────────────────
