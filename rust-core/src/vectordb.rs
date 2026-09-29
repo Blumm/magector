@@ -755,7 +755,7 @@ impl Default for VectorDB {
 /// the decoded file (`persisted_len`), not by opening it: opening rebuilds the
 /// whole HNSW graph, which took about a minute on a 42k-vector index.
 pub fn verify_vector_count(path: &Path, expected: usize) -> Result<()> {
-    let found = VectorDB::persisted_len(path).context("Failed to reopen index after save for verification")?;
+    let found = VectorDB::persisted_len(path).context("Failed to read the saved index for verification")?;
     if found != expected {
         anyhow::bail!(
             "Index verification failed after save: expected {} vectors, found {} in {:?}. \

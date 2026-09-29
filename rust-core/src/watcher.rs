@@ -844,7 +844,7 @@ mod tests {
     #[test]
     fn test_touched_file_is_not_modified() {
         // A checkout, `COPY` or `docker cp` rewrites mtimes of files whose content is
-        // identical (CZUB-178: 4771 false "modified"). Those must not be re-embedded.
+        // identical (a real project saw ~4.8k false "modified"). Those must not be re-embedded.
         let dir = make_temp_dir();
         let php = dir.join("same.php");
         fs::write(&php, "<?php echo 'same';").unwrap();
