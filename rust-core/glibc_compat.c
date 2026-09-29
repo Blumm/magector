@@ -8,6 +8,7 @@
  * Symbols:
  *   __isoc23_strtol   (GLIBC 2.38) → strtol
  *   __isoc23_strtoll  (GLIBC 2.38) → strtoll
+ *   __isoc23_strtoul  (GLIBC 2.38) → strtoul
  *   __isoc23_strtoull (GLIBC 2.38) → strtoull
  *   pidfd_getpid      (GLIBC 2.39) → stub returning -ENOSYS
  *   pidfd_spawnp      (GLIBC 2.39) → stub returning -ENOSYS
@@ -23,6 +24,10 @@ long __isoc23_strtol(const char *nptr, char **endptr, int base) {
 
 long long __isoc23_strtoll(const char *nptr, char **endptr, int base) {
     return strtoll(nptr, endptr, base);
+}
+
+unsigned long __isoc23_strtoul(const char *nptr, char **endptr, int base) {
+    return strtoul(nptr, endptr, base);
 }
 
 unsigned long long __isoc23_strtoull(const char *nptr, char **endptr, int base) {
