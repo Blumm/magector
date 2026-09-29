@@ -377,15 +377,27 @@ fn run_index(
 
     let stats = indexer.index_with_options(force)?;
 
-    tracing::info!("Saving final index to {:?}...", database);
-    indexer.save_atomic(database)?;
+    if stats.db_changed {
+        tracing::info!("Saving final index to {:?}...", database);
+        indexer.save_atomic(database)?;
 
-    // A save that reports success but produces a file that decodes to fewer
-    // live vectors than were in memory (e.g. clobbered by a concurrent writer
-    // targeting the same path) must never be reported as "Indexing complete" —
-    // an index costs hours of CPU, so a silent empty/partial result is worse
-    // than a loud failure that prompts a re-run.
-    magector_core::vectordb::verify_vector_count(database, stats.vectors_created)?;
+        // A save that reports success but produces a file that decodes to fewer
+        // live vectors than were in memory (e.g. clobbered by a concurrent writer
+        // targeting the same path) must never be reported as "Indexing complete" —
+        // an index costs hours of CPU, so a silent empty/partial result is worse
+        // than a loud failure that prompts a re-run.
+        magector_core::vectordb::verify_vector_count(database, stats.vectors_created)?;
+    } else {
+        // Nothing to write: index.db on disk is the one this run loaded (and re-opening it
+        // to verify would rebuild the whole HNSW for nothing).
+        println!("✓ Index unchanged — index.db not rewritten");
+    }
+
+    // The manifest goes last: it must never claim content that index.db on disk does not
+    // hold. If a step above failed, the previous manifest stays and the next run embeds
+    // again what this one did not persist. (It is also written when only stats changed —
+    // touched files, backfilled hashes — since index.db on disk is what this run loaded.)
+    indexer.save_manifest()?;
 
     println!("Files found:    {}", stats.files_found);
     println!("Files indexed:  {}", stats.files_indexed);

@@ -61,6 +61,10 @@ pub struct IndexStats {
     pub js_files: usize,
     pub xml_files: usize,
     pub other_files: usize,
+    /// Whether the caller must write index.db: always after a full index, on resume only
+    /// if a vector was tombstoned or embedded or the DB was compacted. Otherwise the file
+    /// on disk is exactly the one this run loaded.
+    pub db_changed: bool,
 }
 
 /// Intermediate result from parsing (before embedding)
@@ -105,6 +109,9 @@ pub struct Indexer {
     ignore_patterns: Vec<String>,
     /// Embedding batch size (configurable)
     batch_size: usize,
+    /// The manifest `index_with_options` prepared for the sidecar next to index.db. Held
+    /// back so it is written only after index.db is: see `save_manifest`.
+    pending_manifest: Option<crate::watcher::FileManifest>,
 }
 
 impl Indexer {
@@ -162,6 +169,7 @@ impl Indexer {
             descriptions_db: None,
             ignore_patterns,
             batch_size,
+            pending_manifest: None,
         })
     }
 
@@ -190,6 +198,8 @@ impl Indexer {
     /// preserved, and only the remaining files are parsed and embedded.
     /// Pass `force=true` (or use the `--force` CLI flag) to clear the old
     /// index and rebuild from scratch.
+    ///
+    /// Like `index_with_options`, this does not save the finished index: see there.
     pub fn index(&mut self) -> Result<IndexStats> {
         self.index_with_options(false)
     }
@@ -201,8 +211,14 @@ impl Indexer {
     /// by a previous run — files already present in the DB are skipped during
     /// both PHASE 1 parsing and PHASE 2 embedding, and the existing HNSW is
     /// preserved rather than thrown away.
+    ///
+    /// Apart from the periodic crash-safety saves of PHASE 2, this writes neither
+    /// index.db nor the manifest. The caller saves index.db (if `stats.db_changed`),
+    /// verifies it, and only then calls `save_manifest`: the manifest must never claim
+    /// content that index.db on disk does not hold.
     pub fn index_with_options(&mut self, force: bool) -> Result<IndexStats> {
         let mut stats = IndexStats::default();
+        self.pending_manifest = None;
 
         println!();
         println!("  __  __    _    ____ _____ ____ _____ ___  ____  ");
@@ -223,6 +239,8 @@ impl Indexer {
         // *before* clearing anything, so we can filter file discovery below.
         let preexisting_vectors = self.vectordb.len();
         let resume = !force && preexisting_vectors > 0;
+        // A full index always writes index.db; a resume only if it changes something below.
+        stats.db_changed = !resume;
         let already_indexed: HashSet<String> = if resume {
             self.indexed_paths()
         } else {
@@ -289,12 +307,16 @@ impl Indexer {
                     .unwrap_or(path)
                     .to_string_lossy()
                     .to_string();
-                self.remove_vectors_for_path(&relative);
+                if !self.remove_vectors_for_path(&relative).is_empty() {
+                    stats.db_changed = true;
+                }
             }
 
             // Tombstone vectors for deleted files
             for path in &changes.deleted {
-                self.remove_vectors_for_path(path);
+                if !self.remove_vectors_for_path(path).is_empty() {
+                    stats.db_changed = true;
+                }
             }
             manifest.apply_deleted(&changes.deleted);
 
@@ -310,6 +332,7 @@ impl Indexer {
             if self.vectordb_tombstone_ratio() > 0.20 {
                 tracing::info!("Compacting vector DB after removing modified/deleted file vectors");
                 self.compact_vectordb();
+                stats.db_changed = true;
             }
 
             // Files to process = new + modified
@@ -366,23 +389,15 @@ impl Indexer {
         if files.is_empty() {
             println!("✓ Nothing to index — all discovered files already have vectors.\n");
             stats.vectors_created = self.vectordb.len();
-            // Still save manifest (deleted files may have been tombstoned above)
-            if let Some(ref mp) = manifest_path {
+            // The manifest still changes (deleted files, new stats of touched ones, backfilled
+            // hashes); the caller saves it after index.db, and saves index.db only if
+            // stats.db_changed says the vectors did.
+            if manifest_path.is_some() {
                 if !resume {
                     manifest = crate::watcher::FileManifest::from_existing_index(&self.magento_root, &self.indexed_paths());
                     manifest.backfill_hashes(&self.magento_root);
                 }
-                if let Err(e) = manifest.save(mp) {
-                    tracing::warn!("Failed to save manifest: {}", e);
-                }
-            }
-            // Save DB if we tombstoned any vectors (deleted/modified files)
-            if resume && self.vectordb.len() != preexisting_vectors {
-                if let Some(ref db_path) = self.db_path {
-                    if let Err(e) = self.save_atomic(db_path) {
-                        tracing::warn!("Failed to save index after cleanup: {}", e);
-                    }
-                }
+                self.pending_manifest = Some(manifest);
             }
             return Ok(stats);
         }
@@ -580,10 +595,11 @@ impl Indexer {
         println!("                    INDEXING COMPLETE                       ");
         println!("════════════════════════════════════════════════════════════\n");
 
-        // Build and save manifest for future incremental runs.
+        // Build the manifest for future incremental runs, and hold it back for
+        // `save_manifest` — it must not reach disk before index.db does.
         // On a full (non-resume) run, build a fresh manifest from all discovered files.
         // On a resume run, update the existing manifest with newly indexed files.
-        if let Some(ref mp) = manifest_path {
+        if manifest_path.is_some() {
             if !resume {
                 // Full index — build manifest from filesystem, with content hashes
                 manifest = crate::watcher::FileManifest::from_existing_index(&self.magento_root, &self.indexed_paths());
@@ -604,14 +620,30 @@ impl Indexer {
                     }
                 }
             }
-            if let Err(e) = manifest.save(mp) {
-                tracing::warn!("Failed to save manifest: {}", e);
-            } else {
-                tracing::info!("Saved manifest ({} files) to {:?}", manifest.files.len(), mp);
-            }
+            self.pending_manifest = Some(manifest);
         }
 
+        stats.db_changed |= embedded > 0;
         Ok(stats)
+    }
+
+    /// Write the manifest the last `index_with_options` prepared to the sidecar next to
+    /// index.db. Call it only after index.db itself has been saved (and verified): the
+    /// sidecar must never claim content that the index on disk does not hold, so a save
+    /// that fails or is interrupted leaves the previous manifest and the next run embeds
+    /// again what this one did not persist. Does nothing without a database path or a
+    /// prepared manifest.
+    pub fn save_manifest(&mut self) -> Result<()> {
+        let (Some(db_path), Some(manifest)) = (&self.db_path, &self.pending_manifest) else {
+            return Ok(());
+        };
+        let sidecar = crate::watcher::FileManifest::sidecar_path(db_path);
+        manifest
+            .save(&sidecar)
+            .with_context(|| format!("Failed to save manifest {:?}", sidecar))?;
+        tracing::info!("Saved manifest ({} files) to {:?}", manifest.files.len(), sidecar);
+        self.pending_manifest = None;
+        Ok(())
     }
 
     /// Discover files to index (no symlink following for speed)
