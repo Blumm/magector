@@ -111,9 +111,12 @@ jobs:
         shell: bash
         run: |
           BIN=platforms/linux-x64/bin/magector-core
-          if objdump -p "$BIN" | grep -q 'NEEDED.*libstdc++'; then
+          # Capture objdump's output first (as for arm64): `grep -q` closing the pipe early
+          # cannot turn the check into a silent pass.
+          headers=$(objdump -p "$BIN")
+          if grep -q 'NEEDED.*libstdc++' <<< "$headers"; then
             echo "::error::magector-core links libstdc++ dynamically — it will not run on Warden / CentOS Stream 9"
-            objdump -p "$BIN" | grep NEEDED
+            grep NEEDED <<< "$headers"
             exit 1
           fi
           docker run --rm -v "$PWD/platforms/linux-x64/bin:/b:ro" quay.io/centos/centos:stream9 /b/magector-core --version
