@@ -5552,6 +5552,8 @@ function testMcpServerEnv() {
   console.log('\n🔌 mcpServerEnv() (the env init/setup write into the MCP config)');
   const root = '/srv/magento';
   const db = '/srv/magento/.magector/index.db';
+  const models = path.resolve('/srv/magento/.magector/models'); // what init writes; drive-qualified on win32
+  const m = path.resolve('/m');
   const json = (o) => JSON.stringify(o); // also pins key order, which is the order written to the config
 
   assertEq(
@@ -5561,7 +5563,7 @@ function testMcpServerEnv() {
   );
   assertEq(
     json(mcpServerEnv(root, db, {}, { MAGECTOR_MODELS: '/srv/magento/.magector/models' })),
-    json({ MAGENTO_ROOT: root, MAGECTOR_DB: db, MAGECTOR_MODELS: '/srv/magento/.magector/models' }),
+    json({ MAGENTO_ROOT: root, MAGECTOR_DB: db, MAGECTOR_MODELS: models }),
     'MAGECTOR_MODELS set during init is forwarded, so the IDE-launched server finds the model'
   );
   assertEq(
@@ -5576,7 +5578,7 @@ function testMcpServerEnv() {
   );
   assertEq(
     json(mcpServerEnv(root, db, { anthropicApiKey: 'sk-test' }, { MAGECTOR_MODELS: '/m' })),
-    json({ MAGENTO_ROOT: root, MAGECTOR_DB: db, MAGECTOR_MODELS: '/m', ANTHROPIC_API_KEY: 'sk-test' }),
+    json({ MAGENTO_ROOT: root, MAGECTOR_DB: db, MAGECTOR_MODELS: m, ANTHROPIC_API_KEY: 'sk-test' }),
     'The API key is still added, after the paths'
   );
   assertEq(
