@@ -17,7 +17,7 @@ import {
 import { execFileSync, spawn } from 'child_process';
 import { createInterface } from 'readline';
 import { createServer as createNetServer, createConnection } from 'net';
-import { existsSync, statSync, unlinkSync, copyFileSync, renameSync, appendFileSync, writeFileSync, readFileSync, readdirSync, mkdirSync, openSync, closeSync, chmodSync, constants as fsConstants } from 'fs';
+import { existsSync, statSync, unlinkSync, copyFileSync, appendFileSync, writeFileSync, readFileSync, readdirSync, mkdirSync, openSync, closeSync, chmodSync, constants as fsConstants } from 'fs';
 import { stat } from 'fs/promises';
 import { glob } from 'glob';
 import path from 'path';
@@ -34,7 +34,7 @@ import {
 } from 'ruvector/dist/analysis/complexity.js';
 import { resolveBinary } from './binary.js';
 import { resolveModels } from './model.js';
-import { defaultDbPath } from './paths.js';
+import { defaultDbPath, manifestPath, swapInIndex } from './paths.js';
 import { createRequire } from 'module';
 const __pkg = createRequire(import.meta.url)('../package.json');
 
@@ -708,16 +708,9 @@ function startBackgroundReindex() {
     reindexPhase = 0;
     removeReindexPidFile();
     if (code === 0) {
-      // Atomic swap: old → .bak, new → current
+      // Atomic swap: old → .bak, new → current (each DB's manifest travels with it)
       try {
-        if (existsSync(config.dbPath)) {
-          const backupPath = config.dbPath + '.bak';
-          if (existsSync(backupPath)) { try { unlinkSync(backupPath); } catch {} }
-          renameSync(config.dbPath, backupPath);
-          logToFile('INFO', 'Old DB moved to .bak');
-        }
-        renameSync(tempDbPath, config.dbPath);
-        logToFile('INFO', 'New index swapped into place.');
+        swapInIndex(config.dbPath, tempDbPath, (msg) => logToFile('INFO', msg));
       } catch (e) {
         logToFile('ERR', `Failed to swap index: ${e.message}`);
       }
@@ -734,8 +727,9 @@ function startBackgroundReindex() {
       console.error(`Background re-index interrupted (${signal}) — will resume next run.`);
     } else {
       // Genuine failure (non-zero exit, no signal) — the temp DB may be
-      // corrupt, so don't let a later run try to resume from it.
+      // corrupt, so don't let a later run try to resume from it (nor its manifest).
       try { if (existsSync(tempDbPath)) unlinkSync(tempDbPath); } catch {}
+      try { unlinkSync(manifestPath(tempDbPath)); } catch {}
       logToFile('ERR', `Background re-index failed (exit code ${code})`);
       console.error(`Background re-index failed (exit code ${code}). Check ${LOG_PATH}`);
     }

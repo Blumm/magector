@@ -14,7 +14,7 @@ import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'fs';
 import { syncOptionalDeps } from '../scripts/sync-optional-deps.mjs';
 import { getRunningIndexPid, writeIndexPidFile, removeIndexPidFile, lockPathFor } from '../src/index-lock.js';
 import { shouldRespawnServe, MAX_RESPAWNS_PER_WINDOW, RESPAWN_WINDOW_MS, RESPAWN_BASE_DELAY_MS } from '../src/serve-respawn.js';
-import { defaultDbPath } from '../src/paths.js';
+import { defaultDbPath, manifestPath, swapInIndex } from '../src/paths.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -4829,6 +4829,8 @@ async function main() {
   testSocketQueryDefaultTimeout();
   testIndexLockConcurrencyGuard();
   testDefaultDbPath();
+  testManifestPath();
+  testSwapInIndex();
   testShouldRespawnServe();
   await testRustStatsAsyncSocketFirst();
 
@@ -5288,6 +5290,73 @@ function testDefaultDbPath() {
     'Derives from MAGENTO_ROOT, not from the process cwd'
   );
   assertEq(defaultDbPath({}, '/cwd'), path.join('/cwd', '.magector', 'index.db'), 'Falls back to cwd');
+}
+
+// ─── Manifest Pairing Tests ──────────────────────────────────
+
+function testManifestPath() {
+  console.log('\n📂 manifestPath()');
+  // Mirrors Rust's Path::with_extension("manifest") (FileManifest::sidecar_path)
+  assertEq(manifestPath('/x/index.db'), path.join('/x', 'index.manifest'), 'index.db → index.manifest');
+  assertEq(
+    manifestPath('/x/index.db.new'),
+    path.join('/x', 'index.db.manifest'),
+    'index.db.new → index.db.manifest (last extension replaced)'
+  );
+  assertEq(manifestPath('/x/index'), path.join('/x', 'index.manifest'), 'No extension → .manifest appended');
+}
+
+function testSwapInIndex() {
+  console.log('\n── swapInIndex (a re-index swap keeps index.manifest paired with index.db) ──');
+
+  const root = path.join(__dirname, 'tmp_index_swap_test');
+  const db = path.join(root, 'index.db');
+  const tempDb = db + '.new';
+  const manifest = manifestPath(db); // index.manifest
+  const tempManifest = manifestPath(tempDb); // index.db.manifest
+  const read = (p) => (existsSync(p) ? readFileSync(p, 'utf-8') : null);
+  const seed = (files) => {
+    rmSync(root, { recursive: true, force: true });
+    mkdirSync(root, { recursive: true });
+    for (const [p, content] of Object.entries(files)) writeFileSync(p, content);
+  };
+
+  try {
+    // Old index with its manifest, new index built beside it: the manifest follows its DB.
+    seed({ [db]: 'old db', [manifest]: 'old manifest', [tempDb]: 'new db', [tempManifest]: 'new manifest' });
+    const logged = [];
+    swapInIndex(db, tempDb, (m) => logged.push(m));
+    assertEq(read(db), 'new db', 'New DB is live');
+    assertEq(read(manifest), 'new manifest', "The new DB's manifest replaces the old one, not left beside the new DB");
+    assert(!existsSync(tempManifest), 'No orphaned index.db.manifest is left behind');
+    assert(!existsSync(tempDb), 'Temp DB is consumed');
+    assertEq(read(db + '.bak'), 'old db', 'Old DB is kept as .bak');
+    assertEq(logged.join('|'), 'Old DB moved to .bak|New index swapped into place.', 'Logs the .bak move, then the swap');
+
+    // First index (no live DB, no live manifest): no .bak, manifest still follows the DB.
+    seed({ [tempDb]: 'new db', [tempManifest]: 'new manifest' });
+    swapInIndex(db, tempDb);
+    assertEq(read(db), 'new db', 'First index: new DB is live');
+    assertEq(read(manifest), 'new manifest', 'First index: manifest follows the DB');
+    assert(!existsSync(db + '.bak'), 'First index: no .bak without an old DB');
+
+    // The new build saved no manifest: the old one must not survive beside the new DB.
+    seed({ [db]: 'old db', [manifest]: 'old manifest', [tempDb]: 'new db' });
+    swapInIndex(db, tempDb);
+    assertEq(read(db), 'new db', 'No new manifest: new DB is live');
+    assert(!existsSync(manifest), 'No new manifest: the old manifest is removed, never left beside the new DB');
+
+    // The old manifest goes BEFORE any DB is renamed: a crash after the .bak move must not leave it.
+    // (The first log call comes right after that move, so throwing there simulates the crash.)
+    seed({ [db]: 'old db', [manifest]: 'old manifest', [tempDb]: 'new db', [tempManifest]: 'new manifest' });
+    try {
+      swapInIndex(db, tempDb, () => { throw new Error('simulated crash after the old DB moved to .bak'); });
+    } catch {}
+    assert(existsSync(db + '.bak') && !existsSync(db), 'Simulated crash: interrupted between the DB renames');
+    assert(!existsSync(manifest), 'Simulated crash: the old manifest is already gone (index rebuilds it)');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 }
 
 // ─── Serve Respawn Rate-Limit Policy Tests ───────────────────

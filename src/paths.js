@@ -1,6 +1,8 @@
 /**
- * Shared path defaults for the CLI and the MCP server.
+ * Index file locations shared by the CLI and the MCP server: where the DB lives, the
+ * manifest sidecar paired with it, and how a rebuilt DB replaces the live one.
  */
+import { existsSync, renameSync, rmSync, unlinkSync } from 'fs';
 import path from 'path';
 
 /**
@@ -10,4 +12,33 @@ import path from 'path';
  */
 export function defaultDbPath(env = process.env, cwd = process.cwd()) {
   return env.MAGECTOR_DB || path.join(env.MAGENTO_ROOT || cwd, '.magector', 'index.db');
+}
+
+/**
+ * The manifest sidecar the Rust core keeps beside an index DB: the file name with its last
+ * extension replaced by `.manifest` (Rust's Path::with_extension), so `index.db` pairs with
+ * `index.manifest` and `index.db.new` with `index.db.manifest`.
+ */
+export function manifestPath(dbPath) {
+  return path.join(path.dirname(dbPath), path.parse(dbPath).name + '.manifest');
+}
+
+/**
+ * Swap a freshly built index into place (old DB → .bak), moving its manifest with it.
+ * The live manifest describes the OLD index, so it goes FIRST: a crash between the renames
+ * then leaves no manifest (`index` rebuilds it), never the old manifest beside the new DB,
+ * which `index` would trust for content the new DB may not hold. Throws on failure.
+ */
+export function swapInIndex(dbPath, tempDbPath, log = () => {}) {
+  rmSync(manifestPath(dbPath), { force: true });
+  if (existsSync(dbPath)) {
+    const backupPath = dbPath + '.bak';
+    if (existsSync(backupPath)) { try { unlinkSync(backupPath); } catch {} }
+    renameSync(dbPath, backupPath);
+    log('Old DB moved to .bak');
+  }
+  renameSync(tempDbPath, dbPath);
+  const tempManifest = manifestPath(tempDbPath);
+  if (existsSync(tempManifest)) renameSync(tempManifest, manifestPath(dbPath));
+  log('New index swapped into place.');
 }
