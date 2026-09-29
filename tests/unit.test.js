@@ -5359,6 +5359,20 @@ function testSwapInIndex() {
     } catch {}
     assert(existsSync(db + '.bak') && !existsSync(db), 'Simulated crash: interrupted between the DB renames');
     assert(!existsSync(manifest), 'Simulated crash: the old manifest is already gone (index rebuilds it)');
+
+    // A re-index that wrote no temp DB (exit 0, nothing saved): refuse before touching anything,
+    // so the old DB and its manifest stay live instead of the DB being stranded as .bak.
+    seed({ [db]: 'old db', [manifest]: 'old manifest', [tempManifest]: 'stray manifest' });
+    const noDbLog = [];
+    let refused = null;
+    try { swapInIndex(db, tempDb, (m) => noDbLog.push(m)); } catch (e) { refused = e; }
+    assert(refused !== null, 'No temp DB: the swap is refused');
+    assertIncludes(refused?.message, 'index.db.new', 'No temp DB: the error names the missing file');
+    assertEq(read(db), 'old db', 'No temp DB: the old DB stays live');
+    assertEq(read(manifest), 'old manifest', 'No temp DB: the old manifest stays live');
+    assert(!existsSync(db + '.bak'), 'No temp DB: the old DB is not moved to .bak');
+    assertEq(read(tempManifest), 'stray manifest', 'No temp DB: nothing else is touched');
+    assertEq(noDbLog.length, 0, 'No temp DB: nothing is logged as swapped');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

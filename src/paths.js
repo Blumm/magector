@@ -27,9 +27,14 @@ export function manifestPath(dbPath) {
  * Swap a freshly built index into place (old DB → .bak), moving its manifest with it.
  * The live manifest describes the OLD index, so it goes FIRST: a crash between the renames
  * then leaves no manifest (`index` rebuilds it), never the old manifest beside the new DB,
- * which `index` would trust for content the new DB may not hold. Throws on failure.
+ * which `index` would trust for content the new DB may not hold. Throws on failure — before
+ * touching anything when there is no temp DB (a re-index that saved nothing), so the
+ * current DB and manifest stay live rather than the DB being stranded as .bak.
  */
 export function swapInIndex(dbPath, tempDbPath, log = () => {}) {
+  if (!existsSync(tempDbPath)) {
+    throw new Error(`re-index wrote no ${path.basename(tempDbPath)}; keeping the current index`);
+  }
   rmSync(manifestPath(dbPath), { force: true });
   if (existsSync(dbPath)) {
     const backupPath = dbPath + '.bak';
