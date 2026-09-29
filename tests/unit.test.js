@@ -11,12 +11,13 @@
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, renameSync } from 'fs';
+import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, readdirSync, renameSync } from 'fs';
+import { Readable } from 'stream';
 import { syncOptionalDeps } from '../scripts/sync-optional-deps.mjs';
 import { getRunningIndexPid, writeIndexPidFile, removeIndexPidFile, lockPathFor } from '../src/index-lock.js';
 import { shouldRespawnServe, MAX_RESPAWNS_PER_WINDOW, RESPAWN_WINDOW_MS, RESPAWN_BASE_DELAY_MS } from '../src/serve-respawn.js';
 import { defaultDbPath, dbPathForRoot, manifestPath, tempDbPathFor, swapInIndex } from '../src/paths.js';
-import { modelDownloadDir } from '../src/model.js';
+import { modelDownloadDir, downloadFile } from '../src/model.js';
 import { mcpServerEnv } from '../src/init.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -4837,6 +4838,7 @@ async function main() {
   testTempDbPathFor();
   testSwapInIndex();
   testModelDownloadDir();
+  await testDownloadFile();
   testMcpServerEnv();
   testShouldRespawnServe();
   await testRustStatsAsyncSocketFirst();
@@ -5462,6 +5464,86 @@ function testModelDownloadDir() {
   );
   assertEq(modelDownloadDir({}), globalCache, 'Falls back to the global cache');
   assertEq(modelDownloadDir({ MAGECTOR_MODELS: '' }), globalCache, 'An empty MAGECTOR_MODELS counts as unset');
+}
+
+async function testDownloadFile() {
+  console.log('\n📦 downloadFile() (stubbed https.get: a partial file never appears under the final name)');
+  const dir = path.join(__dirname, 'tmp_model_download_test');
+  const dest = path.join(dir, 'model.onnx');
+  const listing = () => (existsSync(dir) ? readdirSync(dir).sort().join(',') : '');
+  const body = Buffer.from('0123456789'.repeat(10)); // 100 bytes
+
+  // Stub of https.get: answers each request with the next queued reply.
+  const stub = (...replies) => {
+    const get = (url, cb) => {
+      get.calls.push(url);
+      const r = replies.shift();
+      const req = { on(event, fn) { if (event === 'error' && r.requestError) process.nextTick(() => fn(r.requestError)); return this; } };
+      if (r.requestError) return req;
+      let res;
+      if (r.chunks) {
+        res = Readable.from(r.chunks);
+      } else { // a connection that dies mid-body
+        res = new Readable({ read() {} });
+        res.push(r.partial);
+        process.nextTick(() => res.destroy(new Error('socket hang up')));
+      }
+      res.statusCode = r.status ?? 200;
+      res.headers = r.headers ?? {};
+      process.nextTick(() => cb(res));
+      return req;
+    };
+    get.calls = [];
+    return get;
+  };
+  const rejection = (promise) => promise.then(() => null, (e) => e);
+  const fresh = () => { rmSync(dir, { recursive: true, force: true }); mkdirSync(dir, { recursive: true }); };
+
+  try {
+    fresh();
+    await downloadFile('https://x.test/m', dest, stub({ chunks: [body.subarray(0, 60), body.subarray(60)], headers: { 'content-length': '100' } }));
+    assertEq(listing(), 'model.onnx', 'Complete body: only the final file is left (no .part)');
+    assertEq(readFileSync(dest).length, 100, 'Complete body: the whole file is in place');
+
+    fresh();
+    await downloadFile('https://x.test/m', dest, stub({ chunks: [body] }));
+    assertEq(listing(), 'model.onnx', 'No Content-Length: a body that ends cleanly is accepted');
+
+    fresh();
+    let err = await rejection(downloadFile('https://x.test/m', dest, stub({ chunks: [body.subarray(0, 40)], headers: { 'content-length': '100' } })));
+    assertIncludes(err?.message, '40 of 100', 'Truncated body: rejected, saying how much arrived');
+    assertEq(listing(), '', 'Truncated body: no final file and no .part');
+
+    fresh();
+    err = await rejection(downloadFile('https://x.test/m', dest, stub({ partial: body.subarray(0, 40), headers: { 'content-length': '100' } })));
+    assertIncludes(err?.message, 'socket hang up', 'Connection dies mid-body: rejected with that error');
+    assertEq(listing(), '', 'Connection dies mid-body: no final file and no .part');
+
+    fresh();
+    err = await rejection(downloadFile('https://x.test/m', dest, stub({ status: 404, chunks: ['not found'] })));
+    assertIncludes(err?.message, 'HTTP 404', 'HTTP error: rejected');
+    assertEq(listing(), '', 'HTTP error: nothing is left behind');
+
+    fresh();
+    err = await rejection(downloadFile('https://x.test/m', dest, stub({ requestError: new Error('getaddrinfo ENOTFOUND x.test') })));
+    assertIncludes(err?.message, 'ENOTFOUND', 'Request error: rejected');
+    assertEq(listing(), '', 'Request error: nothing is left behind');
+
+    fresh();
+    const get = stub({ status: 302, headers: { location: '/cdn/m' }, chunks: [] }, { chunks: [body], headers: { 'content-length': '100' } });
+    await downloadFile('https://x.test/m', dest, get);
+    assertEq(get.calls.join(' '), 'https://x.test/m https://x.test/cdn/m', 'Redirect: followed to the new location');
+    assertEq(listing(), 'model.onnx', 'Redirect: only the final file is left');
+
+    fresh();
+    writeFileSync(dest, 'good');
+    err = await rejection(downloadFile('https://x.test/m', dest, stub({ chunks: [body.subarray(0, 40)], headers: { 'content-length': '100' } })));
+    assert(err !== null, 'Failed download over an existing file: rejected');
+    assertEq(readFileSync(dest, 'utf-8'), 'good', 'Failed download over an existing file: the existing file is untouched');
+    assertEq(listing(), 'model.onnx', 'Failed download over an existing file: no .part left');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 // ─── MCP Config Env Tests ────────────────────────────────────
