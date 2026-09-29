@@ -23,7 +23,7 @@ jobs:
             binary: magector-core
           - platform: linux-arm64
             target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             binary: magector-core
           - platform: win32-x64
             target: x86_64-pc-windows-msvc
@@ -43,7 +43,7 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
 
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
@@ -87,6 +87,24 @@ jobs:
           mkdir -p platforms/${{ matrix.platform }}/bin
           cp rust-core/target/${{ matrix.target }}/release/${{ matrix.binary }} \
              platforms/${{ matrix.platform }}/bin/
+
+      - name: Portability check (linux-arm64)
+        if: matrix.platform == 'linux-arm64'
+        shell: bash
+        run: |
+          BIN=platforms/linux-arm64/bin/magector-core
+          # Capture objdump's output first: a missing objdump then fails the step, and
+          # `grep -q` closing the pipe early cannot turn the check into a silent pass.
+          headers=$(aarch64-linux-gnu-objdump -p "$BIN")
+          if grep -q 'NEEDED.*libstdc++' <<< "$headers"; then
+            echo "::error::the arm64 magector-core links libstdc++ dynamically"; exit 1
+          fi
+          symbols=$(aarch64-linux-gnu-objdump -T "$BIN")
+          newest=$(grep -oE 'GLIBC_[0-9]+\.[0-9]+' <<< "$symbols" | sort -Vu | tail -1)
+          echo "newest glibc symbol version: $newest"
+          if [ "$(printf '%s\n' GLIBC_2.34 "$newest" | sort -V | tail -1)" != GLIBC_2.34 ]; then
+            echo "::error::the arm64 magector-core needs $newest (> GLIBC_2.34) — it will not run on CentOS Stream 9 / RHEL 9"; exit 1
+          fi
 
       - name: Portability smoke test (linux-x64)
         if: matrix.platform == 'linux-x64'
