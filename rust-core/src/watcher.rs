@@ -102,6 +102,11 @@ impl FileRecord {
     pub fn stale() -> Self {
         FileRecord { mtime: SystemTime::UNIX_EPOCH, size: u64::MAX, sha256: None, vector_ids: Vec::new() }
     }
+
+    /// Whether this is the sentinel `stale()` builds.
+    pub fn is_stale(&self) -> bool {
+        self.size == u64::MAX && self.mtime == SystemTime::UNIX_EPOCH && self.sha256.is_none()
+    }
 }
 
 /// On-disk record before 2.17.0 (mtime + size only), decoded for migration.
@@ -295,6 +300,23 @@ impl FileManifest {
         }
 
         manifest
+    }
+
+    /// Adopt the sidecar's record for every path this manifest tracks, when that record
+    /// carries a content hash or is a stale sentinel. `from_existing_index` cannot know
+    /// hashes; the sidecar describes the index.db a `serve` just loaded, so its hashes let
+    /// a checkout that only rewrites mtimes be classified touched instead of re-embedded,
+    /// and its stale sentinels keep forcing the re-embed they demand. A sidecar record with
+    /// neither (v1, or an unreadable hash) adds nothing over the current stat and is skipped.
+    /// Paths the index does not hold are never added.
+    pub fn seed_from(&mut self, sidecar: &FileManifest) {
+        for (path, rec) in self.files.iter_mut() {
+            if let Some(from) = sidecar.files.get(path) {
+                if from.sha256.is_some() || from.is_stale() {
+                    *rec = from.clone();
+                }
+            }
+        }
     }
 
     /// Scan the filesystem and detect changes against the manifest
@@ -502,6 +524,11 @@ pub fn watcher_loop(
         let paths = idx.indexed_paths();
         FileManifest::from_existing_index(&magento_root, &paths)
     };
+    // The sidecar describes the index.db this serve just loaded: take its content hashes
+    // (and stale sentinels) so a checkout during serve is "touched", not re-embedded.
+    if let Some(sidecar) = FileManifest::load(&FileManifest::sidecar_path(&db_path)) {
+        manifest.seed_from(&sidecar);
+    }
 
     {
         let mut s = lock_recover(&status, "status");
@@ -739,6 +766,79 @@ mod tests {
             sha256: file_sha256(path),
             vector_ids,
         }
+    }
+
+    /// A manifest tracking `rel` with its current stat and no hash (what
+    /// `from_existing_index` builds), plus a sidecar whose record for `rel` is `sidecar_rec`.
+    fn seeded(dir: &Path, rel: &str, sidecar_rec: Option<FileRecord>) -> FileManifest {
+        let indexed: std::collections::HashSet<String> = [rel.to_string()].into();
+        let mut watcher = FileManifest::from_existing_index(dir, &indexed);
+        let mut sidecar = FileManifest::new();
+        if let Some(rec) = sidecar_rec {
+            sidecar.files.insert(rel.to_string(), rec);
+        }
+        // a path the sidecar knows but the index does not must not be added
+        sidecar.files.insert("not-in-index.php".to_string(), FileRecord::stale());
+        watcher.seed_from(&sidecar);
+        assert!(!watcher.files.contains_key("not-in-index.php"));
+        watcher
+    }
+
+    #[test]
+    fn test_seed_from_sidecar_hash_makes_a_checkout_touched() {
+        // serve starts from the index, whose records have no hash. After a checkout rewrites
+        // the mtime, the sidecar's hash is what tells "touched" from "modified".
+        let dir = make_temp_dir();
+        let php = dir.join("same.php");
+        fs::write(&php, "<?php echo 'same';").unwrap();
+        let mut rec = record_for(&php, vec![7]);
+        rec.mtime = SystemTime::UNIX_EPOCH; // the sidecar has the stat from index time
+        let watcher = seeded(&dir, "same.php", Some(rec));
+        let changes = watcher.detect_changes(&dir).unwrap();
+        assert!(changes.modified.is_empty(), "identical content must not be re-embedded");
+        assert_eq!(changes.touched.len(), 1);
+
+        // a sidecar record without a hash (v1, or a hash that could not be read) says nothing
+        // the watcher's current-stat record does not: it is not copied
+        let mut unhashed = record_for(&php, vec![7]);
+        unhashed.mtime = SystemTime::UNIX_EPOCH;
+        unhashed.sha256 = None;
+        let watcher = seeded(&dir, "same.php", Some(unhashed));
+        assert_ne!(watcher.files["same.php"].mtime, SystemTime::UNIX_EPOCH);
+        assert!(watcher.detect_changes(&dir).unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_seed_from_sidecar_edit_while_down_is_modified() {
+        // the file changed after it was indexed (serve was not running): the sidecar's hash
+        // differs from the disk, so the watcher re-embeds it instead of trusting the stat.
+        let dir = make_temp_dir();
+        let php = dir.join("edit.php");
+        fs::write(&php, "<?php echo 'old';").unwrap();
+        let mut rec = record_for(&php, vec![1]);
+        rec.mtime = SystemTime::UNIX_EPOCH;
+        fs::write(&php, "<?php echo 'new content';").unwrap();
+        let changes = seeded(&dir, "edit.php", Some(rec)).detect_changes(&dir).unwrap();
+        assert_eq!(rel_paths(&dir, &changes.modified), vec!["edit.php"]);
+        assert!(changes.touched.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_seed_from_sidecar_stale_sentinel_is_modified() {
+        // a path the sidecar withdrew its claim on keeps forcing a re-embed
+        let dir = make_temp_dir();
+        let php = dir.join("stale.php");
+        fs::write(&php, "<?php echo 'x';").unwrap();
+        let watcher = seeded(&dir, "stale.php", Some(FileRecord::stale()));
+        let changes = watcher.detect_changes(&dir).unwrap();
+        assert_eq!(rel_paths(&dir, &changes.modified), vec!["stale.php"]);
+        assert!(changes.touched.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
