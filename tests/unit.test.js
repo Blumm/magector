@@ -17,6 +17,7 @@ import { getRunningIndexPid, writeIndexPidFile, removeIndexPidFile, lockPathFor 
 import { shouldRespawnServe, MAX_RESPAWNS_PER_WINDOW, RESPAWN_WINDOW_MS, RESPAWN_BASE_DELAY_MS } from '../src/serve-respawn.js';
 import { defaultDbPath, manifestPath, swapInIndex } from '../src/paths.js';
 import { modelDownloadDir } from '../src/model.js';
+import { mcpServerEnv } from '../src/init.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -4834,6 +4835,7 @@ async function main() {
   testManifestPath();
   testSwapInIndex();
   testModelDownloadDir();
+  testMcpServerEnv();
   testShouldRespawnServe();
   await testRustStatsAsyncSocketFirst();
 
@@ -5374,6 +5376,46 @@ function testModelDownloadDir() {
   );
   assertEq(modelDownloadDir({}), globalCache, 'Falls back to the global cache');
   assertEq(modelDownloadDir({ MAGECTOR_MODELS: '' }), globalCache, 'An empty MAGECTOR_MODELS counts as unset');
+}
+
+// ─── MCP Config Env Tests ────────────────────────────────────
+
+function testMcpServerEnv() {
+  console.log('\n🔌 mcpServerEnv() (the env init/setup write into the MCP config)');
+  const root = '/srv/magento';
+  const db = '/srv/magento/.magector/index.db';
+  const json = (o) => JSON.stringify(o); // also pins key order, which is the order written to the config
+
+  assertEq(
+    json(mcpServerEnv(root, db, {}, {})),
+    json({ MAGENTO_ROOT: root, MAGECTOR_DB: db }),
+    'Without MAGECTOR_MODELS the env is just the root and the DB'
+  );
+  assertEq(
+    json(mcpServerEnv(root, db, {}, { MAGECTOR_MODELS: '/srv/magento/.magector/models' })),
+    json({ MAGENTO_ROOT: root, MAGECTOR_DB: db, MAGECTOR_MODELS: '/srv/magento/.magector/models' }),
+    'MAGECTOR_MODELS set during init is forwarded, so the IDE-launched server finds the model'
+  );
+  assertEq(
+    json(mcpServerEnv(root, db, {}, { MAGECTOR_MODELS: '' })),
+    json({ MAGENTO_ROOT: root, MAGECTOR_DB: db }),
+    'An empty MAGECTOR_MODELS counts as unset'
+  );
+  assertEq(
+    mcpServerEnv(root, db, {}, { MAGECTOR_MODELS: 'models' }).MAGECTOR_MODELS,
+    path.resolve('models'),
+    'A relative MAGECTOR_MODELS is written absolute (the server starts in another cwd)'
+  );
+  assertEq(
+    json(mcpServerEnv(root, db, { anthropicApiKey: 'sk-test' }, { MAGECTOR_MODELS: '/m' })),
+    json({ MAGENTO_ROOT: root, MAGECTOR_DB: db, MAGECTOR_MODELS: '/m', ANTHROPIC_API_KEY: 'sk-test' }),
+    'The API key is still added, after the paths'
+  );
+  assertEq(
+    json(mcpServerEnv(root, db, { anthropicApiKey: 'sk-test' }, {})),
+    json({ MAGENTO_ROOT: root, MAGECTOR_DB: db, ANTHROPIC_API_KEY: 'sk-test' }),
+    'API key without MAGECTOR_MODELS: unchanged from before'
+  );
 }
 
 // ─── Serve Respawn Rate-Limit Policy Tests ───────────────────
