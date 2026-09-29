@@ -347,14 +347,29 @@ The `describe` command and `magento_describe` MCP tool require an Anthropic API 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `MAGENTO_ROOT` | Path to Magento installation | Current directory |
-| `MAGECTOR_DB` | Path to index database | `./.magector/index.db` |
+| `MAGECTOR_DB` | Path to index database | `$MAGENTO_ROOT/.magector/index.db` (`index <path>`: `<path>/.magector/index.db`) |
 | `MAGECTOR_BIN` | Path to magector-core binary | Auto-detected |
-| `MAGECTOR_MODELS` | Path to ONNX model directory | `~/.magector/models/` |
+| `MAGECTOR_MODELS` | Path to the ONNX model directory; a missing model is downloaded here | `~/.magector/models/` |
 | `MAGECTOR_INDEX_TIMEOUT` | Indexing wall-clock timeout in milliseconds. Override for very large codebases or CPU-constrained environments. | `14400000` (4 h) |
 | `MAGECTOR_THREADS` | Max ONNX intra-op + rayon parsing threads. Equivalent to the `--threads` CLI flag. | Half of CPU cores |
 | `OMP_NUM_THREADS` | Fallback thread limit if `MAGECTOR_THREADS` is not set (de facto standard for ONNX/OpenMP). | — |
 | `MAGECTOR_BATCH_SIZE` | Embedding batch size (higher = faster, more RAM). Equivalent to `--batch-size`. | `256` |
 | `ANTHROPIC_API_KEY` | API key for description generation (`describe` command) | — |
+
+These defaults apply to the Node.js CLI and the MCP server. The Rust core's own `-d` flag (see above) defaults to `./.magector/index.db` in its working directory.
+
+### Running in containers
+
+The Linux binaries (x64 and arm64) link libstdc++ statically and need glibc 2.34 or newer: they run in Warden and DDEV PHP containers (CentOS Stream 9 / RHEL 9), Debian 12 and Ubuntu 22.04+. Alpine (musl) is not supported — use a glibc Node image such as `node:22-bookworm-slim`.
+
+Keep the index and the model beside the code, so they survive container restarts and work offline. Set both variables for every magector command — `index`, `search` and the MCP server:
+
+```bash
+export MAGENTO_ROOT=/var/www/html MAGECTOR_MODELS=/var/www/html/.magector/models
+npx -y magector@2.17.0 index
+```
+
+Re-running `index` embeds only files whose content changed: a checkout or `docker cp` that only rewrote timestamps costs a content-hash comparison, not a re-embed, and a run that changes nothing leaves `index.db` untouched. Set `MAGECTOR_NO_UPDATE=1` in images and CI so the CLI does not re-run itself as the latest npm version.
 
 ### Constraining CPU usage during indexing
 
