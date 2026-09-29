@@ -225,6 +225,10 @@ impl FileManifest {
         if paths.is_empty() {
             return Ok(false);
         }
+        // The watcher thread and the serve `describe` command both mark paths here: one
+        // read-modify-write of the sidecar at a time, or one's marks could be lost.
+        static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+        let _one_at_a_time = ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(mut manifest) = Self::load(sidecar) else {
             if matches!(sidecar.try_exists(), Ok(false)) {
                 return Ok(false);
@@ -932,6 +936,34 @@ mod tests {
         let bytes = fs::read(&sidecar).unwrap();
         assert!(!FileManifest::mark_stale_in_sidecar(&sidecar, &[]).unwrap());
         assert_eq!(fs::read(&sidecar).unwrap(), bytes);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_concurrent_marks_do_not_lose_each_other() {
+        // The watcher thread and the serve `describe` command both mark paths stale, and each
+        // mark is a read-modify-write of the same sidecar: unserialized, they lose updates.
+        let dir = make_temp_dir();
+        let sidecar = dir.join("index.manifest");
+        FileManifest::new().save(&sidecar).unwrap();
+
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let sidecar = sidecar.clone();
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        let paths = vec![format!("t{t}/f{i}.php")];
+                        assert!(FileManifest::mark_stale_in_sidecar(&sidecar, &paths).unwrap());
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("a mark failed while another was writing");
+        }
+
+        assert_eq!(FileManifest::load(&sidecar).unwrap().files.len(), 8 * 25, "a mark was lost");
 
         let _ = fs::remove_dir_all(&dir);
     }

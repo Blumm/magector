@@ -633,6 +633,24 @@ fn run_serve(
     Ok(())
 }
 
+/// Before index.db is changed on behalf of `paths`, mark them stale in the sidecar next to
+/// it, as the serve watcher does: `index` trusts a matching hash there. A sidecar that
+/// cannot be marked is removed; if it cannot even be removed this returns false, and
+/// index.db must be left alone.
+fn withdraw_sidecar_claims(db_path: &std::path::Path, paths: &[String]) -> bool {
+    let sidecar = magector_core::watcher::FileManifest::sidecar_path(db_path);
+    if let Err(e) = magector_core::watcher::FileManifest::mark_stale_in_sidecar(&sidecar, paths) {
+        eprintln!("Warning: could not mark the described files stale in {:?} ({}); removing it", sidecar, e);
+        if let Err(e) = fs::remove_file(&sidecar) {
+            if sidecar.exists() {
+                eprintln!("Warning: could not remove {:?} ({}); not re-embedding the described files", sidecar, e);
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn handle_serve_request(
     indexer: &Arc<Mutex<Indexer>>,
     watcher_status: &Arc<Mutex<WatcherStatus>>,
@@ -766,20 +784,23 @@ fn handle_serve_request(
                             let mut idx = indexer.lock().unwrap();
                             // Ensure descriptions DB is set for re-embedding
                             idx.set_descriptions_db(std::path::PathBuf::from(&output));
-                            // Remove old vectors for these paths
-                            for rel_path in &report.described_paths {
-                                idx.remove_vectors_for_path(rel_path);
-                            }
-                            let reindex_result: Result<Vec<(String, Vec<usize>)>> = idx.index_files(&files_to_reindex);
-                            match reindex_result {
-                                Ok(indexed) => {
-                                    eprintln!("Re-indexed {} files with descriptions", indexed.len());
-                                    if let Err(e) = idx.save(db_path) {
-                                        eprintln!("Warning: failed to save index after re-embed: {}", e);
-                                    }
+                            // The sidecar must stop claiming these files before their vectors change
+                            if withdraw_sidecar_claims(db_path, &report.described_paths) {
+                                // Remove old vectors for these paths
+                                for rel_path in &report.described_paths {
+                                    idx.remove_vectors_for_path(rel_path);
                                 }
-                                Err(e) => {
-                                    eprintln!("Warning: re-index after describe failed: {}", e);
+                                let reindex_result: Result<Vec<(String, Vec<usize>)>> = idx.index_files(&files_to_reindex);
+                                match reindex_result {
+                                    Ok(indexed) => {
+                                        eprintln!("Re-indexed {} files with descriptions", indexed.len());
+                                        if let Err(e) = idx.save_atomic(db_path) {
+                                            eprintln!("Warning: failed to save index after re-embed: {}", e);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Warning: re-index after describe failed: {}", e);
+                                    }
                                 }
                             }
                         }
