@@ -117,10 +117,10 @@ struct FileManifestV1 {
     files: HashMap<String, FileRecordV1>,
 }
 
-/// Prefix of a v2 manifest file. A v1 file starts with a bincode varint map length followed
-/// by a path string, so it could begin with these bytes only with exactly 77 entries and a
-/// 71-byte first path starting with `MF\x02` (no real path does); `load` would then read it
-/// as v2 and return None when that fails, as for a missing manifest.
+/// Prefix of a v2 manifest file. A v1 file (bincode varint map length, then a path string)
+/// can start with "MGMF" only with exactly 77 entries and a 71-byte first path starting with
+/// "MF". `load` then returns None (a rebuild), except for a first path starting "MF\x02\0",
+/// which would read as an empty v2 manifest — no path can contain NUL.
 const MANIFEST_MAGIC: &[u8] = b"MGMF\x02";
 
 /// SHA-256 of a file's content; `None` when the file cannot be read.
@@ -129,6 +129,13 @@ pub(crate) fn file_sha256(path: &Path) -> Option<[u8; 32]> {
     let mut out = [0u8; 32];
     out.copy_from_slice(&Sha256::digest(&data));
     Some(out)
+}
+
+/// Whether `path` currently has this mtime and size.
+fn stat_matches(path: &Path, mtime: SystemTime, size: u64) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.modified().unwrap_or(SystemTime::UNIX_EPOCH) == mtime && m.len() == size)
+        .unwrap_or(false)
 }
 
 /// Manifest of all indexed files and their metadata
@@ -358,13 +365,13 @@ impl FileManifest {
     ) {
         for (rel_path, vector_ids) in indexed {
             let abs_path = magento_root.join(rel_path);
-            let (mtime, size, sha256) = match std::fs::metadata(&abs_path) {
-                Ok(m) => (
-                    m.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                    m.len(),
-                    file_sha256(&abs_path),
-                ),
-                Err(_) => (SystemTime::UNIX_EPOCH, 0, None),
+            // Hash first, stat second: an edit landing between the two is then recorded as
+            // {new stat, old hash}, which a later stat change re-checks — never as
+            // {old stat, new hash}, which would pass that edit off as "touched" for good.
+            let sha256 = file_sha256(&abs_path);
+            let (mtime, size) = match std::fs::metadata(&abs_path) {
+                Ok(m) => (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len()),
+                Err(_) => (SystemTime::UNIX_EPOCH, 0),
             };
             self.files.insert(
                 rel_path.clone(),
@@ -406,13 +413,14 @@ impl FileManifest {
                 continue;
             }
             let abs = magento_root.join(rel);
-            let Ok(meta) = std::fs::metadata(&abs) else { continue };
-            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            if mtime == rec.mtime && meta.len() == rec.size {
-                if let Some(hash) = file_sha256(&abs) {
-                    rec.sha256 = Some(hash);
-                    filled += 1;
-                }
+            if !stat_matches(&abs, rec.mtime, rec.size) {
+                continue;
+            }
+            // Keep the hash only if the file did not change while it was read: the hash of
+            // newer content next to the old stat would pass a later edit off as "touched".
+            if let Some(hash) = file_sha256(&abs).filter(|_| stat_matches(&abs, rec.mtime, rec.size)) {
+                rec.sha256 = Some(hash);
+                filled += 1;
             }
         }
         filled
@@ -969,6 +977,45 @@ mod tests {
         loaded.save(&path).unwrap();
         assert!(fs::read(&path).unwrap().starts_with(MANIFEST_MAGIC), "saves write v2");
         assert_eq!(FileManifest::load(&path).unwrap().files["a.php"].size, 42);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_v2_manifest_byte_layout_is_pinned() {
+        // This literal pins the released 2.17.0 on-disk format. Any change to the record
+        // layout (field, type, order) changes these bytes: it needs a new version byte and
+        // a migration in `load`, or sidecars written by 2.17.0 are misread.
+        const V2_HEX: &str = "4d474d46020105612e706870fc00f15365002a0107070707070707070707070707070707070707070707070707070707070707070103";
+
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let record = FileRecord {
+            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            size: 42,
+            sha256: Some([7u8; 32]),
+            vector_ids: vec![3],
+        };
+        let mut manifest = FileManifest::new();
+        manifest.files.insert("a.php".to_string(), record.clone());
+
+        let dir = make_temp_dir();
+        let path = dir.join("index.manifest");
+        manifest.save(&path).unwrap();
+        assert_eq!(hex(&fs::read(&path).unwrap()), V2_HEX, "the v2 byte layout changed");
+
+        // ... and the pinned bytes load back to the same record.
+        let bytes: Vec<u8> = (0..V2_HEX.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&V2_HEX[i..i + 2], 16).unwrap())
+            .collect();
+        fs::write(&path, bytes).unwrap();
+        let loaded = FileManifest::load(&path).expect("the pinned v2 bytes must load");
+        assert_eq!(loaded.files.len(), 1);
+        let got = &loaded.files["a.php"];
+        assert_eq!(got.mtime, record.mtime);
+        assert_eq!(got.size, record.size);
+        assert_eq!(got.sha256, record.sha256);
+        assert_eq!(got.vector_ids, record.vector_ids);
 
         let _ = fs::remove_dir_all(&dir);
     }
