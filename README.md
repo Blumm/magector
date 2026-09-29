@@ -448,6 +448,17 @@ All search tools return structured JSON:
 - `badges` -- role indicators: `plugin`, `controller`, `observer`, `repository`, `graphql-resolver`, `model`, `block`
 - `snippet` -- first 300 characters of indexed content for quick assessment
 
+### How DI and event results are resolved
+
+For a fully qualified class name, the DI and event tools (`find_plugin`, `find_preference`, `find_observer`, `find_di_wiring`, `trace_dependency`, `impact_analysis`, `find_event_flow`) answer from the configuration files themselves, the way Magento resolves them at runtime:
+
+- di.xml / events.xml are parsed as XML (comments ignored, self-closing elements handled); the DI area comes from the directory (`etc/<area>/di.xml`).
+- Plugins declared on parent classes and interfaces apply; a virtual type uses the plugins of its real class. A plugin's methods come from its declared type, the code that runs from the instantiated class (preference applied).
+- Declarations with the same name are merged in module load order (`app/etc/config.php`); the output shows the effective state, superseded declarations, declarations of disabled modules, and warns when the order between two modules is not fixed by `<sequence>` or composer `require` and matters.
+- Plugins that cannot run are marked: final class, `NoninterceptableInterface`, final / static / non-public / missing target method.
+
+A short class name keeps the fuzzy (substring) matching. The results are static analysis of the files — for a running installation, the object manager configuration read at runtime remains the reference (note that `bin/magento dev:di:info` lists plugins disabled with `disabled="true"` as active).
+
 ### Search Tools
 
 | Tool | Description |

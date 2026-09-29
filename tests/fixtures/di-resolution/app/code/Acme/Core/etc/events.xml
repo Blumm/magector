@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="urn:magento:framework:Event/etc/events.xsd">
+    <event name="acme_order_place_before">
+        <observer name="stock" instance="Acme\Core\Observer\Stock"/>
+    </event>
+    <event name="acme_order_place_after">
+        <observer name="audit" instance="Acme\Core\Observer\Audit"/>
+    </event>
+    <event name="acme_cart_save">
+        <observer name="log" instance="Acme\Core\Observer\Audit"/>
+    </event>
+</config>

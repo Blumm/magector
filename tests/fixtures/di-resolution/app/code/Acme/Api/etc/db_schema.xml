@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<schema xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="urn:magento:framework:Setup/Declaration/Schema/etc/schema.xsd">
+    <table name="acme_log" resource="default" engine="innodb" comment="Acme log">
+        <column xsi:type="int" name="log_id" unsigned="true" nullable="false" identity="true"/>
+        <column xsi:type="text" name="message" nullable="true"/>
+        <column xsi:type="timestamp" name="created_at" nullable="false" default="CURRENT_TIMESTAMP"/>
+        <constraint xsi:type="primary" referenceId="PRIMARY"><column name="log_id"/></constraint>
+        <index referenceId="ACME_LOG_CREATED_AT" indexType="btree"><column name="created_at"/></index>
+    </table>
+</schema>

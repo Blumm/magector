@@ -1,0 +1,55 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="urn:magento:framework:ObjectManager/etc/config.xsd">
+    <preference for="Acme\Core\Api\RepoInterface" type="Acme\Core\Model\Repo"/>
+    <preference for="Acme\Core\Api\PriceInterface" type="Acme\Core\Model\DefaultPrice"/>
+    <preference for="Acme\Core\Api\NotifierInterface" type="Acme\Core\Model\Notifier"/>
+    <type name="Acme\Core\Api\RepoInterface">
+        <plugin name="core_repo_logger" type="Acme\Core\Plugin\RepoLogger"/>
+    </type>
+    <type name="Acme\Core\Model\Repo">
+        <plugin name="core_disable_me" type="Acme\Core\Plugin\DisableMe"/>
+    </type>
+    <type name="Acme\Core\Model\BaseService">
+        <plugin name="base_audit" type="Acme\Core\Plugin\BaseAudit"/>
+    </type>
+    <virtualType name="Acme\Core\Plugin\VirtualLogger" type="Acme\Core\Plugin\RepoLogger"/>
+    <preference for="Acme\Core\Api\AuditPluginInterface" type="Acme\Core\Plugin\AuditPluginImpl"/>
+    <type name="Acme\Core\Model\Audited">
+        <plugin name="virtual_plugin" type="Acme\Core\Plugin\VirtualLogger"/>
+        <plugin name="iface_plugin" type="Acme\Core\Api\AuditPluginInterface"/>
+        <plugin name="pref_plugin" type="Acme\Core\Plugin\BasePlugin"/>
+    </type>
+    <type name="Acme\Core\Model\Notifier" shared="false" />
+    <type name="Acme\Core\Model\Late">
+        <plugin name="after_self_closing_type" type="Acme\Core\Plugin\LatePlugin"/>
+    </type>
+    <virtualType name="Acme\Core\Model\SpecialRepo" type="Acme\Core\Model\Repo"/>
+    <virtualType name="Acme\Core\Model\SpecialRepoLevel2" type="Acme\Core\Model\SpecialRepo"/>
+    <type name="Acme\Core\Model\SpecialRepo">
+        <plugin name="virtual_only_plugin" type="Acme\Core\Plugin\VirtualOnly"/>
+    </type>
+    <virtualType name="Acme\Core\Model\JsonExporter" type="Acme\Core\Model\Exporter">
+        <arguments>
+            <argument name="format" xsi:type="string">json</argument>
+        </arguments>
+    </virtualType>
+    <preference for="Acme\Core\Api\ExporterInterface" type="Acme\Core\Model\JsonExporter"/>
+    <!-- Removed in 2.0, kept for reference:
+    <virtualType name="Acme\Core\Model\OldRepo" type="Acme\Core\Model\Repo"/>
+    <type name="Acme\Core\Model\Repo">
+        <plugin name="commented_out_plugin" type="Acme\Core\Plugin\DisableMe"/>
+    </type>
+    -->
+    <virtualType name="Acme\Core\Model\RepositoryHelper" type="Acme\Core\Model\Notifier"/>
+    <virtualType name="Acme\Core\Model\Alpha" type="Acme\Core\Model\Repo"/>
+    <virtualType name="Acme\Core\Model\Beta" type="Acme\Core\Model\Alpha"/>
+    <type name="Acme\Core\Model\Guarded">
+        <plugin name="guard_plugin" type="Acme\Core\Plugin\GuardPlugin"/>
+    </type>
+    <type name="Acme\Core\Model\FinalService">
+        <plugin name="final_class_plugin" type="Acme\Core\Plugin\GuardPlugin"/>
+    </type>
+    <type name="Acme\Core\Model\NoIntercept">
+        <plugin name="noninterceptable_plugin" type="Acme\Core\Plugin\GuardPlugin"/>
+    </type>
+</config>

@@ -6,6 +6,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions corresp
 
 ## [Unreleased]
 
+### Added
+- **Effective DI state per area.** `find_plugin`, `trace_dependency` and `find_di_wiring` add an *Effective state* section: declarations with the same plugin name are merged in module load order (`app/etc/config.php`, or `<sequence>` when it is missing), so a plugin disabled by another module is reported as disabled; `find_preference` answers structurally (FQCN) with the effective preference per area, the superseded declarations and the class that is finally instantiated; `find_observer` / `find_event_flow` merge observers by name the same way.
+- **Ambiguous module order is reported.** When two modules declare the same preference, plugin or observer, neither depends on the other (no `<sequence>`, no composer `require`) and swapping them would change the result, the output warns that the outcome depends on incidental module order.
+- **Declarations of modules disabled in `app/etc/config.php`** are listed but marked as ignored.
+- **Interceptability.** `find_plugin` marks plugins that never run: final class, `Magento\Framework\ObjectManager\NoninterceptableInterface`, and per plugin method a final, static, non-public or never-intercepted target method (`__construct`, `_resetState`, …) or a method the class does not have.
+- `find_class` recognises a virtual type name and shows its di.xml declaration and the class it instantiates; `impact_analysis` lists API exposure (`webapi.xml` services, `schema.graphqls` resolvers) and the DI arguments that inject the class.
+
+### Fixed
+- **Plugins declared on an interface or a parent class were missing** from `find_plugin` and `find_di_wiring` for the implementing / child class. Parents and interfaces are now resolved from the PHP sources (composer PSR-4 map first).
+- **A plugin declared right after a self-closing `<type … />` was lost or attributed to the wrong type**, and only the first self-closing `<virtualType … />` of a file was read. di.xml and events.xml are parsed with an XML parser (`src/di-config.js`) instead of regexes.
+- **Commented-out XML was reported as live configuration.** Comments are ignored everywhere di.xml is read.
+- **Virtual types and DI arguments were matched by a substring of the short class name** (`trace_dependency`, `impact_analysis` on a FQCN), which listed unrelated virtual types (`…\Reporter` for `…\Repo`) and missed chains through neutrally named virtual types. They are now resolved transitively, through preferences, `Factory` and `\Proxy`.
+- **Plugins on a virtual type:** the plugins of its real class are reported; a plugin declared only on the virtual type name is marked as not running (the interceptor looks plugins up by the real class).
+- **Plugin type resolution:** methods are read from the declared type (a virtual type → its base class), the code shown is the class that is instantiated (a preference on the plugin type or an interface as plugin type applies).
+- **DI area** of `etc/webapi_rest/`, `etc/webapi_soap/` and `etc/crontab/` files was reported as `global` in `find_plugin`.
+- **Observers:** declarations without `instance` (disabling or changing an observer) were dropped, area disables were not shown, and an observer class could be mapped to another module's file with the same short name. `find_event_flow` listed semantic neighbours as "dispatchers"; it now lists exact `dispatch('event')` calls. `find_event_dispatchers` counts only this event's observer declarations.
+- **`find_table_usage` missed the ResourceModel that owns the table** (`_init('table', …)`); PHP and `db_schema.xml` are also searched for the exact table name.
+- **`find_controller` returned nothing for admin routes** (the area filter compared `/adminhtml/` with `Controller/Adminhtml/`); routes are also resolved through `routes.xml` (frontName → module → controller class).
+- **A relative `MAGENTO_ROOT` produced non-existent file paths** (the root segment was cut out). It is resolved to an absolute path at startup.
+
 ## [2.17.0] - 2026-09-29
 
 ### Added

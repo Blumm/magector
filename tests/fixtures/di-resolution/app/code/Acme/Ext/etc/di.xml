@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="urn:magento:framework:ObjectManager/etc/config.xsd">
+    <preference for="Acme\Core\Api\NotifierInterface" type="Acme\Ext\Model\Notifier"/>
+    <type name="Acme\Core\Model\Repo">
+        <plugin name="core_disable_me" disabled="true"/>
+    </type>
+    <preference for="Acme\Core\Plugin\BasePlugin" type="Acme\Ext\Plugin\OverridePlugin"/>
+    <virtualType name="Acme\Ext\Model\Repo" type="Acme\Core\Model\BaseService"/>
+    <virtualType name="Acme\Ext\Model\OtherVirtual" type="Acme\Ext\Model\Repo"/>
+    <virtualType name="Acme\Ext\Model\ReporterVirtual" type="Acme\Ext\Model\Reporter"/>
+</config>

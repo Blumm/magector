@@ -1,0 +1,3 @@
+type Query {
+    acmeRepo(id: String!): String @resolver(class: "Acme\\Api\\Model\\Resolver\\RepoResolver")
+}

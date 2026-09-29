@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="urn:magento:framework:ObjectManager/etc/config.xsd">
+    <type name="Acme\Api\Model\VirtualConsumer">
+        <arguments>
+            <argument name="repo" xsi:type="object">Acme\Core\Model\SpecialRepoLevel2</argument>
+        </arguments>
+    </type>
+    <type name="Acme\Api\Model\ChainConsumer">
+        <arguments><argument name="repo" xsi:type="object">Acme\Core\Model\Beta</argument></arguments>
+    </type>
+    <type name="Acme\Api\Model\ReportConsumer">
+        <arguments><argument name="reporter" xsi:type="object">Acme\Ext\Model\Reporter</argument></arguments>
+    </type>
+    <!-- Acme_Api and Acme_Ext both prefer NotifierInterface and do not depend on each other -->
+    <preference for="Acme\Core\Api\NotifierInterface" type="Acme\Api\Model\Notifier"/>
+</config>
