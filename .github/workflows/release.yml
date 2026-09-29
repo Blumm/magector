@@ -59,6 +59,22 @@ jobs:
           rm -f rust-core/Cargo.toml.bak
           echo "Cargo.toml version synced to ${VERSION}"
 
+      - name: Link libstdc++ statically (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # The x64 binary must run in Warden / CentOS Stream 9 PHP containers (GCC 11
+          # libstdc++): linked dynamically it picks up GLIBCXX_3.4.30 from the build host.
+          # rustc links with -nodefaultlibs, so -static-libstdc++ would add nothing: silence
+          # the two sources of -lstdc++ (ort-sys, and the cc crate for esaxx-rs) and append
+          # libstdc++.a after every archive. -lgcc brings the aarch64 outline-atomics helpers
+          # libstdc++.a needs. The glibc_compat stubs are linked whole-archive (build.rs).
+          {
+            echo "ORT_CXX_STDLIB="
+            echo "CXXSTDLIB="
+            echo "RUSTFLAGS=-C link-arg=-l:libstdc++.a -C link-arg=-lgcc"
+          } >> "$GITHUB_ENV"
+
       - name: Build
         working-directory: rust-core
         run: cargo build --release --target ${{ matrix.target }}
@@ -71,6 +87,18 @@ jobs:
           mkdir -p platforms/${{ matrix.platform }}/bin
           cp rust-core/target/${{ matrix.target }}/release/${{ matrix.binary }} \
              platforms/${{ matrix.platform }}/bin/
+
+      - name: Portability smoke test (linux-x64)
+        if: matrix.platform == 'linux-x64'
+        shell: bash
+        run: |
+          BIN=platforms/linux-x64/bin/magector-core
+          if objdump -p "$BIN" | grep -q 'NEEDED.*libstdc++'; then
+            echo "::error::magector-core links libstdc++ dynamically — it will not run on Warden / CentOS Stream 9"
+            objdump -p "$BIN" | grep NEEDED
+            exit 1
+          fi
+          docker run --rm -v "$PWD/platforms/linux-x64/bin:/b:ro" quay.io/centos/centos:stream9 /b/magector-core --version
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
