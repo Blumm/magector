@@ -65,16 +65,30 @@ function detectIDEs(projectPath) {
 }
 
 /**
- * Write MCP server configuration for the given IDE(s).
+ * The env the MCP server is started with. The IDE launches it outside this shell, so
+ * MAGECTOR_MODELS (the model location chosen for this run) has to be written down here,
+ * or the server cannot find the model that was just downloaded there.
  */
-function writeMcpConfig(projectPath, ides, dbPath, { anthropicApiKey } = {}) {
-  const env = {
+export function mcpServerEnv(projectPath, dbPath, { anthropicApiKey } = {}, env = process.env) {
+  const serverEnv = {
     MAGENTO_ROOT: projectPath,
     MAGECTOR_DB: dbPath
   };
-  if (anthropicApiKey) {
-    env.ANTHROPIC_API_KEY = anthropicApiKey;
+  if (env.MAGECTOR_MODELS) {
+    // Absolute: the server starts in whatever directory the IDE picks, not in this cwd.
+    serverEnv.MAGECTOR_MODELS = path.resolve(env.MAGECTOR_MODELS);
   }
+  if (anthropicApiKey) {
+    serverEnv.ANTHROPIC_API_KEY = anthropicApiKey;
+  }
+  return serverEnv;
+}
+
+/**
+ * Write MCP server configuration for the given IDE(s).
+ */
+function writeMcpConfig(projectPath, ides, dbPath, { anthropicApiKey } = {}) {
+  const env = mcpServerEnv(projectPath, dbPath, { anthropicApiKey });
   const mcpEntry = {
     command: 'npx',
     args: ['-y', 'magector@latest', 'mcp'],

@@ -105,6 +105,55 @@ struct PersistedStateV2 {
     tombstones: HashSet<usize>,
 }
 
+/// A database file decoded, before any HNSW graph is built from it.
+enum Persisted {
+    Empty,
+    V1(PersistedState),
+    V2(PersistedStateV2),
+}
+
+/// Read and decode a database file (V2 with tombstones, V1 fallback).
+/// Returns `Err` with `FormatChanged` context if the schema is incompatible.
+fn read_persisted(path: &Path) -> Result<Persisted> {
+    let bytes = fs::read(path).context("Failed to read database")?;
+    if bytes.is_empty() {
+        return Ok(Persisted::Empty);
+    }
+
+    // Try V2 first: first byte == PERSIST_VERSION_V2
+    if bytes[0] == PERSIST_VERSION_V2 {
+        return match bincode::serde::decode_from_slice::<PersistedStateV2, _>(&bytes[1..], bincode::config::standard()) {
+            Ok((state, _)) => Ok(Persisted::V2(state)),
+            Err(e) => {
+                tracing::warn!("V2 database format incompatible: {e}");
+                Err(anyhow::anyhow!("Database format changed (schema mismatch). Re-index required."))
+                    .context("FormatChanged")
+            }
+        };
+    }
+
+    // Fallback: V1 (no version byte)
+    match bincode::serde::decode_from_slice::<PersistedState, _>(&bytes, bincode::config::standard()) {
+        Ok((state, _)) => Ok(Persisted::V1(state)),
+        Err(e) => {
+            tracing::warn!("V1 database format incompatible: {e}");
+            Err(anyhow::anyhow!("Database format changed (schema mismatch). Re-index required."))
+                .context("FormatChanged")
+        }
+    }
+}
+
+/// Ids among `vectors` that loading tombstones on top of `tombstones`: the vectors that
+/// are not valid for cosine distance (NaN, Inf, zero). Shared by `open` and
+/// `persisted_len`, so the count they report cannot drift apart.
+fn invalid_vector_ids(vectors: &HashMap<usize, Vec<f32>>, tombstones: &HashSet<usize>) -> Vec<usize> {
+    vectors
+        .iter()
+        .filter(|(id, vec)| !tombstones.contains(id) && !is_valid_vector(vec))
+        .map(|(&id, _)| id)
+        .collect()
+}
+
 /// Vector database for semantic code search
 pub struct VectorDB {
     hnsw: Hnsw<'static, f32, DistCosine>,
@@ -206,32 +255,33 @@ impl VectorDB {
     /// Load database from a bincode file (V2 with tombstones, V1 fallback).
     /// Returns `Err` with `FormatChanged` context if the schema is incompatible.
     fn load(path: &Path) -> Result<Self> {
-        let bytes = fs::read(path).context("Failed to read database")?;
-        if bytes.is_empty() {
-            return Ok(Self::new());
+        match read_persisted(path)? {
+            Persisted::Empty => Ok(Self::new()),
+            Persisted::V2(state) => Self::from_state_v2(state),
+            Persisted::V1(state) => Self::from_state(state),
         }
+    }
 
-        // Try V2 first: first byte == PERSIST_VERSION_V2
-        if bytes[0] == PERSIST_VERSION_V2 {
-            match bincode::serde::decode_from_slice::<PersistedStateV2, _>(&bytes[1..], bincode::config::standard()) {
-                Ok((state, _)) => return Self::from_state_v2(state),
-                Err(e) => {
-                    tracing::warn!("V2 database format incompatible: {e}");
-                    return Err(anyhow::anyhow!("Database format changed (schema mismatch). Re-index required."))
-                        .context("FormatChanged");
-                }
-            }
+    /// Number of live vectors in the database file at `path`, as `VectorDB::open(path)?.len()`
+    /// reports it, but without building the HNSW graph, which is most of the cost of opening
+    /// a large index. A missing file counts as empty, like `open`; unlike `open`, this never
+    /// migrates or moves a file, and a file that cannot be read or decoded is an `Err`.
+    pub(crate) fn persisted_len(path: &Path) -> Result<usize> {
+        if !path.exists() {
+            return Ok(0);
         }
-
-        // Fallback: V1 (no version byte)
-        match bincode::serde::decode_from_slice::<PersistedState, _>(&bytes, bincode::config::standard()) {
-            Ok((state, _)) => Self::from_state(state),
-            Err(e) => {
-                tracing::warn!("V1 database format incompatible: {e}");
-                Err(anyhow::anyhow!("Database format changed (schema mismatch). Re-index required."))
-                    .context("FormatChanged")
+        Ok(match read_persisted(path)? {
+            Persisted::Empty => 0,
+            Persisted::V1(state) => {
+                let invalid = invalid_vector_ids(&state.vectors, &HashSet::new()).len();
+                state.metadata.len().saturating_sub(invalid)
             }
-        }
+            Persisted::V2(mut state) => {
+                let invalid = invalid_vector_ids(&state.vectors, &state.tombstones);
+                state.tombstones.extend(invalid);
+                state.metadata.len().saturating_sub(state.tombstones.len())
+            }
+        })
     }
 
     /// Check if a database file is compatible with the current format.
@@ -260,24 +310,17 @@ impl VectorDB {
         let capacity = state.vectors.len().max(HNSW_MIN_CAPACITY);
         let hnsw = make_hnsw(capacity);
 
-        // Filter out invalid vectors to prevent HNSW corruption
+        // Tombstone any invalid vectors, and keep them out of the HNSW graph they would corrupt
+        let tombstones: HashSet<usize> =
+            invalid_vector_ids(&state.vectors, &HashSet::new()).into_iter().collect();
+        if !tombstones.is_empty() {
+            tracing::warn!("V1 load: skipped {} invalid vectors (NaN/Inf/zero)", tombstones.len());
+        }
         let data: Vec<(&Vec<f32>, usize)> = state.vectors.iter()
-            .filter(|(_, vec)| is_valid_vector(vec))
+            .filter(|(id, _)| !tombstones.contains(id))
             .map(|(&id, vec)| (vec, id))
             .collect();
-        let skipped = state.vectors.len() - data.len();
-        if skipped > 0 {
-            tracing::warn!("V1 load: skipped {} invalid vectors (NaN/Inf/zero)", skipped);
-        }
         hnsw.parallel_insert(&data);
-
-        // Tombstone any invalid vectors
-        let mut tombstones = HashSet::new();
-        for (&id, vec) in &state.vectors {
-            if !is_valid_vector(vec) {
-                tombstones.insert(id);
-            }
-        }
 
         Ok(Self {
             hnsw,
@@ -296,18 +339,12 @@ impl VectorDB {
 
         // Only insert non-tombstoned AND valid vectors
         let mut tombstones = state.tombstones;
+        for id in invalid_vector_ids(&state.vectors, &tombstones) {
+            tracing::warn!("V2 load: tombstoning invalid vector id={}", id);
+            tombstones.insert(id);
+        }
         let data: Vec<(&Vec<f32>, usize)> = state.vectors.iter()
-            .filter(|(id, vec)| {
-                if tombstones.contains(id) {
-                    return false;
-                }
-                if !is_valid_vector(vec) {
-                    tracing::warn!("V2 load: tombstoning invalid vector id={}", id);
-                    tombstones.insert(**id);
-                    return false;
-                }
-                true
-            })
+            .filter(|(id, _)| !tombstones.contains(id))
             .map(|(&id, vec)| (vec, id))
             .collect();
         hnsw.parallel_insert(&data);
@@ -709,21 +746,23 @@ impl Default for VectorDB {
     }
 }
 
-/// Reopen a just-saved index and confirm its live vector count matches what
+/// Re-read a just-saved index and confirm its live vector count matches what
 /// was in memory before the save. A decode can succeed (no `FormatChanged`
 /// error) while still yielding an empty or partial DB — e.g. if the file was
 /// overwritten by a concurrent writer between the atomic rename and this
 /// check. An index costs hours of CPU to build, so that must surface as a
-/// loud error, not a silent "Indexing complete".
+/// loud error, not a silent "Indexing complete". The vectors are counted from
+/// the decoded file (`persisted_len`), not by opening it: opening rebuilds the
+/// whole HNSW graph, which took about a minute on a 42k-vector index.
 pub fn verify_vector_count(path: &Path, expected: usize) -> Result<()> {
-    let reopened = VectorDB::open(path).context("Failed to reopen index after save for verification")?;
-    if reopened.len() != expected {
+    let found = VectorDB::persisted_len(path).context("Failed to read the saved index for verification")?;
+    if found != expected {
         anyhow::bail!(
             "Index verification failed after save: expected {} vectors, found {} in {:?}. \
              The saved index is corrupt (likely clobbered by a concurrent process writing \
              the same path) — do not trust it; re-run indexing.",
             expected,
-            reopened.len(),
+            found,
             path
         );
     }
@@ -1018,5 +1057,86 @@ mod tests {
         assert!(err.to_string().contains("Index verification failed"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_persisted_len_matches_open_with_tombstones() {
+        // `verify_vector_count` counts the decoded file instead of opening it (which
+        // rebuilds the HNSW graph); the count must be the one `open` reports.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("count.db");
+
+        let mut db = VectorDB::new();
+        for i in 0..6 {
+            let mut v = vec![0.1f32; EMBEDDING_DIM];
+            v[i] = 1.0;
+            db.insert(&v, make_test_meta(&format!("f{i}.php")));
+        }
+        db.remove_by_path("f1.php");
+        db.remove_by_path("f4.php");
+        db.insert(&vec![0.0f32; EMBEDDING_DIM], make_test_meta("zero.php")); // invalid: stored tombstoned
+        db.save_atomic(&db_path).unwrap();
+
+        let opened = VectorDB::open(&db_path).unwrap().len();
+        assert_eq!(opened, 4, "6 inserted - 2 removed; the zero vector is tombstoned");
+        assert_eq!(VectorDB::persisted_len(&db_path).unwrap(), opened);
+        assert!(verify_vector_count(&db_path, opened).is_ok());
+        assert!(verify_vector_count(&db_path, opened + 1).is_err());
+    }
+
+    #[test]
+    fn test_persisted_len_applies_the_load_time_rules() {
+        // `open` also tombstones vectors that are invalid for cosine distance, whether or
+        // not the file says so; the count must do the same, for the V2 and the V1 format.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = bincode::config::standard();
+        let metadata: HashMap<usize, IndexMetadata> =
+            (0..4).map(|i| (i, make_test_meta(&format!("f{i}.php")))).collect();
+        let vectors: HashMap<usize, Vec<f32>> = [0.1f32, 0.2, 0.0, 0.3]
+            .into_iter()
+            .enumerate()
+            .map(|(i, x)| (i, vec![x; EMBEDDING_DIM]))
+            .collect(); // id 2 is a zero vector
+
+        // V2: id 3 tombstoned in the file, id 2 invalid but not tombstoned
+        let v2 = PersistedStateV2 {
+            metadata: metadata.clone(),
+            vectors: vectors.clone(),
+            next_id: 4,
+            tombstones: HashSet::from([3]),
+        };
+        let mut bytes = vec![PERSIST_VERSION_V2];
+        bytes.extend(bincode::serde::encode_to_vec(&v2, cfg).unwrap());
+        let v2_path = dir.path().join("v2.db");
+        fs::write(&v2_path, bytes).unwrap();
+        assert_eq!(VectorDB::open(&v2_path).unwrap().len(), 2);
+        assert_eq!(VectorDB::persisted_len(&v2_path).unwrap(), 2);
+
+        // V1: no tombstones and no version byte; only the zero vector is dropped
+        let v1 = PersistedState { metadata, vectors, next_id: 4 };
+        let v1_path = dir.path().join("v1.db");
+        fs::write(&v1_path, bincode::serde::encode_to_vec(&v1, cfg).unwrap()).unwrap();
+        assert_eq!(VectorDB::open(&v1_path).unwrap().len(), 3);
+        assert_eq!(VectorDB::persisted_len(&v1_path).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_persisted_len_of_missing_empty_and_undecodable_files() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let missing = dir.path().join("missing.db");
+        assert_eq!(VectorDB::persisted_len(&missing).unwrap(), 0);
+
+        let empty = dir.path().join("empty.db");
+        fs::write(&empty, b"").unwrap();
+        assert_eq!(VectorDB::persisted_len(&empty).unwrap(), 0);
+
+        // Undecodable: an error (`open` would move the file aside and start empty); the
+        // file stays where it is, and verification fails rather than passing on 0.
+        let junk = dir.path().join("junk.db");
+        fs::write(&junk, [PERSIST_VERSION_V2, 0xff, 0xff]).unwrap();
+        assert!(VectorDB::persisted_len(&junk).is_err());
+        assert!(junk.exists());
+        assert!(verify_vector_count(&junk, 1).is_err());
     }
 }

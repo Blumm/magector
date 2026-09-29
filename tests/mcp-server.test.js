@@ -397,7 +397,7 @@ async function main() {
       .replace(/Joined existing serve process \(secondary\)\n/g, '')
       .replace(/Waiting for primary instance to start serve process\.\.\.\n/g, '')
       .replace(/Warmup complete — all tools available\n/g, '')
-      .replace(/Database format incompatible\. Starting background re-index[^\n]*\n/g, '')
+      .replace(/(Database format incompatible|No index found)\. Starting background re-index[^\n]*\n/g, '')
       .replace(/Background re-index completed[^\n]*\n/g, '')
       .replace(/Cannot auto-reindex[^\n]*\n/g, '')
       .trim();

@@ -61,6 +61,10 @@ pub struct IndexStats {
     pub js_files: usize,
     pub xml_files: usize,
     pub other_files: usize,
+    /// Whether the caller must write index.db: always after a full index, on resume only
+    /// if a vector was tombstoned or embedded or the DB was compacted. Otherwise the file
+    /// on disk is exactly the one this run loaded.
+    pub db_changed: bool,
 }
 
 /// Intermediate result from parsing (before embedding)
@@ -105,6 +109,12 @@ pub struct Indexer {
     ignore_patterns: Vec<String>,
     /// Embedding batch size (configurable)
     batch_size: usize,
+    /// The manifest `index_with_options` prepared for the sidecar next to index.db. Held
+    /// back so it is written only after index.db is: see `save_manifest`.
+    pending_manifest: Option<crate::watcher::FileManifest>,
+    /// Set by a full rebuild: the old sidecar is removed just before index.db is first
+    /// written (`withdraw_old_sidecar`). Never set by the serve watcher.
+    withdraw_sidecar: bool,
 }
 
 impl Indexer {
@@ -162,6 +172,8 @@ impl Indexer {
             descriptions_db: None,
             ignore_patterns,
             batch_size,
+            pending_manifest: None,
+            withdraw_sidecar: false,
         })
     }
 
@@ -190,6 +202,8 @@ impl Indexer {
     /// preserved, and only the remaining files are parsed and embedded.
     /// Pass `force=true` (or use the `--force` CLI flag) to clear the old
     /// index and rebuild from scratch.
+    ///
+    /// Like `index_with_options`, this does not save the finished index: see there.
     pub fn index(&mut self) -> Result<IndexStats> {
         self.index_with_options(false)
     }
@@ -201,8 +215,17 @@ impl Indexer {
     /// by a previous run — files already present in the DB are skipped during
     /// both PHASE 1 parsing and PHASE 2 embedding, and the existing HNSW is
     /// preserved rather than thrown away.
+    ///
+    /// Apart from the periodic crash-safety saves of PHASE 2, this writes neither
+    /// index.db nor the manifest. The caller saves index.db (if `stats.db_changed`),
+    /// verifies it, and only then calls `save_manifest`: the manifest must never claim
+    /// content that index.db on disk does not hold. (For the same reason a resume first
+    /// marks the paths it is about to change stale in the existing sidecar, and a full
+    /// rebuild removes it when it first writes index.db, so a run that dies after a
+    /// periodic save leaves no old hash claiming them.)
     pub fn index_with_options(&mut self, force: bool) -> Result<IndexStats> {
         let mut stats = IndexStats::default();
+        self.pending_manifest = None;
 
         println!();
         println!("  __  __    _    ____ _____ ____ _____ ___  ____  ");
@@ -223,6 +246,12 @@ impl Indexer {
         // *before* clearing anything, so we can filter file discovery below.
         let preexisting_vectors = self.vectordb.len();
         let resume = !force && preexisting_vectors > 0;
+        // A full index always writes index.db; a resume only if it changes something below.
+        stats.db_changed = !resume;
+        // A full rebuild replaces index.db piece by piece, and the old sidecar would keep
+        // claiming every file. It goes when index.db is first written, and not before: a run
+        // that dies earlier leaves the old index and its sidecar as they were.
+        self.withdraw_sidecar = !resume;
         let already_indexed: HashSet<String> = if resume {
             self.indexed_paths()
         } else {
@@ -264,9 +293,14 @@ impl Indexer {
             manifest_path.as_ref()
                 .and_then(|p| crate::watcher::FileManifest::load(p))
                 .unwrap_or_else(|| {
-                    // No manifest on disk — first run after upgrade.
-                    // Build from filesystem (treats all indexed files as current).
-                    tracing::info!("No manifest found — building from filesystem for existing index");
+                    // No usable manifest: missing (first run after upgrade), or present but
+                    // unreadable. Build from filesystem (treats all indexed files as current).
+                    let present = manifest_path.as_ref().is_some_and(|p| !matches!(p.try_exists(), Ok(false)));
+                    println!(
+                        "⚠️  {} — treating the {} indexed files as current (run with --force to rebuild from scratch)",
+                        if present { "No usable manifest (unreadable, or written by a newer magector)" } else { "No manifest found" },
+                        already_indexed.len()
+                    );
                     crate::watcher::FileManifest::from_existing_index(&self.magento_root, &already_indexed)
                 })
         } else {
@@ -276,9 +310,44 @@ impl Indexer {
         let (files, skipped_resume): (Vec<PathBuf>, usize) = if resume {
             // Detect changes against manifest
             let changes = manifest.detect_changes(&self.magento_root)?;
+            manifest.apply_touched(&changes.touched);
+            let touched_count = changes.touched.len();
             let modified_count = changes.modified.len();
             let deleted_count = changes.deleted.len();
             let added_count = changes.added.len();
+
+            // The periodic saves of PHASE 2 write index.db, tombstones included, long before
+            // the manifest reaches disk, and `index` trusts a matching hash in the on-disk
+            // sidecar. So before anything is tombstoned, withdraw the sidecar's claims on
+            // every path this run is about to change — as the serve watcher does: if the run
+            // dies mid-way, the next one re-embeds those files instead of taking a file
+            // restored to its old content for "touched". `save_manifest` replaces the
+            // sentinels with real records. Touched files change nothing in index.db.
+            if let Some(ref mp) = manifest_path {
+                let root = &self.magento_root;
+                let changing: Vec<String> = changes
+                    .modified
+                    .iter()
+                    .chain(changes.added.iter())
+                    .map(|p| p.strip_prefix(root).unwrap_or(p).to_string_lossy().to_string())
+                    .chain(changes.deleted.iter().cloned())
+                    .collect();
+                match crate::watcher::FileManifest::mark_stale_in_sidecar(mp, &changing) {
+                    Ok(true) => tracing::info!("Marked {} changing files stale in {:?} until index.db is saved", changing.len(), mp),
+                    Ok(false) => {}
+                    Err(e) => {
+                        println!("⚠️  Could not mark the changing files stale in {:?} ({}) — removing it", mp, e);
+                        if let Err(e) = fs::remove_file(mp) {
+                            if mp.exists() {
+                                anyhow::bail!(
+                                    "Could not remove {:?} ({}); not changing index.db while that file may claim content this run drops",
+                                    mp, e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
 
             // Tombstone vectors for modified files (will be re-indexed)
             for path in &changes.modified {
@@ -287,19 +356,49 @@ impl Indexer {
                     .unwrap_or(path)
                     .to_string_lossy()
                     .to_string();
-                self.remove_vectors_for_path(&relative);
+                if !self.remove_vectors_for_path(&relative).is_empty() {
+                    stats.db_changed = true;
+                }
+            }
+
+            // An added file that already has vectors — a crash after an incremental save, or
+            // a lost manifest record — is replaced like a modified one; embedding it on top
+            // would list it in search results twice.
+            let mut replaced = 0;
+            for path in &changes.added {
+                let relative = path
+                    .strip_prefix(&self.magento_root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .to_string();
+                if already_indexed.contains(&relative) {
+                    self.remove_vectors_for_path(&relative);
+                    replaced += 1;
+                }
+            }
+            if replaced > 0 {
+                stats.db_changed = true;
+                println!("♻️  {} new files already had vectors in the index (an interrupted run?) — replacing them", replaced);
             }
 
             // Tombstone vectors for deleted files
             for path in &changes.deleted {
-                self.remove_vectors_for_path(path);
+                if !self.remove_vectors_for_path(path).is_empty() {
+                    stats.db_changed = true;
+                }
             }
             manifest.apply_deleted(&changes.deleted);
+
+            // Record content hashes for unchanged files that have none yet (v1 manifest,
+            // or a manifest built from an existing index), so the next environment — a
+            // checkout, `docker cp` — can tell a touched file from a modified one.
+            let backfilled = manifest.backfill_hashes(&self.magento_root);
 
             // Compact if many tombstones
             if self.vectordb_tombstone_ratio() > 0.20 {
                 tracing::info!("Compacting vector DB after removing modified/deleted file vectors");
                 self.compact_vectordb();
+                stats.db_changed = true;
             }
 
             // Files to process = new + modified
@@ -308,13 +407,18 @@ impl Indexer {
                 .chain(changes.modified.into_iter())
                 .collect();
 
-            let skipped = stats.files_found - to_process.len() - deleted_count;
+            // Deleted files were never discovered, so they are not part of files_found.
+            // A file can appear between the two walks, hence the saturating subtraction.
+            let skipped = stats.files_found.saturating_sub(to_process.len());
 
-            if modified_count > 0 || deleted_count > 0 || added_count > 0 {
+            if modified_count > 0 || deleted_count > 0 || added_count > 0 || touched_count > 0 {
                 println!(
-                    "📊 Incremental: {} new, {} modified, {} deleted, {} unchanged",
-                    added_count, modified_count, deleted_count, skipped
+                    "📊 Incremental: {} new, {} modified, {} deleted, {} unchanged ({} touched: mtime changed, content identical)",
+                    added_count, modified_count, deleted_count, skipped, touched_count
                 );
+            }
+            if backfilled > 0 {
+                println!("🔐 Recorded content hashes for {} unchanged files", backfilled);
             }
 
             (to_process, skipped)
@@ -355,22 +459,15 @@ impl Indexer {
         if files.is_empty() {
             println!("✓ Nothing to index — all discovered files already have vectors.\n");
             stats.vectors_created = self.vectordb.len();
-            // Still save manifest (deleted files may have been tombstoned above)
-            if let Some(ref mp) = manifest_path {
+            // The manifest still changes (deleted files, new stats of touched ones, backfilled
+            // hashes); the caller saves it after index.db, and saves index.db only if
+            // stats.db_changed says the vectors did.
+            if manifest_path.is_some() {
                 if !resume {
                     manifest = crate::watcher::FileManifest::from_existing_index(&self.magento_root, &self.indexed_paths());
+                    manifest.backfill_hashes(&self.magento_root);
                 }
-                if let Err(e) = manifest.save(mp) {
-                    tracing::warn!("Failed to save manifest: {}", e);
-                }
-            }
-            // Save DB if we tombstoned any vectors (deleted/modified files)
-            if resume && self.vectordb.len() != preexisting_vectors {
-                if let Some(ref db_path) = self.db_path {
-                    if let Err(e) = self.save_atomic(db_path) {
-                        tracing::warn!("Failed to save index after cleanup: {}", e);
-                    }
-                }
+                self.pending_manifest = Some(manifest);
             }
             return Ok(stats);
         }
@@ -548,8 +645,9 @@ impl Indexer {
 
             // Incremental save to disk — enables partial recovery on crash/restart
             if batch_num % SAVE_INTERVAL_BATCHES == 0 {
-                if let Some(ref db_path) = self.db_path {
-                    if let Err(e) = self.vectordb.save_atomic(db_path) {
+                if let Some(db_path) = self.db_path.clone() {
+                    self.withdraw_old_sidecar()?;
+                    if let Err(e) = self.vectordb.save_atomic(&db_path) {
                         tracing::warn!("Incremental save failed (non-fatal): {e}");
                     } else {
                         let msg = format!("Incremental save: {} vectors written to disk", embedded);
@@ -568,36 +666,82 @@ impl Indexer {
         println!("                    INDEXING COMPLETE                       ");
         println!("════════════════════════════════════════════════════════════\n");
 
-        // Build and save manifest for future incremental runs.
+        // Build the manifest for future incremental runs, and hold it back for
+        // `save_manifest` — it must not reach disk before index.db does.
         // On a full (non-resume) run, build a fresh manifest from all discovered files.
         // On a resume run, update the existing manifest with newly indexed files.
-        if let Some(ref mp) = manifest_path {
+        if manifest_path.is_some() {
             if !resume {
-                // Full index — build manifest from filesystem
+                // Full index — build manifest from filesystem, with content hashes
                 manifest = crate::watcher::FileManifest::from_existing_index(&self.magento_root, &self.indexed_paths());
+                manifest.backfill_hashes(&self.magento_root);
             } else {
                 // Incremental — update manifest entries for the files we just processed
                 let root = &self.magento_root;
                 for f in &files {
                     let rel = f.strip_prefix(root).unwrap_or(f).to_string_lossy().to_string();
+                    // Hash first, stat second (as `apply_indexed` does): an edit landing between
+                    // the two is then {new stat, old hash}, re-checked on the next stat change,
+                    // never {old stat, new hash}, which would pass that edit off as "touched".
+                    let sha256 = crate::watcher::file_sha256(f);
                     if let Ok(meta) = std::fs::metadata(f) {
                         let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
                         manifest.files.insert(rel, crate::watcher::FileRecord {
                             mtime,
                             size: meta.len(),
+                            sha256,
                             vector_ids: Vec::new(),
                         });
                     }
                 }
             }
-            if let Err(e) = manifest.save(mp) {
-                tracing::warn!("Failed to save manifest: {}", e);
-            } else {
-                tracing::info!("Saved manifest ({} files) to {:?}", manifest.files.len(), mp);
-            }
+            self.pending_manifest = Some(manifest);
         }
 
+        stats.db_changed |= embedded > 0;
         Ok(stats)
+    }
+
+    /// Remove the old sidecar if a full rebuild is about to write index.db for the first
+    /// time: from then on index.db holds a partial new index, which that sidecar would
+    /// misdescribe. Called before every index.db write; does nothing once done, or when the
+    /// flag was never set (the serve watcher). A file that is not there is fine; any other
+    /// error stops the write.
+    fn withdraw_old_sidecar(&mut self) -> Result<()> {
+        if !self.withdraw_sidecar {
+            return Ok(());
+        }
+        if let Some(sidecar) = self.db_path.as_deref().map(crate::watcher::FileManifest::sidecar_path) {
+            match fs::remove_file(&sidecar) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => anyhow::bail!(
+                    "Could not remove {:?} ({}); not writing index.db while it still claims the old content",
+                    sidecar, e
+                ),
+            }
+        }
+        self.withdraw_sidecar = false;
+        Ok(())
+    }
+
+    /// Write the manifest the last `index_with_options` prepared to the sidecar next to
+    /// index.db. Call it only after index.db itself has been saved (and verified): the
+    /// sidecar must never claim content that the index on disk does not hold, so a save
+    /// that fails or is interrupted leaves the previous manifest and the next run embeds
+    /// again what this one did not persist. Does nothing without a database path or a
+    /// prepared manifest.
+    pub fn save_manifest(&mut self) -> Result<()> {
+        let (Some(db_path), Some(manifest)) = (&self.db_path, &self.pending_manifest) else {
+            return Ok(());
+        };
+        let sidecar = crate::watcher::FileManifest::sidecar_path(db_path);
+        manifest
+            .save(&sidecar)
+            .with_context(|| format!("Failed to save manifest {:?}", sidecar))?;
+        tracing::info!("Saved manifest ({} files) to {:?}", manifest.files.len(), sidecar);
+        self.pending_manifest = None;
+        Ok(())
     }
 
     /// Discover files to index (no symlink following for speed)
@@ -683,16 +827,6 @@ impl Indexer {
         false
     }
 
-    /// Backwards-compatible check for external callers (watcher.rs).
-    /// Uses only built-in exclusions, no .magectorignore patterns.
-    pub(crate) fn should_skip_dir(entry: &walkdir::DirEntry) -> bool {
-        if entry.file_type().is_dir() {
-            let name = entry.file_name().to_string_lossy();
-            return EXCLUDE_DIRS.iter().any(|&d| name == *d);
-        }
-        false
-    }
-
     /// Load .magectorignore file from the project root.
     /// Returns a list of directory patterns to exclude.
     ///
@@ -702,24 +836,15 @@ impl Indexer {
     ///   - Trailing slashes are stripped
     ///   - Patterns without / match directory names anywhere
     ///   - Patterns with / match relative paths from project root
-    fn load_ignore_file(root: &Path) -> Vec<String> {
+    pub(crate) fn load_ignore_file(root: &Path) -> Vec<String> {
         let ignore_path = root.join(".magectorignore");
         match fs::read_to_string(&ignore_path) {
-            Ok(content) => {
-                let patterns: Vec<String> = content
-                    .lines()
-                    .map(|line| line.trim())
-                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                    .map(|line| line.trim_end_matches('/').to_string())
-                    .collect();
-                if !patterns.is_empty() {
-                    tracing::info!(
-                        "Loaded {} patterns from .magectorignore",
-                        patterns.len()
-                    );
-                }
-                patterns
-            }
+            Ok(content) => content
+                .lines()
+                .map(|line| line.trim())
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(|line| line.trim_end_matches('/').to_string())
+                .collect(),
             Err(_) => Vec::new(),
         }
     }
@@ -1349,12 +1474,14 @@ impl Indexer {
     }
 
     /// Save the index to disk
-    pub fn save(&self, path: &Path) -> Result<()> {
+    pub fn save(&mut self, path: &Path) -> Result<()> {
+        self.withdraw_old_sidecar()?;
         self.vectordb.save(path)
     }
 
     /// Crash-safe save: write to temp file, then atomic rename
-    pub fn save_atomic(&self, path: &Path) -> Result<()> {
+    pub fn save_atomic(&mut self, path: &Path) -> Result<()> {
+        self.withdraw_old_sidecar()?;
         self.vectordb.save_atomic(path)
     }
 

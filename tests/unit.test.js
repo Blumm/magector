@@ -8,12 +8,17 @@
  *   node tests/unit.test.js
  */
 
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'fs';
+import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, readdirSync, renameSync } from 'fs';
+import { Readable } from 'stream';
 import { syncOptionalDeps } from '../scripts/sync-optional-deps.mjs';
 import { getRunningIndexPid, writeIndexPidFile, removeIndexPidFile, lockPathFor } from '../src/index-lock.js';
 import { shouldRespawnServe, MAX_RESPAWNS_PER_WINDOW, RESPAWN_WINDOW_MS, RESPAWN_BASE_DELAY_MS } from '../src/serve-respawn.js';
+import { defaultDbPath, dbPathForRoot, manifestPath, tempDbPathFor, swapInIndex } from '../src/paths.js';
+import { modelDownloadDir, downloadFile } from '../src/model.js';
+import { mcpServerEnv } from '../src/init.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -4827,6 +4832,14 @@ async function main() {
   testToolCountIncludesTraceConfig();
   testSocketQueryDefaultTimeout();
   testIndexLockConcurrencyGuard();
+  testDefaultDbPath();
+  testDbPathForRoot();
+  testManifestPath();
+  testTempDbPathFor();
+  testSwapInIndex();
+  testModelDownloadDir();
+  await testDownloadFile();
+  testMcpServerEnv();
   testShouldRespawnServe();
   await testRustStatsAsyncSocketFirst();
 
@@ -5273,6 +5286,306 @@ async function testRustStatsAsyncSocketFirst() {
   const failingQueryFn = async () => { throw new Error('Socket query timeout'); };
   await rustStatsAsync(failingQueryFn, coldPathFn);
   assertEq(coldPathCalled, true, 'Cold path invoked as fallback when socket query throws');
+}
+
+// ─── Default DB Path Tests ───────────────────────────────────
+
+function testDefaultDbPath() {
+  console.log('\n📂 defaultDbPath()');
+  assertEq(defaultDbPath({ MAGECTOR_DB: '/x/index.db' }, '/cwd'), '/x/index.db', 'MAGECTOR_DB wins');
+  assertEq(
+    defaultDbPath({ MAGENTO_ROOT: '/srv/magento' }, '/cwd'),
+    path.join('/srv/magento', '.magector', 'index.db'),
+    'Derives from MAGENTO_ROOT, not from the process cwd'
+  );
+  assertEq(defaultDbPath({}, '/cwd'), path.join('/cwd', '.magector', 'index.db'), 'Falls back to cwd');
+}
+
+function testDbPathForRoot() {
+  console.log('\n📂 dbPathForRoot() (`index <path>` keeps its database under that path)');
+  const under = path.join('/srv/shop', '.magector', 'index.db');
+  assertEq(dbPathForRoot('/srv/shop', {}), under, 'Derives from <path>');
+  assertEq(dbPathForRoot('/srv/shop', { MAGENTO_ROOT: '/srv/other' }), under, '<path> wins over MAGENTO_ROOT');
+  assertEq(dbPathForRoot('/srv/shop', { MAGECTOR_DB: '/x/index.db' }), '/x/index.db', 'MAGECTOR_DB still wins');
+}
+
+// ─── Manifest Pairing Tests ──────────────────────────────────
+
+function testManifestPath() {
+  console.log('\n📂 manifestPath()');
+  // Mirrors Rust's Path::with_extension("manifest") (FileManifest::sidecar_path)
+  assertEq(manifestPath('/x/index.db'), path.join('/x', 'index.manifest'), 'index.db → index.manifest');
+  assertEq(
+    manifestPath('/x/index.db.new'),
+    path.join('/x', 'index.db.manifest'),
+    'index.db.new → index.db.manifest (last extension replaced)'
+  );
+  assertEq(manifestPath('/x/index'), path.join('/x', 'index.manifest'), 'No extension → .manifest appended');
+}
+
+function testTempDbPathFor() {
+  console.log('\n📂 tempDbPathFor()');
+  assertEq(tempDbPathFor('/x/index.db'), '/x/index.db.new', 'index.db → index.db.new (a resume in progress keeps working)');
+  assertEq(tempDbPathFor('/x/index'), '/x/index.new.db', 'No extension → .new.db, so it has an extension of its own');
+  // The temp DB's manifest sidecar must never be the live DB's, or the rebuild would overwrite it
+  for (const name of ['index.db', 'index', '.index', 'magector', 'a.b.c', 'index.']) {
+    const db = path.join('/x.y', name);
+    assert(
+      manifestPath(db) !== manifestPath(tempDbPathFor(db)),
+      `Temp DB of "${name}" has its own manifest`,
+      `${manifestPath(db)} vs ${manifestPath(tempDbPathFor(db))}`
+    );
+    assert(tempDbPathFor(db) !== db, `Temp DB of "${name}" is not the live DB`);
+  }
+}
+
+function testSwapInIndex() {
+  console.log('\n── swapInIndex (a re-index swap keeps index.manifest paired with index.db) ──');
+
+  const root = path.join(__dirname, 'tmp_index_swap_test');
+  const db = path.join(root, 'index.db');
+  const tempDb = db + '.new';
+  const manifest = manifestPath(db); // index.manifest
+  const tempManifest = manifestPath(tempDb); // index.db.manifest
+  const read = (p) => (existsSync(p) ? readFileSync(p, 'utf-8') : null);
+  const seed = (files) => {
+    rmSync(root, { recursive: true, force: true });
+    mkdirSync(root, { recursive: true });
+    for (const [p, content] of Object.entries(files)) writeFileSync(p, content);
+  };
+
+  try {
+    // Old index with its manifest, new index built beside it: the manifest follows its DB.
+    seed({ [db]: 'old db', [manifest]: 'old manifest', [tempDb]: 'new db', [tempManifest]: 'new manifest' });
+    const logged = [];
+    const swapped = swapInIndex(db, tempDb, (m) => logged.push(m));
+    assertEq(swapped.manifestError, null, 'A complete swap reports no manifest error');
+    assertEq(read(db), 'new db', 'New DB is live');
+    assertEq(read(manifest), 'new manifest', "The new DB's manifest replaces the old one, not left beside the new DB");
+    assert(!existsSync(tempManifest), 'No orphaned index.db.manifest is left behind');
+    assert(!existsSync(tempDb), 'Temp DB is consumed');
+    assertEq(read(db + '.bak'), 'old db', 'Old DB is kept as .bak');
+    assertEq(logged.join('|'), 'Old DB moved to .bak|New index swapped into place.', 'Logs the .bak move, then the swap');
+
+    // First index (no live DB, no live manifest): no .bak, manifest still follows the DB.
+    seed({ [tempDb]: 'new db', [tempManifest]: 'new manifest' });
+    swapInIndex(db, tempDb);
+    assertEq(read(db), 'new db', 'First index: new DB is live');
+    assertEq(read(manifest), 'new manifest', 'First index: manifest follows the DB');
+    assert(!existsSync(db + '.bak'), 'First index: no .bak without an old DB');
+
+    // The new build saved no manifest: the old one must not survive beside the new DB.
+    seed({ [db]: 'old db', [manifest]: 'old manifest', [tempDb]: 'new db' });
+    swapInIndex(db, tempDb);
+    assertEq(read(db), 'new db', 'No new manifest: new DB is live');
+    assert(!existsSync(manifest), 'No new manifest: the old manifest is removed, never left beside the new DB');
+
+    // The old manifest goes BEFORE any DB is renamed: a crash after the .bak move must not leave it.
+    // (The first log call comes right after that move, so throwing there simulates the crash.)
+    seed({ [db]: 'old db', [manifest]: 'old manifest', [tempDb]: 'new db', [tempManifest]: 'new manifest' });
+    try {
+      swapInIndex(db, tempDb, () => { throw new Error('simulated crash after the old DB moved to .bak'); });
+    } catch {}
+    assert(existsSync(db + '.bak') && !existsSync(db), 'Simulated crash: interrupted between the DB renames');
+    assert(!existsSync(manifest), 'Simulated crash: the old manifest is already gone (index rebuilds it)');
+
+    // A re-index that wrote no temp DB (exit 0, nothing saved): refuse before touching anything,
+    // so the old DB and its manifest stay live instead of the DB being stranded as .bak.
+    seed({ [db]: 'old db', [manifest]: 'old manifest', [tempManifest]: 'stray manifest' });
+    const noDbLog = [];
+    let refused = null;
+    try { swapInIndex(db, tempDb, (m) => noDbLog.push(m)); } catch (e) { refused = e; }
+    assert(refused !== null, 'No temp DB: the swap is refused');
+    assertIncludes(refused?.message, 'index.db.new', 'No temp DB: the error names the missing file');
+    assertEq(read(db), 'old db', 'No temp DB: the old DB stays live');
+    assertEq(read(manifest), 'old manifest', 'No temp DB: the old manifest stays live');
+    assert(!existsSync(db + '.bak'), 'No temp DB: the old DB is not moved to .bak');
+    assertEq(read(tempManifest), 'stray manifest', 'No temp DB: nothing else is touched');
+    assertEq(noDbLog.length, 0, 'No temp DB: nothing is logged as swapped');
+
+    // The new DB cannot be renamed into place after the old one moved to .bak: put the old one back.
+    const failing = (...blocked) => (from, to) => {
+      if (blocked.includes(from)) throw new Error(`simulated rename failure: ${path.basename(from)}`);
+      renameSync(from, to);
+    };
+    seed({ [db]: 'old db', [manifest]: 'old manifest', [tempDb]: 'new db', [tempManifest]: 'new manifest' });
+    const undoLog = [];
+    let failed = null;
+    try { swapInIndex(db, tempDb, (m) => undoLog.push(m), failing(tempDb)); } catch (e) { failed = e; }
+    assertIncludes(failed?.message, 'simulated rename failure', 'Failed rename: the original error is rethrown');
+    assertEq(read(db), 'old db', 'Failed rename: the old DB is back in place');
+    assert(!existsSync(db + '.bak'), 'Failed rename: nothing is left at .bak');
+    assertEq(read(tempDb), 'new db', 'Failed rename: the new DB stays at its temp path');
+    assertEq(read(tempManifest), 'new manifest', 'Failed rename: the new manifest stays with it');
+    assertEq(undoLog.join('|'), 'Old DB moved to .bak|Old DB restored from .bak', 'Failed rename: logs the move and the restore');
+
+    // ...and if putting it back fails too, say where the old index is.
+    seed({ [db]: 'old db', [manifest]: 'old manifest', [tempDb]: 'new db' });
+    failed = null;
+    try { swapInIndex(db, tempDb, () => {}, failing(tempDb, db + '.bak')); } catch (e) { failed = e; }
+    assertIncludes(failed?.message, 'simulated rename failure', 'Failed restore: still reports the rename failure');
+    assertIncludes(failed?.message, 'index.db.bak', 'Failed restore: names where the old index is');
+    assertEq(read(db + '.bak'), 'old db', 'Failed restore: the old DB is still at .bak');
+
+    // First index (no old DB): nothing to restore.
+    seed({ [tempDb]: 'new db' });
+    failed = null;
+    try { swapInIndex(db, tempDb, () => {}, failing(tempDb)); } catch (e) { failed = e; }
+    assertIncludes(failed?.message, 'simulated rename failure', 'First index, failed rename: rethrown');
+    assertEq(read(tempDb), 'new db', 'First index, failed rename: the new DB stays at its temp path');
+
+    // The new DB is live but its manifest cannot be moved: not a failed swap, reported separately
+    // (no manifest is safe: the next `index` rebuilds it).
+    seed({ [db]: 'old db', [manifest]: 'old manifest', [tempDb]: 'new db', [tempManifest]: 'new manifest' });
+    const partialLog = [];
+    let partial = null;
+    let threw = false;
+    try { partial = swapInIndex(db, tempDb, (m) => partialLog.push(m), failing(tempManifest)); } catch { threw = true; }
+    assert(!threw, 'Manifest not moved: the swap does not throw, the new DB is live');
+    assertIncludes(partial?.manifestError?.message, 'simulated rename failure', 'Manifest not moved: the error is reported to the caller');
+    assertEq(read(db), 'new db', 'Manifest not moved: new DB is live');
+    assert(!existsSync(manifest), 'Manifest not moved: no manifest beside the new DB (the old one is gone)');
+    assertEq(read(db + '.bak'), 'old db', 'Manifest not moved: old DB kept as .bak');
+    assertEq(partialLog.join('|'), 'Old DB moved to .bak|New index swapped into place.', 'Manifest not moved: the DB swap is still logged');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// ─── Model Download Dir Tests ────────────────────────────────
+
+function testModelDownloadDir() {
+  console.log('\n📦 modelDownloadDir()');
+  const globalCache = path.join(os.homedir(), '.magector', 'models');
+  assertEq(
+    modelDownloadDir({ MAGECTOR_MODELS: '/srv/magento/.magector/models' }),
+    '/srv/magento/.magector/models',
+    'Downloads into MAGECTOR_MODELS when it is set'
+  );
+  assertEq(modelDownloadDir({}), globalCache, 'Falls back to the global cache');
+  assertEq(modelDownloadDir({ MAGECTOR_MODELS: '' }), globalCache, 'An empty MAGECTOR_MODELS counts as unset');
+}
+
+async function testDownloadFile() {
+  console.log('\n📦 downloadFile() (stubbed https.get: a partial file never appears under the final name)');
+  const dir = path.join(__dirname, 'tmp_model_download_test');
+  const dest = path.join(dir, 'model.onnx');
+  const listing = () => (existsSync(dir) ? readdirSync(dir).sort().join(',') : '');
+  const body = Buffer.from('0123456789'.repeat(10)); // 100 bytes
+
+  // Stub of https.get: answers each request with the next queued reply.
+  const stub = (...replies) => {
+    const get = (url, cb) => {
+      get.calls.push(url);
+      const r = replies.shift();
+      const req = { on(event, fn) { if (event === 'error' && r.requestError) process.nextTick(() => fn(r.requestError)); return this; } };
+      if (r.requestError) return req;
+      let res;
+      if (r.chunks) {
+        res = Readable.from(r.chunks);
+      } else { // a connection that dies mid-body
+        res = new Readable({ read() {} });
+        res.push(r.partial);
+        process.nextTick(() => res.destroy(new Error('socket hang up')));
+      }
+      res.statusCode = r.status ?? 200;
+      res.headers = r.headers ?? {};
+      process.nextTick(() => cb(res));
+      return req;
+    };
+    get.calls = [];
+    return get;
+  };
+  const rejection = (promise) => promise.then(() => null, (e) => e);
+  const fresh = () => { rmSync(dir, { recursive: true, force: true }); mkdirSync(dir, { recursive: true }); };
+
+  try {
+    fresh();
+    await downloadFile('https://x.test/m', dest, stub({ chunks: [body.subarray(0, 60), body.subarray(60)], headers: { 'content-length': '100' } }));
+    assertEq(listing(), 'model.onnx', 'Complete body: only the final file is left (no .part)');
+    assertEq(readFileSync(dest).length, 100, 'Complete body: the whole file is in place');
+
+    fresh();
+    await downloadFile('https://x.test/m', dest, stub({ chunks: [body] }));
+    assertEq(listing(), 'model.onnx', 'No Content-Length: a body that ends cleanly is accepted');
+
+    fresh();
+    let err = await rejection(downloadFile('https://x.test/m', dest, stub({ chunks: [body.subarray(0, 40)], headers: { 'content-length': '100' } })));
+    assertIncludes(err?.message, '40 of 100', 'Truncated body: rejected, saying how much arrived');
+    assertEq(listing(), '', 'Truncated body: no final file and no .part');
+
+    fresh();
+    err = await rejection(downloadFile('https://x.test/m', dest, stub({ partial: body.subarray(0, 40), headers: { 'content-length': '100' } })));
+    assertIncludes(err?.message, 'socket hang up', 'Connection dies mid-body: rejected with that error');
+    assertEq(listing(), '', 'Connection dies mid-body: no final file and no .part');
+
+    fresh();
+    err = await rejection(downloadFile('https://x.test/m', dest, stub({ status: 404, chunks: ['not found'] })));
+    assertIncludes(err?.message, 'HTTP 404', 'HTTP error: rejected');
+    assertEq(listing(), '', 'HTTP error: nothing is left behind');
+
+    fresh();
+    err = await rejection(downloadFile('https://x.test/m', dest, stub({ requestError: new Error('getaddrinfo ENOTFOUND x.test') })));
+    assertIncludes(err?.message, 'ENOTFOUND', 'Request error: rejected');
+    assertEq(listing(), '', 'Request error: nothing is left behind');
+
+    fresh();
+    const get = stub({ status: 302, headers: { location: '/cdn/m' }, chunks: [] }, { chunks: [body], headers: { 'content-length': '100' } });
+    await downloadFile('https://x.test/m', dest, get);
+    assertEq(get.calls.join(' '), 'https://x.test/m https://x.test/cdn/m', 'Redirect: followed to the new location');
+    assertEq(listing(), 'model.onnx', 'Redirect: only the final file is left');
+
+    fresh();
+    writeFileSync(dest, 'good');
+    err = await rejection(downloadFile('https://x.test/m', dest, stub({ chunks: [body.subarray(0, 40)], headers: { 'content-length': '100' } })));
+    assert(err !== null, 'Failed download over an existing file: rejected');
+    assertEq(readFileSync(dest, 'utf-8'), 'good', 'Failed download over an existing file: the existing file is untouched');
+    assertEq(listing(), 'model.onnx', 'Failed download over an existing file: no .part left');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// ─── MCP Config Env Tests ────────────────────────────────────
+
+function testMcpServerEnv() {
+  console.log('\n🔌 mcpServerEnv() (the env init/setup write into the MCP config)');
+  const root = '/srv/magento';
+  const db = '/srv/magento/.magector/index.db';
+  const models = path.resolve('/srv/magento/.magector/models'); // what init writes; drive-qualified on win32
+  const m = path.resolve('/m');
+  const json = (o) => JSON.stringify(o); // also pins key order, which is the order written to the config
+
+  assertEq(
+    json(mcpServerEnv(root, db, {}, {})),
+    json({ MAGENTO_ROOT: root, MAGECTOR_DB: db }),
+    'Without MAGECTOR_MODELS the env is just the root and the DB'
+  );
+  assertEq(
+    json(mcpServerEnv(root, db, {}, { MAGECTOR_MODELS: '/srv/magento/.magector/models' })),
+    json({ MAGENTO_ROOT: root, MAGECTOR_DB: db, MAGECTOR_MODELS: models }),
+    'MAGECTOR_MODELS set during init is forwarded, so the IDE-launched server finds the model'
+  );
+  assertEq(
+    json(mcpServerEnv(root, db, {}, { MAGECTOR_MODELS: '' })),
+    json({ MAGENTO_ROOT: root, MAGECTOR_DB: db }),
+    'An empty MAGECTOR_MODELS counts as unset'
+  );
+  assertEq(
+    mcpServerEnv(root, db, {}, { MAGECTOR_MODELS: 'models' }).MAGECTOR_MODELS,
+    path.resolve('models'),
+    'A relative MAGECTOR_MODELS is written absolute (the server starts in another cwd)'
+  );
+  assertEq(
+    json(mcpServerEnv(root, db, { anthropicApiKey: 'sk-test' }, { MAGECTOR_MODELS: '/m' })),
+    json({ MAGENTO_ROOT: root, MAGECTOR_DB: db, MAGECTOR_MODELS: m, ANTHROPIC_API_KEY: 'sk-test' }),
+    'The API key is still added, after the paths'
+  );
+  assertEq(
+    json(mcpServerEnv(root, db, { anthropicApiKey: 'sk-test' }, {})),
+    json({ MAGENTO_ROOT: root, MAGECTOR_DB: db, ANTHROPIC_API_KEY: 'sk-test' }),
+    'API key without MAGECTOR_MODELS: unchanged from before'
+  );
 }
 
 // ─── Serve Respawn Rate-Limit Policy Tests ───────────────────

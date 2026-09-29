@@ -6,9 +6,10 @@
  * 2. ~/.magector/models/ (global cache)
  * 3. rust-core/models/ (dev fallback)
  *
- * Downloads from HuggingFace if not found.
+ * Downloads from HuggingFace if not found — into MAGECTOR_MODELS when set, else the
+ * global cache.
  */
-import { existsSync, statSync, mkdirSync, createWriteStream, unlinkSync } from 'fs';
+import { existsSync, statSync, mkdirSync, createWriteStream, unlinkSync, renameSync, rmSync } from 'fs';
 import { get as httpsGet } from 'https';
 import path from 'path';
 import os from 'os';
@@ -31,6 +32,14 @@ const MODEL_FILES = [
 
 function getGlobalCacheDir() {
   return path.join(os.homedir(), '.magector', 'models');
+}
+
+/**
+ * Where a missing model is downloaded: MAGECTOR_MODELS when set (the directory the user
+ * chose, and the first place resolveModels() looks), else the global cache.
+ */
+export function modelDownloadDir(env = process.env) {
+  return env.MAGECTOR_MODELS || getGlobalCacheDir();
 }
 
 /**
@@ -73,7 +82,7 @@ export async function ensureModels({ silent = false } = {}) {
   const existing = resolveModels();
   if (existing) return existing;
 
-  const targetDir = getGlobalCacheDir();
+  const targetDir = modelDownloadDir();
   mkdirSync(targetDir, { recursive: true });
 
   if (!silent) {
@@ -101,30 +110,69 @@ export async function ensureModels({ silent = false } = {}) {
   return targetDir;
 }
 
-function downloadFile(url, dest) {
+/**
+ * Download `url` to `dest` by way of `<dest>.part`, renamed into place only once the whole
+ * body has arrived and matches Content-Length (when the server sent one). A dropped
+ * connection or a short body must never leave a truncated model under its final name:
+ * hasModels() would accept it, and it would be used and copied along with the directory.
+ * `get` is injectable for tests.
+ */
+export function downloadFile(url, dest, get = httpsGet) {
+  const part = dest + '.part';
   return new Promise((resolve, reject) => {
-    const file = createWriteStream(dest);
+    let settled = false;
+    let response = null;
+    let file = null; // the .part stream, opened once a 200 response arrives
+
+    // Every failure ends here: stop the transfer, close the stream, then remove the partial file.
+    const fail = (err, streamClosed = false) => {
+      if (settled) return;
+      settled = true;
+      if (response) response.destroy();
+      const done = () => { rmSync(part, { force: true }); reject(err); };
+      if (!file || streamClosed) return done();
+      file.once('close', done);
+      file.destroy();
+    };
 
     function follow(currentUrl) {
-      httpsGet(currentUrl, (res) => {
+      get(currentUrl, (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          const next = new URL(res.headers.location, currentUrl).href;
-          follow(next);
+          res.resume();
+          follow(new URL(res.headers.location, currentUrl).href);
           return;
         }
         if (res.statusCode !== 200) {
-          file.close();
-          reject(new Error(`HTTP ${res.statusCode} downloading ${url}`));
+          res.resume();
+          fail(new Error(`HTTP ${res.statusCode} downloading ${url}`));
           return;
         }
-        res.pipe(file);
-        file.on('finish', () => {
-          file.close(resolve);
+        response = res;
+        const expected = Number(res.headers['content-length']); // NaN when the header is absent
+        let ended = false;
+        file = createWriteStream(part);
+        res.on('end', () => { ended = true; });
+        res.on('error', fail);
+        res.on('close', () => {
+          if (!ended) fail(new Error(`Connection closed before ${url} finished downloading`));
         });
-      }).on('error', (err) => {
-        file.close();
-        reject(err);
-      });
+        file.on('error', fail);
+        file.on('close', () => {
+          if (settled) return;
+          try {
+            const size = statSync(part).size;
+            if (Number.isFinite(expected) && size !== expected) {
+              throw new Error(`Incomplete download of ${url}: got ${size} of ${expected} bytes`);
+            }
+            renameSync(part, dest);
+          } catch (err) {
+            return fail(err, true);
+          }
+          settled = true;
+          resolve();
+        });
+        res.pipe(file);
+      }).on('error', fail);
     }
 
     follow(url);

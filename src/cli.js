@@ -14,6 +14,7 @@ import { init, setup } from './init.js';
 import { checkForUpdate } from './update.js';
 import { createRequire } from 'module';
 import { getRunningIndexPid, writeIndexPidFile, removeIndexPidFile } from './index-lock.js';
+import { defaultDbPath, dbPathForRoot } from './paths.js';
 const __cliPkg = createRequire(import.meta.url)('../package.json');
 
 const args = process.argv.slice(2);
@@ -49,7 +50,7 @@ Index options:
 
 Environment Variables:
   MAGENTO_ROOT             Path to Magento installation (default: cwd)
-  MAGECTOR_DB              Path to index database (default: ./.magector/index.db)
+  MAGECTOR_DB              Path to index database (default: $MAGENTO_ROOT/.magector/index.db)
   MAGECTOR_BIN             Path to magector-core binary
   MAGECTOR_MODELS          Path to ONNX model directory
   MAGECTOR_THREADS         Max threads (overridden by --threads)
@@ -70,7 +71,7 @@ Examples:
 
 function getConfig() {
   return {
-    dbPath: process.env.MAGECTOR_DB || './.magector/index.db',
+    dbPath: defaultDbPath(),
     magentoRoot: process.env.MAGENTO_ROOT || process.cwd()
   };
 }
@@ -98,11 +99,12 @@ function parseArgs(argv) {
 async function runIndex(targetPath, opts = {}) {
   const config = getConfig();
   const root = targetPath || config.magentoRoot;
+  const dbPath = dbPathForRoot(root);
   const binary = resolveBinary();
   const modelPath = await ensureModels();
 
   console.log(`\nIndexing: ${path.resolve(root)}`);
-  console.log(`Database: ${path.resolve(config.dbPath)}\n`);
+  console.log(`Database: ${path.resolve(dbPath)}\n`);
 
   // Ensure .magector/ directory exists
   const magectorDir = path.resolve(root, '.magector');
@@ -130,7 +132,7 @@ async function runIndex(targetPath, opts = {}) {
     const indexArgs = [
       'index',
       '-m', path.resolve(root),
-      '-d', path.resolve(config.dbPath),
+      '-d', path.resolve(dbPath),
       '-c', modelPath
     ];
     // Forward thread/batch limits to the Rust binary. The Rust side already

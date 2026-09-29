@@ -17,7 +17,7 @@ import {
 import { execFileSync, spawn } from 'child_process';
 import { createInterface } from 'readline';
 import { createServer as createNetServer, createConnection } from 'net';
-import { existsSync, statSync, unlinkSync, copyFileSync, renameSync, appendFileSync, writeFileSync, readFileSync, readdirSync, mkdirSync, openSync, closeSync, chmodSync, constants as fsConstants } from 'fs';
+import { existsSync, statSync, unlinkSync, copyFileSync, appendFileSync, writeFileSync, readFileSync, readdirSync, mkdirSync, openSync, closeSync, chmodSync, constants as fsConstants } from 'fs';
 import { stat } from 'fs/promises';
 import { glob } from 'glob';
 import path from 'path';
@@ -34,11 +34,12 @@ import {
 } from 'ruvector/dist/analysis/complexity.js';
 import { resolveBinary } from './binary.js';
 import { resolveModels } from './model.js';
+import { defaultDbPath, manifestPath, tempDbPathFor, swapInIndex } from './paths.js';
 import { createRequire } from 'module';
 const __pkg = createRequire(import.meta.url)('../package.json');
 
 const config = {
-  dbPath: process.env.MAGECTOR_DB || './.magector/index.db',
+  dbPath: defaultDbPath(),
   magentoRoot: process.env.MAGENTO_ROOT || process.cwd(),
   watchInterval: parseInt(process.env.MAGECTOR_WATCH_INTERVAL, 10) || 300,
   get rustBinary() { return resolveBinary(); },
@@ -585,7 +586,7 @@ async function checkDbFormat() {
 /**
  * Start a background re-index process that builds to a temporary path.
  * The old DB remains in place so search tools keep working during rebuild.
- * On completion, the new index is swapped in atomically (old → .bak, new → current).
+ * On completion, the new index is swapped in (old → .bak, new → current).
  */
 function startBackgroundReindex() {
   if (reindexInProgress) return;
@@ -597,7 +598,7 @@ function startBackgroundReindex() {
     console.error(`Reindex already running (PID ${existingPid}) — skipping`);
     reindexInProgress = true; // mark locally so tools know
     // Poll the external process and react when it finishes
-    const tempDbPath = config.dbPath + '.new';
+    const tempDbPath = tempDbPathFor(config.dbPath);
     const pollInterval = setInterval(() => {
       if (!getRunningReindexPid()) {
         clearInterval(pollInterval);
@@ -631,7 +632,7 @@ function startBackgroundReindex() {
     return;
   }
 
-  const tempDbPath = config.dbPath + '.new';
+  const tempDbPath = tempDbPathFor(config.dbPath);
 
   // A leftover temp DB from a reindex that was interrupted (e.g. the MCP
   // session ended before it finished) is NOT garbage — magector-core saves
@@ -650,7 +651,7 @@ function startBackgroundReindex() {
 
   const hadExistingDb = existsSync(config.dbPath);
   logToFile('WARN', `Starting background re-index to temp path. Old DB ${hadExistingDb ? 'preserved for queries' : 'not found'}.`);
-  console.error(`Database format incompatible. Starting background re-index (log: ${LOG_PATH})`);
+  console.error(`${hadExistingDb ? 'Database format incompatible' : 'No index found'}. Starting background re-index (log: ${LOG_PATH})`);
 
   const reindexArgs = [
     'index',
@@ -705,26 +706,38 @@ function startBackgroundReindex() {
     reindexProcess = null;
     reindexStartTime = null;
     reindexPhase = 0;
-    removeReindexPidFile();
     if (code === 0) {
-      // Atomic swap: old → .bak, new → current
+      // The lock file still names the re-index child, which has just exited, and the serve
+      // watcher (like other instances) only defers to a PID that is alive. Hold the lock
+      // under our own PID until the new DB is in place, so nothing writes index.db mid-swap.
+      writeReindexPidFile(process.pid);
+      // Swap the new index in: old → .bak, new → current (each DB's manifest travels with it)
+      let swap = null;
+      let swapError = null;
       try {
-        if (existsSync(config.dbPath)) {
-          const backupPath = config.dbPath + '.bak';
-          if (existsSync(backupPath)) { try { unlinkSync(backupPath); } catch {} }
-          renameSync(config.dbPath, backupPath);
-          logToFile('INFO', 'Old DB moved to .bak');
-        }
-        renameSync(tempDbPath, config.dbPath);
-        logToFile('INFO', 'New index swapped into place.');
+        swap = swapInIndex(config.dbPath, tempDbPath, (msg) => logToFile('INFO', msg));
       } catch (e) {
-        logToFile('ERR', `Failed to swap index: ${e.message}`);
+        swapError = e;
       }
-      logToFile('INFO', 'Background re-index completed. Restarting serve process.');
-      console.error('Background re-index completed. Restarting serve process.');
-      searchCache.clear();
-      restartServeProcessIntentionally('background re-index completed');
+      if (swapError) {
+        removeReindexPidFile();
+        // Nothing new is live (the old index is kept or was put back), so serve keeps
+        // the index it has loaded: no restart, no "completed".
+        logToFile('ERR', `Failed to swap index: ${swapError.message}`);
+        console.error(`Background re-index finished, but its index was not swapped in: ${swapError.message}. Check ${LOG_PATH}`);
+      } else {
+        if (swap.manifestError) {
+          logToFile('WARN', `New index is live, but its manifest could not be moved (${swap.manifestError.message}); the next \`index\` rebuilds it`);
+        }
+        logToFile('INFO', 'Background re-index completed. Restarting serve process.');
+        console.error('Background re-index completed. Restarting serve process.');
+        searchCache.clear();
+        // The old serve still holds the previous index in memory, and its watcher would save
+        // that over the one just swapped in: keep the lock until that serve has exited.
+        restartServeProcessIntentionally('background re-index completed', removeReindexPidFile);
+      }
     } else if (signal) {
+      removeReindexPidFile();
       // Killed (e.g. our own cleanup() when the MCP session ended before
       // indexing finished) — not a real failure. magector-core saves
       // incrementally, so keep the temp DB for the next session to resume
@@ -732,9 +745,11 @@ function startBackgroundReindex() {
       logToFile('WARN', `Background re-index interrupted by signal ${signal} — temp DB kept for resume`);
       console.error(`Background re-index interrupted (${signal}) — will resume next run.`);
     } else {
+      removeReindexPidFile();
       // Genuine failure (non-zero exit, no signal) — the temp DB may be
-      // corrupt, so don't let a later run try to resume from it.
+      // corrupt, so don't let a later run try to resume from it (nor its manifest).
       try { if (existsSync(tempDbPath)) unlinkSync(tempDbPath); } catch {}
+      try { unlinkSync(manifestPath(tempDbPath)); } catch {}
       logToFile('ERR', `Background re-index failed (exit code ${code})`);
       console.error(`Background re-index failed (exit code ${code}). Check ${LOG_PATH}`);
     }
@@ -1019,10 +1034,12 @@ function scheduleServeRespawn() {
  * inside save_atomic), and clears intentionalRestart on 'error' too — a
  * stuck flag would otherwise both skip real crash respawns forever and
  * never spawn a replacement itself.
+ * `onOldServeGone` runs once the old process is gone (or there was none), just
+ * before its replacement is spawned.
  */
-function restartServeProcessIntentionally(reason) {
+function restartServeProcessIntentionally(reason, onOldServeGone = () => {}) {
   const proc = serveProcess;
-  if (!proc) { startServeProcess(); return; }
+  if (!proc) { onOldServeGone(); startServeProcess(); return; }
   intentionalRestart = true;
   logToFile('INFO', `Restarting serve process (${reason})`);
 
@@ -1032,6 +1049,7 @@ function restartServeProcessIntentionally(reason) {
     settled = true;
     clearTimeout(killTimer);
     intentionalRestart = false;
+    onOldServeGone();
     startServeProcess();
   };
 

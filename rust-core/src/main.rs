@@ -377,15 +377,27 @@ fn run_index(
 
     let stats = indexer.index_with_options(force)?;
 
-    tracing::info!("Saving final index to {:?}...", database);
-    indexer.save_atomic(database)?;
+    if stats.db_changed {
+        tracing::info!("Saving final index to {:?}...", database);
+        indexer.save_atomic(database)?;
 
-    // A save that reports success but produces a file that decodes to fewer
-    // live vectors than were in memory (e.g. clobbered by a concurrent writer
-    // targeting the same path) must never be reported as "Indexing complete" —
-    // an index costs hours of CPU, so a silent empty/partial result is worse
-    // than a loud failure that prompts a re-run.
-    magector_core::vectordb::verify_vector_count(database, stats.vectors_created)?;
+        // A save that reports success but produces a file that decodes to fewer
+        // live vectors than were in memory (e.g. clobbered by a concurrent writer
+        // targeting the same path) must never be reported as "Indexing complete" —
+        // an index costs hours of CPU, so a silent empty/partial result is worse
+        // than a loud failure that prompts a re-run.
+        magector_core::vectordb::verify_vector_count(database, stats.vectors_created)?;
+    } else {
+        // Nothing to write: index.db on disk is the one this run loaded (and re-opening it
+        // to verify would rebuild the whole HNSW for nothing).
+        println!("✓ Index unchanged — index.db not rewritten");
+    }
+
+    // The manifest goes last: it must never claim content that index.db on disk does not
+    // hold. If a step above failed, the previous manifest stays and the next run embeds
+    // again what this one did not persist. (It is also written when only stats changed —
+    // touched files, backfilled hashes — since index.db on disk is what this run loaded.)
+    manifest_save_is_best_effort(indexer.save_manifest(), database);
 
     println!("Files found:    {}", stats.files_found);
     println!("Files indexed:  {}", stats.files_indexed);
@@ -398,6 +410,21 @@ fn run_index(
     println!("Errors:         {}", stats.errors);
 
     Ok(())
+}
+
+/// No manifest is the safe state — the next `index` rebuilds it from index.db — so one that
+/// cannot be written is a warning, not a failed run: failing here would make the MCP
+/// background re-index delete a complete, verified `index.db.new`. A sidecar still on disk
+/// describes the index.db from before this run, so it is removed rather than left to claim it.
+fn manifest_save_is_best_effort(saved: Result<()>, database: &std::path::Path) {
+    let Err(err) = saved else { return };
+    println!("⚠️  Could not save the manifest ({err:#}) — the next run rebuilds it");
+    let sidecar = magector_core::watcher::FileManifest::sidecar_path(database);
+    match fs::remove_file(&sidecar) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => println!("⚠️  Could not remove the old manifest {sidecar:?} ({e})"),
+    }
 }
 
 fn run_validation(
@@ -621,6 +648,24 @@ fn run_serve(
     Ok(())
 }
 
+/// Before index.db is changed on behalf of `paths`, mark them stale in the sidecar next to
+/// it, as the serve watcher does: `index` trusts a matching hash there. A sidecar that
+/// cannot be marked is removed; if it cannot even be removed this returns false, and
+/// index.db must be left alone.
+fn withdraw_sidecar_claims(db_path: &std::path::Path, paths: &[String]) -> bool {
+    let sidecar = magector_core::watcher::FileManifest::sidecar_path(db_path);
+    if let Err(e) = magector_core::watcher::FileManifest::mark_stale_in_sidecar(&sidecar, paths) {
+        eprintln!("Warning: could not mark the described files stale in {:?} ({}); removing it", sidecar, e);
+        if let Err(e) = fs::remove_file(&sidecar) {
+            if sidecar.exists() {
+                eprintln!("Warning: could not remove {:?} ({}); not re-embedding the described files", sidecar, e);
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn handle_serve_request(
     indexer: &Arc<Mutex<Indexer>>,
     watcher_status: &Arc<Mutex<WatcherStatus>>,
@@ -754,20 +799,23 @@ fn handle_serve_request(
                             let mut idx = indexer.lock().unwrap();
                             // Ensure descriptions DB is set for re-embedding
                             idx.set_descriptions_db(std::path::PathBuf::from(&output));
-                            // Remove old vectors for these paths
-                            for rel_path in &report.described_paths {
-                                idx.remove_vectors_for_path(rel_path);
-                            }
-                            let reindex_result: Result<Vec<(String, Vec<usize>)>> = idx.index_files(&files_to_reindex);
-                            match reindex_result {
-                                Ok(indexed) => {
-                                    eprintln!("Re-indexed {} files with descriptions", indexed.len());
-                                    if let Err(e) = idx.save(db_path) {
-                                        eprintln!("Warning: failed to save index after re-embed: {}", e);
-                                    }
+                            // The sidecar must stop claiming these files before their vectors change
+                            if withdraw_sidecar_claims(db_path, &report.described_paths) {
+                                // Remove old vectors for these paths
+                                for rel_path in &report.described_paths {
+                                    idx.remove_vectors_for_path(rel_path);
                                 }
-                                Err(e) => {
-                                    eprintln!("Warning: re-index after describe failed: {}", e);
+                                let reindex_result: Result<Vec<(String, Vec<usize>)>> = idx.index_files(&files_to_reindex);
+                                match reindex_result {
+                                    Ok(indexed) => {
+                                        eprintln!("Re-indexed {} files with descriptions", indexed.len());
+                                        if let Err(e) = idx.save_atomic(db_path) {
+                                            eprintln!("Warning: failed to save index after re-embed: {}", e);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Warning: re-index after describe failed: {}", e);
+                                    }
                                 }
                             }
                         }
@@ -1814,5 +1862,27 @@ class Helper
         assert!(glob_match_simple("a.b.c", "*.b.*"));
         assert!(glob_match_simple("test", "????"));
         assert!(!glob_match_simple("test", "???"));
+    }
+}
+
+#[cfg(test)]
+mod manifest_save_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_manifest_save_withdraws_the_old_sidecar_and_does_not_fail() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("index.db");
+        let sidecar = magector_core::watcher::FileManifest::sidecar_path(&db);
+        fs::write(&sidecar, b"an old manifest").unwrap();
+
+        manifest_save_is_best_effort(Err(anyhow::anyhow!("disk full")), &db);
+        assert!(!sidecar.exists(), "an old sidecar must not be left claiming the previous index");
+
+        // no sidecar to remove, and a saved manifest: nothing to do, nothing to fail
+        manifest_save_is_best_effort(Err(anyhow::anyhow!("disk full")), &db);
+        fs::write(&sidecar, b"the new manifest").unwrap();
+        manifest_save_is_best_effort(Ok(()), &db);
+        assert!(sidecar.exists());
     }
 }
