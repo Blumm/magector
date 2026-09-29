@@ -276,6 +276,8 @@ impl Indexer {
         let (files, skipped_resume): (Vec<PathBuf>, usize) = if resume {
             // Detect changes against manifest
             let changes = manifest.detect_changes(&self.magento_root)?;
+            manifest.apply_touched(&changes.touched);
+            let touched_count = changes.touched.len();
             let modified_count = changes.modified.len();
             let deleted_count = changes.deleted.len();
             let added_count = changes.added.len();
@@ -296,6 +298,14 @@ impl Indexer {
             }
             manifest.apply_deleted(&changes.deleted);
 
+            // Record content hashes for unchanged files that have none yet (v1 manifest,
+            // or a manifest built from an existing index), so the next environment — a
+            // checkout, `docker cp` — can tell a touched file from a modified one.
+            let backfilled = manifest.backfill_hashes(&self.magento_root);
+            if backfilled > 0 {
+                println!("🔐 Recorded content hashes for {} unchanged files", backfilled);
+            }
+
             // Compact if many tombstones
             if self.vectordb_tombstone_ratio() > 0.20 {
                 tracing::info!("Compacting vector DB after removing modified/deleted file vectors");
@@ -308,12 +318,13 @@ impl Indexer {
                 .chain(changes.modified.into_iter())
                 .collect();
 
-            let skipped = stats.files_found - to_process.len() - deleted_count;
+            // Deleted files were never discovered, so they are not part of files_found.
+            let skipped = stats.files_found - to_process.len();
 
-            if modified_count > 0 || deleted_count > 0 || added_count > 0 {
+            if modified_count > 0 || deleted_count > 0 || added_count > 0 || touched_count > 0 {
                 println!(
-                    "📊 Incremental: {} new, {} modified, {} deleted, {} unchanged",
-                    added_count, modified_count, deleted_count, skipped
+                    "📊 Incremental: {} new, {} modified, {} deleted, {} unchanged ({} touched: mtime changed, content identical)",
+                    added_count, modified_count, deleted_count, skipped, touched_count
                 );
             }
 
@@ -359,6 +370,7 @@ impl Indexer {
             if let Some(ref mp) = manifest_path {
                 if !resume {
                     manifest = crate::watcher::FileManifest::from_existing_index(&self.magento_root, &self.indexed_paths());
+                    manifest.backfill_hashes(&self.magento_root);
                 }
                 if let Err(e) = manifest.save(mp) {
                     tracing::warn!("Failed to save manifest: {}", e);
@@ -573,8 +585,9 @@ impl Indexer {
         // On a resume run, update the existing manifest with newly indexed files.
         if let Some(ref mp) = manifest_path {
             if !resume {
-                // Full index — build manifest from filesystem
+                // Full index — build manifest from filesystem, with content hashes
                 manifest = crate::watcher::FileManifest::from_existing_index(&self.magento_root, &self.indexed_paths());
+                manifest.backfill_hashes(&self.magento_root);
             } else {
                 // Incremental — update manifest entries for the files we just processed
                 let root = &self.magento_root;
@@ -585,7 +598,7 @@ impl Indexer {
                         manifest.files.insert(rel, crate::watcher::FileRecord {
                             mtime,
                             size: meta.len(),
-                            sha256: None,
+                            sha256: crate::watcher::file_sha256(f),
                             vector_ids: Vec::new(),
                         });
                     }
