@@ -112,6 +112,9 @@ pub struct Indexer {
     /// The manifest `index_with_options` prepared for the sidecar next to index.db. Held
     /// back so it is written only after index.db is: see `save_manifest`.
     pending_manifest: Option<crate::watcher::FileManifest>,
+    /// Set by a full rebuild: the old sidecar is removed just before index.db is first
+    /// written (`withdraw_old_sidecar`). Never set by the serve watcher.
+    withdraw_sidecar: bool,
 }
 
 impl Indexer {
@@ -170,6 +173,7 @@ impl Indexer {
             ignore_patterns,
             batch_size,
             pending_manifest: None,
+            withdraw_sidecar: false,
         })
     }
 
@@ -217,8 +221,8 @@ impl Indexer {
     /// verifies it, and only then calls `save_manifest`: the manifest must never claim
     /// content that index.db on disk does not hold. (For the same reason a resume first
     /// marks the paths it is about to change stale in the existing sidecar, and a full
-    /// rebuild removes it, so a run that dies after a periodic save leaves no old hash
-    /// claiming them.)
+    /// rebuild removes it when it first writes index.db, so a run that dies after a
+    /// periodic save leaves no old hash claiming them.)
     pub fn index_with_options(&mut self, force: bool) -> Result<IndexStats> {
         let mut stats = IndexStats::default();
         self.pending_manifest = None;
@@ -244,6 +248,10 @@ impl Indexer {
         let resume = !force && preexisting_vectors > 0;
         // A full index always writes index.db; a resume only if it changes something below.
         stats.db_changed = !resume;
+        // A full rebuild replaces index.db piece by piece, and the old sidecar would keep
+        // claiming every file. It goes when index.db is first written, and not before: a run
+        // that dies earlier leaves the old index and its sidecar as they were.
+        self.withdraw_sidecar = !resume;
         let already_indexed: HashSet<String> = if resume {
             self.indexed_paths()
         } else {
@@ -413,19 +421,6 @@ impl Indexer {
 
             (to_process, skipped)
         } else {
-            // A full rebuild (--force, or no index yet) overwrites index.db through PHASE 2's
-            // periodic saves while an old sidecar keeps claiming every file. Remove it first:
-            // if the run dies, `index` rebuilds the sidecar from whatever index.db holds.
-            if let Some(ref mp) = manifest_path {
-                match fs::remove_file(mp) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => anyhow::bail!(
-                        "Could not remove {:?} ({}); not rebuilding index.db while it still claims the old content",
-                        mp, e
-                    ),
-                }
-            }
             (all_files, 0)
         };
 
@@ -648,8 +643,9 @@ impl Indexer {
 
             // Incremental save to disk — enables partial recovery on crash/restart
             if batch_num % SAVE_INTERVAL_BATCHES == 0 {
-                if let Some(ref db_path) = self.db_path {
-                    if let Err(e) = self.vectordb.save_atomic(db_path) {
+                if let Some(db_path) = self.db_path.clone() {
+                    self.withdraw_old_sidecar()?;
+                    if let Err(e) = self.vectordb.save_atomic(&db_path) {
                         tracing::warn!("Incremental save failed (non-fatal): {e}");
                     } else {
                         let msg = format!("Incremental save: {} vectors written to disk", embedded);
@@ -698,6 +694,29 @@ impl Indexer {
 
         stats.db_changed |= embedded > 0;
         Ok(stats)
+    }
+
+    /// Remove the old sidecar if a full rebuild is about to write index.db for the first
+    /// time: from then on index.db holds a partial new index, which that sidecar would
+    /// misdescribe. Called before every index.db write; does nothing once done, or when the
+    /// flag was never set (the serve watcher). A file that is not there is fine; any other
+    /// error stops the write.
+    fn withdraw_old_sidecar(&mut self) -> Result<()> {
+        if !self.withdraw_sidecar {
+            return Ok(());
+        }
+        if let Some(sidecar) = self.db_path.as_deref().map(crate::watcher::FileManifest::sidecar_path) {
+            match fs::remove_file(&sidecar) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => anyhow::bail!(
+                    "Could not remove {:?} ({}); not writing index.db while it still claims the old content",
+                    sidecar, e
+                ),
+            }
+        }
+        self.withdraw_sidecar = false;
+        Ok(())
     }
 
     /// Write the manifest the last `index_with_options` prepared to the sidecar next to
@@ -1449,12 +1468,14 @@ impl Indexer {
     }
 
     /// Save the index to disk
-    pub fn save(&self, path: &Path) -> Result<()> {
+    pub fn save(&mut self, path: &Path) -> Result<()> {
+        self.withdraw_old_sidecar()?;
         self.vectordb.save(path)
     }
 
     /// Crash-safe save: write to temp file, then atomic rename
-    pub fn save_atomic(&self, path: &Path) -> Result<()> {
+    pub fn save_atomic(&mut self, path: &Path) -> Result<()> {
+        self.withdraw_old_sidecar()?;
         self.vectordb.save_atomic(path)
     }
 
