@@ -34,7 +34,7 @@ import {
 } from 'ruvector/dist/analysis/complexity.js';
 import { resolveBinary } from './binary.js';
 import { resolveModels } from './model.js';
-import { defaultDbPath, manifestPath, swapInIndex } from './paths.js';
+import { defaultDbPath, manifestPath, tempDbPathFor, swapInIndex } from './paths.js';
 import { createRequire } from 'module';
 const __pkg = createRequire(import.meta.url)('../package.json');
 
@@ -598,7 +598,7 @@ function startBackgroundReindex() {
     console.error(`Reindex already running (PID ${existingPid}) — skipping`);
     reindexInProgress = true; // mark locally so tools know
     // Poll the external process and react when it finishes
-    const tempDbPath = config.dbPath + '.new';
+    const tempDbPath = tempDbPathFor(config.dbPath);
     const pollInterval = setInterval(() => {
       if (!getRunningReindexPid()) {
         clearInterval(pollInterval);
@@ -632,7 +632,7 @@ function startBackgroundReindex() {
     return;
   }
 
-  const tempDbPath = config.dbPath + '.new';
+  const tempDbPath = tempDbPathFor(config.dbPath);
 
   // A leftover temp DB from a reindex that was interrupted (e.g. the MCP
   // session ended before it finished) is NOT garbage — magector-core saves

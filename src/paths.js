@@ -33,6 +33,15 @@ export function manifestPath(dbPath) {
 }
 
 /**
+ * Where a background re-index builds the new DB: `index.db` → `index.db.new`. A DB path
+ * with no extension gets `.new.db` instead, because `<name>.new` would share its manifest
+ * (`<name>.manifest`) with the live DB and the rebuild would overwrite the live sidecar.
+ */
+export function tempDbPathFor(dbPath) {
+  return path.extname(dbPath) ? dbPath + '.new' : dbPath + '.new.db';
+}
+
+/**
  * Swap a freshly built index into place (old DB → .bak), moving its manifest with it.
  * The live manifest describes the OLD index, so it goes FIRST: a crash between the renames
  * then leaves no manifest (`index` rebuilds it), never the old manifest beside the new DB,

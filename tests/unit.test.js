@@ -15,7 +15,7 @@ import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'fs';
 import { syncOptionalDeps } from '../scripts/sync-optional-deps.mjs';
 import { getRunningIndexPid, writeIndexPidFile, removeIndexPidFile, lockPathFor } from '../src/index-lock.js';
 import { shouldRespawnServe, MAX_RESPAWNS_PER_WINDOW, RESPAWN_WINDOW_MS, RESPAWN_BASE_DELAY_MS } from '../src/serve-respawn.js';
-import { defaultDbPath, dbPathForRoot, manifestPath, swapInIndex } from '../src/paths.js';
+import { defaultDbPath, dbPathForRoot, manifestPath, tempDbPathFor, swapInIndex } from '../src/paths.js';
 import { modelDownloadDir } from '../src/model.js';
 import { mcpServerEnv } from '../src/init.js';
 
@@ -4834,6 +4834,7 @@ async function main() {
   testDefaultDbPath();
   testDbPathForRoot();
   testManifestPath();
+  testTempDbPathFor();
   testSwapInIndex();
   testModelDownloadDir();
   testMcpServerEnv();
@@ -5318,6 +5319,22 @@ function testManifestPath() {
     'index.db.new → index.db.manifest (last extension replaced)'
   );
   assertEq(manifestPath('/x/index'), path.join('/x', 'index.manifest'), 'No extension → .manifest appended');
+}
+
+function testTempDbPathFor() {
+  console.log('\n📂 tempDbPathFor()');
+  assertEq(tempDbPathFor('/x/index.db'), '/x/index.db.new', 'index.db → index.db.new (a resume in progress keeps working)');
+  assertEq(tempDbPathFor('/x/index'), '/x/index.new.db', 'No extension → .new.db, so it has an extension of its own');
+  // The temp DB's manifest sidecar must never be the live DB's, or the rebuild would overwrite it
+  for (const name of ['index.db', 'index', '.index', 'magector', 'a.b.c', 'index.']) {
+    const db = path.join('/x.y', name);
+    assert(
+      manifestPath(db) !== manifestPath(tempDbPathFor(db)),
+      `Temp DB of "${name}" has its own manifest`,
+      `${manifestPath(db)} vs ${manifestPath(tempDbPathFor(db))}`
+    );
+    assert(tempDbPathFor(db) !== db, `Temp DB of "${name}" is not the live DB`);
+  }
 }
 
 function testSwapInIndex() {
