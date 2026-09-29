@@ -11,7 +11,7 @@
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'fs';
+import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, renameSync } from 'fs';
 import { syncOptionalDeps } from '../scripts/sync-optional-deps.mjs';
 import { getRunningIndexPid, writeIndexPidFile, removeIndexPidFile, lockPathFor } from '../src/index-lock.js';
 import { shouldRespawnServe, MAX_RESPAWNS_PER_WINDOW, RESPAWN_WINDOW_MS, RESPAWN_BASE_DELAY_MS } from '../src/serve-respawn.js';
@@ -5399,6 +5399,37 @@ function testSwapInIndex() {
     assert(!existsSync(db + '.bak'), 'No temp DB: the old DB is not moved to .bak');
     assertEq(read(tempManifest), 'stray manifest', 'No temp DB: nothing else is touched');
     assertEq(noDbLog.length, 0, 'No temp DB: nothing is logged as swapped');
+
+    // The new DB cannot be renamed into place after the old one moved to .bak: put the old one back.
+    const failing = (...blocked) => (from, to) => {
+      if (blocked.includes(from)) throw new Error(`simulated rename failure: ${path.basename(from)}`);
+      renameSync(from, to);
+    };
+    seed({ [db]: 'old db', [manifest]: 'old manifest', [tempDb]: 'new db', [tempManifest]: 'new manifest' });
+    const undoLog = [];
+    let failed = null;
+    try { swapInIndex(db, tempDb, (m) => undoLog.push(m), failing(tempDb)); } catch (e) { failed = e; }
+    assertIncludes(failed?.message, 'simulated rename failure', 'Failed rename: the original error is rethrown');
+    assertEq(read(db), 'old db', 'Failed rename: the old DB is back in place');
+    assert(!existsSync(db + '.bak'), 'Failed rename: nothing is left at .bak');
+    assertEq(read(tempDb), 'new db', 'Failed rename: the new DB stays at its temp path');
+    assertEq(read(tempManifest), 'new manifest', 'Failed rename: the new manifest stays with it');
+    assertEq(undoLog.join('|'), 'Old DB moved to .bak|Old DB restored from .bak', 'Failed rename: logs the move and the restore');
+
+    // ...and if putting it back fails too, say where the old index is.
+    seed({ [db]: 'old db', [manifest]: 'old manifest', [tempDb]: 'new db' });
+    failed = null;
+    try { swapInIndex(db, tempDb, () => {}, failing(tempDb, db + '.bak')); } catch (e) { failed = e; }
+    assertIncludes(failed?.message, 'simulated rename failure', 'Failed restore: still reports the rename failure');
+    assertIncludes(failed?.message, 'index.db.bak', 'Failed restore: names where the old index is');
+    assertEq(read(db + '.bak'), 'old db', 'Failed restore: the old DB is still at .bak');
+
+    // First index (no old DB): nothing to restore.
+    seed({ [tempDb]: 'new db' });
+    failed = null;
+    try { swapInIndex(db, tempDb, () => {}, failing(tempDb)); } catch (e) { failed = e; }
+    assertIncludes(failed?.message, 'simulated rename failure', 'First index, failed rename: rethrown');
+    assertEq(read(tempDb), 'new db', 'First index, failed rename: the new DB stays at its temp path');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

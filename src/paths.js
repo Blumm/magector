@@ -46,22 +46,35 @@ export function tempDbPathFor(dbPath) {
  * The live manifest describes the OLD index, so it goes FIRST: a crash between the renames
  * then leaves no manifest (`index` rebuilds it), never the old manifest beside the new DB,
  * which `index` would trust for content the new DB may not hold. Throws on failure — before
- * touching anything when there is no temp DB (a re-index that saved nothing), so the
- * current DB and manifest stay live rather than the DB being stranded as .bak.
+ * touching anything when there is no temp DB (a re-index that saved nothing), and putting
+ * the old DB back if the new one cannot be renamed into place, so the current index stays
+ * live rather than being stranded as .bak. `rename` is injectable for tests.
  */
-export function swapInIndex(dbPath, tempDbPath, log = () => {}) {
+export function swapInIndex(dbPath, tempDbPath, log = () => {}, rename = renameSync) {
   if (!existsSync(tempDbPath)) {
     throw new Error(`re-index wrote no ${path.basename(tempDbPath)}; keeping the current index`);
   }
   rmSync(manifestPath(dbPath), { force: true });
-  if (existsSync(dbPath)) {
-    const backupPath = dbPath + '.bak';
+  const backupPath = dbPath + '.bak';
+  const hadOldDb = existsSync(dbPath);
+  if (hadOldDb) {
     if (existsSync(backupPath)) { try { unlinkSync(backupPath); } catch {} }
-    renameSync(dbPath, backupPath);
+    rename(dbPath, backupPath);
     log('Old DB moved to .bak');
   }
-  renameSync(tempDbPath, dbPath);
+  try {
+    rename(tempDbPath, dbPath);
+  } catch (e) {
+    if (!hadOldDb) throw e;
+    try {
+      rename(backupPath, dbPath);
+    } catch (undoError) {
+      throw new Error(`${e.message}; putting the old DB back failed too (${undoError.message}) — it is at ${backupPath}`);
+    }
+    log('Old DB restored from .bak');
+    throw e;
+  }
   const tempManifest = manifestPath(tempDbPath);
-  if (existsSync(tempManifest)) renameSync(tempManifest, manifestPath(dbPath));
+  if (existsSync(tempManifest)) rename(tempManifest, manifestPath(dbPath));
   log('New index swapped into place.');
 }
