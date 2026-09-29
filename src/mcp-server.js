@@ -719,8 +719,8 @@ function startBackgroundReindex() {
       } catch (e) {
         swapError = e;
       }
-      removeReindexPidFile();
       if (swapError) {
+        removeReindexPidFile();
         // Nothing new is live (the old index is kept or was put back), so serve keeps
         // the index it has loaded: no restart, no "completed".
         logToFile('ERR', `Failed to swap index: ${swapError.message}`);
@@ -732,7 +732,9 @@ function startBackgroundReindex() {
         logToFile('INFO', 'Background re-index completed. Restarting serve process.');
         console.error('Background re-index completed. Restarting serve process.');
         searchCache.clear();
-        restartServeProcessIntentionally('background re-index completed');
+        // The old serve still holds the previous index in memory, and its watcher would save
+        // that over the one just swapped in: keep the lock until that serve has exited.
+        restartServeProcessIntentionally('background re-index completed', removeReindexPidFile);
       }
     } else if (signal) {
       removeReindexPidFile();
@@ -1032,10 +1034,12 @@ function scheduleServeRespawn() {
  * inside save_atomic), and clears intentionalRestart on 'error' too — a
  * stuck flag would otherwise both skip real crash respawns forever and
  * never spawn a replacement itself.
+ * `onOldServeGone` runs once the old process is gone (or there was none), just
+ * before its replacement is spawned.
  */
-function restartServeProcessIntentionally(reason) {
+function restartServeProcessIntentionally(reason, onOldServeGone = () => {}) {
   const proc = serveProcess;
-  if (!proc) { startServeProcess(); return; }
+  if (!proc) { onOldServeGone(); startServeProcess(); return; }
   intentionalRestart = true;
   logToFile('INFO', `Restarting serve process (${reason})`);
 
@@ -1045,6 +1049,7 @@ function restartServeProcessIntentionally(reason) {
     settled = true;
     clearTimeout(killTimer);
     intentionalRestart = false;
+    onOldServeGone();
     startServeProcess();
   };
 
