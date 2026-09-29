@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 use walkdir::WalkDir;
+use sha2::{Digest, Sha256};
 
 use crate::indexer::{Indexer, INCLUDE_EXTENSIONS, MAX_FILE_SIZE};
 
@@ -87,7 +88,36 @@ fn lock_recover<'a, T>(mutex: &'a Mutex<T>, label: &str) -> MutexGuard<'a, T> {
 pub struct FileRecord {
     pub mtime: SystemTime,
     pub size: u64,
+    /// SHA-256 of the content when the file was last indexed or verified. `None` for
+    /// records migrated from a v1 manifest or built from an existing index, until
+    /// `backfill_hashes` or the next index of that file fills it.
+    pub sha256: Option<[u8; 32]>,
     pub vector_ids: Vec<usize>,
+}
+
+/// On-disk record before 2.17.0 (mtime + size only), decoded for migration.
+#[derive(Deserialize)]
+struct FileRecordV1 {
+    mtime: SystemTime,
+    size: u64,
+    vector_ids: Vec<usize>,
+}
+
+#[derive(Deserialize)]
+struct FileManifestV1 {
+    files: HashMap<String, FileRecordV1>,
+}
+
+/// Prefix of a v2 manifest file. A v1 file starts with a bincode varint map length
+/// followed by a path string, so it can never begin with these bytes.
+const MANIFEST_MAGIC: &[u8] = b"MGMF\x02";
+
+/// SHA-256 of a file's content; `None` when the file cannot be read.
+pub(crate) fn file_sha256(path: &Path) -> Option<[u8; 32]> {
+    let data = std::fs::read(path).ok()?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&Sha256::digest(&data));
+    Some(out)
 }
 
 /// Manifest of all indexed files and their metadata
@@ -102,6 +132,9 @@ pub struct ChangeSet {
     pub added: Vec<PathBuf>,
     pub modified: Vec<PathBuf>,
     pub deleted: Vec<String>,
+    /// mtime or size changed but the content hash is identical: the manifest takes
+    /// the new stat, nothing is re-embedded. (relative path, mtime, size)
+    pub touched: Vec<(String, SystemTime, u64)>,
 }
 
 impl ChangeSet {
@@ -121,18 +154,31 @@ impl FileManifest {
         }
     }
 
-    /// Load manifest from a sidecar file next to the index DB.
+    /// Load manifest from a sidecar file next to the index DB. Reads v2 (content
+    /// hashes) and migrates v1 (mtime + size only; `sha256 = None`).
     /// Returns None if the file doesn't exist or can't be parsed.
     pub fn load(path: &Path) -> Option<Self> {
         let data = std::fs::read(path).ok()?;
-        bincode::serde::decode_from_slice(&data, bincode::config::standard())
-            .map(|(val, _)| val)
-            .ok()
+        let cfg = bincode::config::standard();
+        if let Some(body) = data.strip_prefix(MANIFEST_MAGIC) {
+            return bincode::serde::decode_from_slice(body, cfg).map(|(val, _)| val).ok();
+        }
+        let (v1, _): (FileManifestV1, usize) = bincode::serde::decode_from_slice(&data, cfg).ok()?;
+        Some(Self {
+            files: v1
+                .files
+                .into_iter()
+                .map(|(path, r)| {
+                    (path, FileRecord { mtime: r.mtime, size: r.size, sha256: None, vector_ids: r.vector_ids })
+                })
+                .collect(),
+        })
     }
 
-    /// Save manifest to a sidecar file next to the index DB.
+    /// Save manifest (v2) to a sidecar file next to the index DB.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let data = bincode::serde::encode_to_vec(self, bincode::config::standard())?;
+        let mut data = MANIFEST_MAGIC.to_vec();
+        data.extend(bincode::serde::encode_to_vec(self, bincode::config::standard())?);
         // Atomic write: write to temp, then rename
         let tmp = path.with_extension("manifest.tmp");
         std::fs::write(&tmp, &data)?;
@@ -190,6 +236,7 @@ impl FileManifest {
                     FileRecord {
                         mtime,
                         size: meta.len(),
+                        sha256: None, // filled by backfill_hashes (index) or apply_indexed
                         vector_ids: Vec::new(), // IDs unknown for pre-existing index
                     },
                 );
@@ -243,10 +290,16 @@ impl FileManifest {
                     changes.added.push(path.to_path_buf());
                 }
                 Some(record) => {
-                    // Check if modified (mtime or size changed)
                     let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
                     if mtime != record.mtime || meta.len() != record.size {
-                        changes.modified.push(path.to_path_buf());
+                        // Stat changed. A checkout, `COPY` or `docker cp` rewrites the mtime
+                        // of files whose content is identical — compare content first.
+                        match (record.sha256, file_sha256(path)) {
+                            (Some(old), Some(new)) if old == new => {
+                                changes.touched.push((relative.clone(), mtime, meta.len()));
+                            }
+                            _ => changes.modified.push(path.to_path_buf()),
+                        }
                     }
                 }
             }
@@ -270,18 +323,20 @@ impl FileManifest {
     ) {
         for (rel_path, vector_ids) in indexed {
             let abs_path = magento_root.join(rel_path);
-            let (mtime, size) = match std::fs::metadata(&abs_path) {
+            let (mtime, size, sha256) = match std::fs::metadata(&abs_path) {
                 Ok(m) => (
                     m.modified().unwrap_or(SystemTime::UNIX_EPOCH),
                     m.len(),
+                    file_sha256(&abs_path),
                 ),
-                Err(_) => (SystemTime::UNIX_EPOCH, 0),
+                Err(_) => (SystemTime::UNIX_EPOCH, 0, None),
             };
             self.files.insert(
                 rel_path.clone(),
                 FileRecord {
                     mtime,
                     size,
+                    sha256,
                     vector_ids: vector_ids.clone(),
                 },
             );
@@ -293,6 +348,39 @@ impl FileManifest {
         for path in deleted {
             self.files.remove(path);
         }
+    }
+
+    /// Record the new stat of files whose content did not change.
+    pub fn apply_touched(&mut self, touched: &[(String, SystemTime, u64)]) {
+        for (rel, mtime, size) in touched {
+            if let Some(rec) = self.files.get_mut(rel) {
+                rec.mtime = *mtime;
+                rec.size = *size;
+            }
+        }
+    }
+
+    /// Fill in missing content hashes for files that are unchanged on disk (mtime and
+    /// size still match the record), so the next environment can tell a touched file
+    /// from a modified one. A record whose file changed is left alone: it is
+    /// re-indexed, and apply_indexed records its hash then. Returns how many were filled.
+    pub fn backfill_hashes(&mut self, magento_root: &Path) -> usize {
+        let mut filled = 0;
+        for (rel, rec) in self.files.iter_mut() {
+            if rec.sha256.is_some() {
+                continue;
+            }
+            let abs = magento_root.join(rel);
+            let Ok(meta) = std::fs::metadata(&abs) else { continue };
+            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            if mtime == rec.mtime && meta.len() == rec.size {
+                if let Some(hash) = file_sha256(&abs) {
+                    rec.sha256 = Some(hash);
+                    filled += 1;
+                }
+            }
+        }
+        filled
     }
 }
 
@@ -554,6 +642,143 @@ mod tests {
         dir
     }
 
+    fn record_for(path: &Path, vector_ids: Vec<usize>) -> FileRecord {
+        let meta = fs::metadata(path).unwrap();
+        FileRecord {
+            mtime: meta.modified().unwrap(),
+            size: meta.len(),
+            sha256: file_sha256(path),
+            vector_ids,
+        }
+    }
+
+    #[test]
+    fn test_touched_file_is_not_modified() {
+        // A checkout, `COPY` or `docker cp` rewrites mtimes of files whose content is
+        // identical (CZUB-178: 4771 false "modified"). Those must not be re-embedded.
+        let dir = make_temp_dir();
+        let php = dir.join("same.php");
+        fs::write(&php, "<?php echo 'same';").unwrap();
+        let mut manifest = FileManifest::new();
+        let mut rec = record_for(&php, vec![0]);
+        rec.mtime = SystemTime::UNIX_EPOCH; // stat differs from disk, content does not
+        manifest.files.insert("same.php".to_string(), rec);
+
+        let changes = manifest.detect_changes(&dir).unwrap();
+        assert!(changes.modified.is_empty(), "identical content must not be re-embedded");
+        assert_eq!(changes.touched.len(), 1);
+        assert!(changes.is_empty(), "a touched-only scan needs no indexing");
+
+        manifest.apply_touched(&changes.touched);
+        let again = manifest.detect_changes(&dir).unwrap();
+        assert!(again.touched.is_empty(), "the new stat is recorded");
+        assert!(again.modified.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_changed_content_is_modified_even_with_hash() {
+        let dir = make_temp_dir();
+        let php = dir.join("edit.php");
+        fs::write(&php, "<?php echo 'v1';").unwrap();
+        let mut manifest = FileManifest::new();
+        manifest.files.insert("edit.php".to_string(), record_for(&php, vec![0]));
+        fs::write(&php, "<?php echo 'v2 is longer';").unwrap();
+
+        let changes = manifest.detect_changes(&dir).unwrap();
+        assert_eq!(changes.modified.len(), 1);
+        assert!(changes.touched.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_missing_hash_with_changed_stat_is_modified() {
+        // Records without a hash (v1 manifest) keep the old rule: a stat change re-embeds.
+        let dir = make_temp_dir();
+        let php = dir.join("old.php");
+        fs::write(&php, "<?php echo 'old';").unwrap();
+        let mut manifest = FileManifest::new();
+        let mut rec = record_for(&php, vec![0]);
+        rec.sha256 = None;
+        rec.mtime = SystemTime::UNIX_EPOCH;
+        manifest.files.insert("old.php".to_string(), rec);
+
+        let changes = manifest.detect_changes(&dir).unwrap();
+        assert_eq!(changes.modified.len(), 1);
+        assert!(changes.touched.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_backfill_hashes_only_unchanged_files() {
+        let dir = make_temp_dir();
+        let same = dir.join("same.php");
+        let changed = dir.join("changed.php");
+        fs::write(&same, "<?php // same").unwrap();
+        fs::write(&changed, "<?php // changed").unwrap();
+        let mut manifest = FileManifest::new();
+        let mut a = record_for(&same, vec![0]);
+        a.sha256 = None;
+        let mut b = record_for(&changed, vec![1]);
+        b.sha256 = None;
+        b.mtime = SystemTime::UNIX_EPOCH; // changed since it was indexed
+        manifest.files.insert("same.php".to_string(), a);
+        manifest.files.insert("changed.php".to_string(), b);
+
+        assert_eq!(manifest.backfill_hashes(&dir), 1);
+        assert!(manifest.files["same.php"].sha256.is_some());
+        assert!(
+            manifest.files["changed.php"].sha256.is_none(),
+            "a changed file must stay modified — never hashed into 'touched'"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_v1_manifest_loads_and_migrates() {
+        #[derive(Serialize)]
+        struct V1Record {
+            mtime: SystemTime,
+            size: u64,
+            vector_ids: Vec<usize>,
+        }
+        #[derive(Serialize)]
+        struct V1Manifest {
+            files: HashMap<String, V1Record>,
+        }
+
+        let dir = make_temp_dir();
+        let path = dir.join("index.manifest");
+        let mut files = HashMap::new();
+        files.insert(
+            "a.php".to_string(),
+            V1Record {
+                mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                size: 42,
+                vector_ids: vec![3],
+            },
+        );
+        let bytes =
+            bincode::serde::encode_to_vec(&V1Manifest { files }, bincode::config::standard()).unwrap();
+        fs::write(&path, bytes).unwrap();
+
+        let loaded = FileManifest::load(&path).expect("a v1 manifest must still load");
+        let a = &loaded.files["a.php"];
+        assert_eq!(a.size, 42);
+        assert_eq!(a.vector_ids, vec![3]);
+        assert!(a.sha256.is_none());
+
+        loaded.save(&path).unwrap();
+        assert!(fs::read(&path).unwrap().starts_with(MANIFEST_MAGIC), "saves write v2");
+        assert_eq!(FileManifest::load(&path).unwrap().files["a.php"].size, 42);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_lock_recover_from_poisoned_mutex() {
         // Reproduces Bug 2: a panic in another thread while holding the lock
@@ -589,6 +814,7 @@ mod tests {
             FileRecord {
                 mtime: meta.modified().unwrap(),
                 size: meta.len(),
+                sha256: None,
                 vector_ids: vec![0],
             },
         );
@@ -630,6 +856,7 @@ mod tests {
             FileRecord {
                 mtime: SystemTime::UNIX_EPOCH,
                 size: 0,
+                sha256: None,
                 vector_ids: vec![0],
             },
         );
@@ -650,6 +877,7 @@ mod tests {
             FileRecord {
                 mtime: SystemTime::UNIX_EPOCH,
                 size: 100,
+                sha256: None,
                 vector_ids: vec![0],
             },
         );
@@ -805,6 +1033,7 @@ mod tests {
             FileRecord {
                 mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1700000000),
                 size: 4096,
+                sha256: None,
                 vector_ids: vec![10, 11, 12],
             },
         );
@@ -813,6 +1042,7 @@ mod tests {
             FileRecord {
                 mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1600000000),
                 size: 2048,
+                sha256: None,
                 vector_ids: vec![20],
             },
         );

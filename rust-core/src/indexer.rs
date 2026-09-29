@@ -585,6 +585,7 @@ impl Indexer {
                         manifest.files.insert(rel, crate::watcher::FileRecord {
                             mtime,
                             size: meta.len(),
+                            sha256: None,
                             vector_ids: Vec::new(),
                         });
                     }
