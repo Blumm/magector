@@ -218,12 +218,18 @@ impl FileManifest {
     /// them deleted) instead of trusting an old hash. Only an existing, readable sidecar
     /// is updated — without one, `index` rebuilds it from the index anyway, and a partial
     /// one would make `index` re-add every other file. Returns whether it was updated.
+    /// A sidecar that exists but cannot be loaded (corrupt, or written by a newer
+    /// magector) is an `Err`, and left in place: a magector that can parse it would trust
+    /// claims the caller is about to make false, so the caller must remove it.
     pub fn mark_stale_in_sidecar(sidecar: &Path, paths: &[String]) -> Result<bool> {
         if paths.is_empty() {
             return Ok(false);
         }
         let Some(mut manifest) = Self::load(sidecar) else {
-            return Ok(false);
+            if matches!(sidecar.try_exists(), Ok(false)) {
+                return Ok(false);
+            }
+            anyhow::bail!("the sidecar exists but cannot be read");
         };
         for path in paths {
             manifest.files.insert(path.clone(), FileRecord::stale());
@@ -534,8 +540,8 @@ pub fn watcher_loop(
         // reindex.pid lock this watcher never used to check. Without this, the
         // two could concurrently save_atomic() the same index.db and clobber
         // each other's write — the exact failure mode that prompted the lock
-        // in the first place. Skip this cycle without touching manifest or
-        // index state; the same changes are re-detected and retried next tick.
+        // in the first place. Skip this cycle without touching index.db or the
+        // sidecar; the same changes are re-detected and retried next tick.
         if let Some(pid) = external_reindex_pid(&magento_root) {
             tracing::warn!(
                 "Watcher: external indexer (PID {}) holds the reindex lock — deferring this cycle",
@@ -548,7 +554,8 @@ pub fn watcher_loop(
         // hash there means "these vectors are current". This loop is about to change
         // index.db without rewriting those records, so mark every path it touches stale
         // there first (a stale record only withdraws a claim, so doing it before the DB
-        // write is safe at any crash point). If that fails, remove the sidecar — `index`
+        // write is safe at any crash point). If that fails — including a sidecar it cannot
+        // read, which a newer magector might still trust — remove the sidecar: `index`
         // rebuilds a missing one; if even that fails, leave index.db alone this tick.
         let sidecar = FileManifest::sidecar_path(&db_path);
         let changing: Vec<String> = changes
@@ -908,10 +915,15 @@ mod tests {
         assert!(!FileManifest::mark_stale_in_sidecar(&sidecar, &paths).unwrap());
         assert!(!sidecar.exists());
 
-        // An unreadable sidecar (here: a newer format) is left as it is.
-        fs::write(&sidecar, b"MGMF\x09junk").unwrap();
-        assert!(!FileManifest::mark_stale_in_sidecar(&sidecar, &paths).unwrap());
-        assert_eq!(fs::read(&sidecar).unwrap(), b"MGMF\x09junk");
+        // A sidecar that exists but cannot be loaded (a newer format, or garbage) is an
+        // error, not a skip: a magector that can parse it would trust claims the caller is
+        // about to make false, so the caller must remove it. It is left as it is here.
+        for junk in [&b"MGMF\x09junk"[..], &b"not a manifest"[..]] {
+            fs::write(&sidecar, junk).unwrap();
+            assert!(FileManifest::mark_stale_in_sidecar(&sidecar, &paths).is_err());
+            assert_eq!(fs::read(&sidecar).unwrap(), junk);
+        }
+        fs::remove_file(&sidecar).unwrap();
 
         // Nothing to mark: no rewrite of a good sidecar either.
         let mut manifest = FileManifest::new();
