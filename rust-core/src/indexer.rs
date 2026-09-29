@@ -284,7 +284,10 @@ impl Indexer {
                 .unwrap_or_else(|| {
                     // No manifest on disk — first run after upgrade.
                     // Build from filesystem (treats all indexed files as current).
-                    tracing::info!("No manifest found — building from filesystem for existing index");
+                    println!(
+                        "⚠️  No manifest found — treating the {} indexed files as current (run with --force to rebuild from scratch)",
+                        already_indexed.len()
+                    );
                     crate::watcher::FileManifest::from_existing_index(&self.magento_root, &already_indexed)
                 })
         } else {
@@ -312,6 +315,26 @@ impl Indexer {
                 }
             }
 
+            // An added file that already has vectors — a crash after an incremental save, or
+            // a lost manifest record — is replaced like a modified one; embedding it on top
+            // would list it in search results twice.
+            let mut replaced = 0;
+            for path in &changes.added {
+                let relative = path
+                    .strip_prefix(&self.magento_root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .to_string();
+                if already_indexed.contains(&relative) {
+                    self.remove_vectors_for_path(&relative);
+                    replaced += 1;
+                }
+            }
+            if replaced > 0 {
+                stats.db_changed = true;
+                println!("♻️  {} new files already had vectors in the index (an interrupted run?) — replacing them", replaced);
+            }
+
             // Tombstone vectors for deleted files
             for path in &changes.deleted {
                 if !self.remove_vectors_for_path(path).is_empty() {
@@ -324,9 +347,6 @@ impl Indexer {
             // or a manifest built from an existing index), so the next environment — a
             // checkout, `docker cp` — can tell a touched file from a modified one.
             let backfilled = manifest.backfill_hashes(&self.magento_root);
-            if backfilled > 0 {
-                println!("🔐 Recorded content hashes for {} unchanged files", backfilled);
-            }
 
             // Compact if many tombstones
             if self.vectordb_tombstone_ratio() > 0.20 {
@@ -342,13 +362,17 @@ impl Indexer {
                 .collect();
 
             // Deleted files were never discovered, so they are not part of files_found.
-            let skipped = stats.files_found - to_process.len();
+            // A file can appear between the two walks, hence the saturating subtraction.
+            let skipped = stats.files_found.saturating_sub(to_process.len());
 
             if modified_count > 0 || deleted_count > 0 || added_count > 0 || touched_count > 0 {
                 println!(
                     "📊 Incremental: {} new, {} modified, {} deleted, {} unchanged ({} touched: mtime changed, content identical)",
                     added_count, modified_count, deleted_count, skipped, touched_count
                 );
+            }
+            if backfilled > 0 {
+                println!("🔐 Recorded content hashes for {} unchanged files", backfilled);
             }
 
             (to_process, skipped)
