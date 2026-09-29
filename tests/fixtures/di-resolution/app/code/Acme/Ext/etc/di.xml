@@ -8,4 +8,8 @@
     <virtualType name="Acme\Ext\Model\Repo" type="Acme\Core\Model\BaseService"/>
     <virtualType name="Acme\Ext\Model\OtherVirtual" type="Acme\Ext\Model\Repo"/>
     <virtualType name="Acme\Ext\Model\ReporterVirtual" type="Acme\Ext\Model\Reporter"/>
+    <!-- xs:boolean: "1" disables like "true" -->
+    <type name="Acme\Core\Model\Guarded">
+        <plugin name="guard_plugin" disabled="1"/>
+    </type>
 </config>

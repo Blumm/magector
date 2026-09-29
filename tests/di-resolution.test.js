@@ -247,6 +247,18 @@ async function main() {
       has: ['`Acme\\Core\\Model\\MultiRepo` ('],
     });
 
+    t = await client.call('magento_find_implementors', { interfaceName: 'Acme\\Core\\Api\\NotifierInterface' });
+    check('find_implementors: enum, block namespace, upper-case keywords, namespace alias + relative name', t, {
+      has: [
+        '`Acme\\Core\\Model\\Mode` [enum]', '`Acme\\Ext\\Model\\BlockNsNotifier` (',
+        '`Acme\\Ext\\Model\\UpperNotifier` (', '`Acme\\Ext\\Model\\AliasNsNotifier` (',
+      ],
+    });
+    t = await client.call('magento_find_plugin', { targetClass: 'Acme\\Core\\Model\\Guarded' });
+    check('find_plugin: disabled="1" (xs:boolean) disables the plugin', t, {
+      has: ['**guard_plugin** [global]: `Acme\\Core\\Plugin\\GuardPlugin` — **disabled** by Acme_Ext'],
+    });
+
     // ── Events ───────────────────────────────────────────────────
     t = await client.call('magento_find_observer', { eventName: 'acme_order_place_before' });
     check('find_observer: same-name declarations merged — re-declared observer stays disabled', t, {

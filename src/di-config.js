@@ -67,6 +67,15 @@ function* walk(node) {
   }
 }
 
+/** xs:boolean as used by Magento's XSDs: true / 1 and false / 0; null when absent or invalid. */
+export function xmlBoolean(value) {
+  if (value === undefined || value === null) return null;
+  const v = String(value).trim().toLowerCase();
+  if (v === 'true' || v === '1') return true;
+  if (v === 'false' || v === '0') return false;
+  return null;
+}
+
 // ─── Names and areas ────────────────────────────────────────────
 
 /** `\Foo\\Bar` → `Foo\Bar` */
@@ -133,9 +142,9 @@ export function parseDiXml(content, relPath) {
       const plugins = node.children.filter(c => c.name === 'plugin').map(p => ({
         name: p.attrs.name ?? '',
         type: normalizeClassName(p.attrs.type),
-        disabled: p.attrs.disabled === 'true',
+        disabled: xmlBoolean(p.attrs.disabled) === true,
         // null when the attribute is absent: a later declaration of the same name keeps the earlier value
-        disabledAttr: p.attrs.disabled === undefined ? null : p.attrs.disabled === 'true',
+        disabledAttr: xmlBoolean(p.attrs.disabled),
         sortOrder: p.attrs.sortOrder ?? null,
       }));
       const entry = { name: normalizeClassName(node.attrs.name), args, objectRefs, plugins, file: relPath, area };
@@ -317,8 +326,8 @@ export function parseEventsXml(content, relPath, eventName) {
         name: o.attrs.name ?? '',
         instance: o.attrs.instance ? normalizeClassName(o.attrs.instance) : null,
         method: o.attrs.method || 'execute',
-        disabled: o.attrs.disabled === 'true',
-        disabledAttr: o.attrs.disabled === undefined ? null : o.attrs.disabled === 'true',
+        disabled: xmlBoolean(o.attrs.disabled) === true,
+        disabledAttr: xmlBoolean(o.attrs.disabled),
         shared: o.attrs.shared ?? null,
         file: relPath,
         area,
@@ -353,14 +362,14 @@ function stripPhpComments(source) {
  * first class-like declaration is read, so `use SomeTrait;` inside a class body is not an import.
  */
 function parsePhpUses(code) {
-  const firstDecl = /(?:^|[\s;{}])(?:(?:final|abstract|readonly)\s+)*(?:class|interface|trait|enum)\s+\w+/.exec(code);
+  const firstDecl = /(?:^|[\s;{}])(?:(?:final|abstract|readonly)\s+)*(?:class|interface|trait|enum)\s+\w+/i.exec(code);
   const head = firstDecl ? code.slice(0, firstDecl.index) : code;
   const uses = new Map();
   const add = (fq, alias) => {
     const clean = fq.trim().replace(/^\\/, '');
     if (clean) uses.set((alias || clean.split('\\').pop()).trim(), clean);
   };
-  const stmtRe = /(?:^|[;{}\s])use\s+(?!function\b|const\b)([^;]+);/g;
+  const stmtRe = /(?:^|[;{}\s])use\s+(?!function\b|const\b)([^;]+);/gi;
   let m;
   while ((m = stmtRe.exec(head)) !== null) {
     const body = m[1].replace(/\s+/g, ' ').trim();
@@ -377,15 +386,15 @@ function parsePhpUses(code) {
 /** Direct parent class and interfaces declared in a PHP source file for `shortName`. */
 export function parsePhpDeclaration(source, shortName) {
   const code = stripPhpComments(source);
-  const ns = (/^\s*namespace\s+([\w\\]+)\s*;/m.exec(code) || [])[1] || '';
+  const ns = (/^\s*namespace\s+([\w\\]+)\s*[;{]/mi.exec(code) || [])[1] || '';
   const uses = parsePhpUses(code);
-  const declRe = new RegExp(`\\b(class|interface)\\s+${shortName}\\b([^{]*)\\{`);
+  const declRe = new RegExp(`\\b(class|interface|enum)\\s+${shortName}\\b([^{]*)\\{`, 'i');
   const d = declRe.exec(code);
   if (!d) return { namespace: ns, parents: [], interfaces: [] };
   const tail = d[2];
-  const kind = d[1];
-  const ext = (/\bextends\s+([\w\\\s,]+?)(?=\bimplements\b|$)/.exec(tail) || [])[1] || '';
-  const impl = (/\bimplements\s+([\w\\\s,]+)$/.exec(tail.trim()) || [])[1] || '';
+  const kind = d[1].toLowerCase();
+  const ext = (/\bextends\s+([\w\\\s,]+?)(?=\bimplements\b|$)/i.exec(tail) || [])[1] || '';
+  const impl = (/\bimplements\s+([\w\\\s,]+)$/i.exec(tail.trim()) || [])[1] || '';
   const list = s => s.split(',').map(x => resolvePhpName(x, ns, uses)).filter(Boolean);
   return kind === 'interface'
     ? { namespace: ns, parents: [], interfaces: list(ext) }
@@ -638,10 +647,10 @@ const NOT_INTERCEPTED_METHODS = ['__construct', '__destruct', '__sleep', '__wake
 /** Class modifiers and method signatures (visibility, static, final) of `shortName` in a PHP file. */
 export function parsePhpMembers(source, shortName) {
   const code = stripPhpComments(source);
-  const decl = new RegExp(`((?:\\b(?:final|abstract|readonly)\\s+)*)\\b(class|interface|trait|enum)\\s+${shortName}\\b`).exec(code);
+  const decl = new RegExp(`((?:\\b(?:final|abstract|readonly)\\s+)*)\\b(class|interface|trait|enum)\\s+${shortName}\\b`, 'i').exec(code);
   if (!decl) return null;
   const methods = new Map();
-  const re = /((?:\b(?:final|abstract|public|protected|private|static)\s+)*)function\s+&?\s*(\w+)\s*\(/g;
+  const re = /((?:\b(?:final|abstract|public|protected|private|static)\s+)*)function\s+&?\s*(\w+)\s*\(/gi;
   let m;
   while ((m = re.exec(code.slice(decl.index))) !== null) {
     const mods = m[1];
@@ -652,7 +661,7 @@ export function parsePhpMembers(source, shortName) {
       isFinal: /\bfinal\b/.test(mods),
     });
   }
-  return { kind: decl[2], isFinal: /\bfinal\b/.test(decl[1]), isAbstract: /\babstract\b/.test(decl[1]), methods };
+  return { kind: decl[2].toLowerCase(), isFinal: /\bfinal\b/i.test(decl[1]), isAbstract: /\babstract\b/i.test(decl[1]), methods };
 }
 
 /** `membersOf(fqcn)` → parsePhpMembers result, or null when the file cannot be found or read. */
@@ -711,20 +720,22 @@ export function interceptionStatus(className, methodName, ancestorsOf, membersOf
 /** All class / interface declarations in a PHP file with their resolved parents and interfaces. */
 export function parsePhpTypes(source) {
   const code = stripPhpComments(source);
-  const ns = (/^\s*namespace\s+([\w\\]+)\s*;/m.exec(code) || [])[1] || '';
+  const ns = (/^\s*namespace\s+([\w\\]+)\s*[;{]/mi.exec(code) || [])[1] || '';
   const uses = parsePhpUses(code);
   const out = [];
-  const declRe = /(?:^|[\s;{}])((?:(?:final|abstract|readonly)\s+)*)(class|interface)\s+(\w+)([^{;]*)\{/g;
+  const declRe = /(?:^|[\s;{}])((?:(?:final|abstract|readonly)\s+)*)(class|interface|enum)\s+(\w+)([^{;]*)\{/gi;
   let d;
   while ((d = declRe.exec(code)) !== null) {
-    const tail = d[4];
-    const ext = (/\bextends\s+([\w\\\s,]+?)(?=\bimplements\b|$)/.exec(tail) || [])[1] || '';
-    const impl = (/\bimplements\s+([\w\\\s,]+)$/.exec(tail.trim()) || [])[1] || '';
+    const kind = d[2].toLowerCase();
+    // enum Name: string implements X — drop the backing type before reading the lists
+    const tail = kind === 'enum' ? d[4].replace(/^\s*:\s*\w+/, '') : d[4];
+    const ext = (/\bextends\s+([\w\\\s,]+?)(?=\bimplements\b|$)/i.exec(tail) || [])[1] || '';
+    const impl = (/\bimplements\s+([\w\\\s,]+)$/i.exec(tail.trim()) || [])[1] || '';
     const list = s => s.split(',').map(x => resolvePhpName(x, ns, uses)).filter(Boolean);
     const fqcn = ns ? `${ns}\\${d[3]}` : d[3];
-    out.push(d[2] === 'interface'
-      ? { fqcn, kind: 'interface', parents: [], interfaces: list(ext) }
-      : { fqcn, kind: /\babstract\b/.test(d[1]) ? 'abstract class' : 'class', parents: list(ext).slice(0, 1), interfaces: list(impl) });
+    if (kind === 'interface') out.push({ fqcn, kind: 'interface', parents: [], interfaces: list(ext) });
+    else if (kind === 'enum') out.push({ fqcn, kind: 'enum', parents: [], interfaces: list(impl) });
+    else out.push({ fqcn, kind: /\babstract\b/i.test(d[1]) ? 'abstract class' : 'class', parents: list(ext).slice(0, 1), interfaces: list(impl) });
   }
   return out;
 }

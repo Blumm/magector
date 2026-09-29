@@ -26,7 +26,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions corresp
 - **`find_table_usage` missed the ResourceModel that owns the table** (`_init('table', …)`); PHP and `db_schema.xml` are also searched for the exact table name.
 - **`find_controller` returned nothing for admin routes** (the area filter compared `/adminhtml/` with `Controller/Adminhtml/`); routes are also resolved through `routes.xml` (frontName → module → controller class).
 - **`find_implementors` listed only classes whose `implements` names the interface**, missed subclasses, implementors of extending interfaces and preferences whose attributes are in `type`/`for` order, and counted commented-out preferences. For a FQCN it now returns everything that is `instanceof` the type, transitively, from a reverse class hierarchy built once per session.
-- **PHP declarations are read robustly:** group and multi-imports (`use A\\{B, C as D};`, `use A, B;`), aliases, declarations split over several lines, comments between the parts; a trait `use` inside a class body is not taken for an import.
+- **PHP declarations are read robustly:** group and multi-imports (`use A\\{B, C as D};`, `use A, B;`), aliases, declarations split over several lines, comments between the parts; a trait `use` inside a class body is not taken for an import; namespace aliases with relative names (`use A\\B as C;` … `implements C\\X`), enums implementing interfaces, block namespaces (`namespace X { … }`) and case-insensitive keywords.
+- **`disabled="1"` / `"0"`** (xs:boolean, as Magento's XSDs allow) is read like `true` / `false` for plugins and observers.
 - **A relative `MAGENTO_ROOT` produced non-existent file paths** (the root segment was cut out). It is resolved to an absolute path at startup.
 
 ## [2.17.0] - 2026-09-29

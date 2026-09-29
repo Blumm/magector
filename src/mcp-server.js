@@ -3888,7 +3888,7 @@ async function getClassHierarchy(root) {
   for (const rel of files) {
     let source;
     try { source = readFileSync(path.join(root, rel), 'utf-8'); } catch { continue; }
-    if (!/\b(?:extends|implements)\b/.test(source)) continue;
+    if (!/\b(?:extends|implements)\b/i.test(source)) continue;
     entries.push({ relPath: rel, source });
   }
   classHierarchyCache.root = root;
