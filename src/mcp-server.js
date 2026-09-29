@@ -586,7 +586,7 @@ async function checkDbFormat() {
 /**
  * Start a background re-index process that builds to a temporary path.
  * The old DB remains in place so search tools keep working during rebuild.
- * On completion, the new index is swapped in atomically (old → .bak, new → current).
+ * On completion, the new index is swapped in (old → .bak, new → current).
  */
 function startBackgroundReindex() {
   if (reindexInProgress) return;
@@ -706,19 +706,36 @@ function startBackgroundReindex() {
     reindexProcess = null;
     reindexStartTime = null;
     reindexPhase = 0;
-    removeReindexPidFile();
     if (code === 0) {
-      // Atomic swap: old → .bak, new → current (each DB's manifest travels with it)
+      // The lock file still names the re-index child, which has just exited, and the serve
+      // watcher (like other instances) only defers to a PID that is alive. Hold the lock
+      // under our own PID until the new DB is in place, so nothing writes index.db mid-swap.
+      writeReindexPidFile(process.pid);
+      // Swap the new index in: old → .bak, new → current (each DB's manifest travels with it)
+      let swap = null;
+      let swapError = null;
       try {
-        swapInIndex(config.dbPath, tempDbPath, (msg) => logToFile('INFO', msg));
+        swap = swapInIndex(config.dbPath, tempDbPath, (msg) => logToFile('INFO', msg));
       } catch (e) {
-        logToFile('ERR', `Failed to swap index: ${e.message}`);
+        swapError = e;
       }
-      logToFile('INFO', 'Background re-index completed. Restarting serve process.');
-      console.error('Background re-index completed. Restarting serve process.');
-      searchCache.clear();
-      restartServeProcessIntentionally('background re-index completed');
+      removeReindexPidFile();
+      if (swapError) {
+        // Nothing new is live (the old index is kept or was put back), so serve keeps
+        // the index it has loaded: no restart, no "completed".
+        logToFile('ERR', `Failed to swap index: ${swapError.message}`);
+        console.error(`Background re-index finished, but its index was not swapped in: ${swapError.message}. Check ${LOG_PATH}`);
+      } else {
+        if (swap.manifestError) {
+          logToFile('WARN', `New index is live, but its manifest could not be moved (${swap.manifestError.message}); the next \`index\` rebuilds it`);
+        }
+        logToFile('INFO', 'Background re-index completed. Restarting serve process.');
+        console.error('Background re-index completed. Restarting serve process.');
+        searchCache.clear();
+        restartServeProcessIntentionally('background re-index completed');
+      }
     } else if (signal) {
+      removeReindexPidFile();
       // Killed (e.g. our own cleanup() when the MCP session ended before
       // indexing finished) — not a real failure. magector-core saves
       // incrementally, so keep the temp DB for the next session to resume
@@ -726,6 +743,7 @@ function startBackgroundReindex() {
       logToFile('WARN', `Background re-index interrupted by signal ${signal} — temp DB kept for resume`);
       console.error(`Background re-index interrupted (${signal}) — will resume next run.`);
     } else {
+      removeReindexPidFile();
       // Genuine failure (non-zero exit, no signal) — the temp DB may be
       // corrupt, so don't let a later run try to resume from it (nor its manifest).
       try { if (existsSync(tempDbPath)) unlinkSync(tempDbPath); } catch {}
