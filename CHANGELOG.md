@@ -6,6 +6,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions corresp
 
 ## [Unreleased]
 
+### Changed
+- **Tool answers are capped** so one broad query cannot flood an agent's context: every MCP tool answer is cut at 40,000 characters (~10k tokens; `MAGECTOR_MAX_OUTPUT_CHARS`) at a line boundary, with open code blocks closed and a note to narrow the query, and `find_implementors` lists at most 50 classes per group with the remaining count (`ActionInterface` on a full install: ~390 KB → 12 KB, every group still shown).
+
 ## [2.17.1] - 2026-09-30
 
 ### Added
