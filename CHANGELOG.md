@@ -6,6 +6,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions corresp
 
 ## [Unreleased]
 
+## [2.17.4] - 2026-09-30
+
+### Changed
+- **Docs:** neutral placeholder names in the architecture plan and spec (`vendor/acme/`).
+
 ## [2.17.3] - 2026-09-30
 
 ### Changed
