@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="urn:magento:module:Magento_Config:etc/system_file.xsd">
+    <system>
+        <section id="acme" translate="label" showInDefault="1">
+            <label>Acme</label>
+            <resource>Acme_Api::repo</resource>
+            <group id="general" showInDefault="1">
+                <field id="mode" type="select" showInDefault="1" showInWebsite="1">
+                    <label>Mode</label>
+                    <source_model>Acme\Api\Model\Source\Mode</source_model>
+                </field>
+            </group>
+        </section>
+    </system>
+</config>

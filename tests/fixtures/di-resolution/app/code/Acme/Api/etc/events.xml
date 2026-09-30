@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="urn:magento:framework:Event/etc/events.xsd">
+    <!-- Acme_Api and Acme_Ext both disable "log" without depending on each other: same outcome either way -->
+    <event name="acme_cart_save">
+        <observer name="log" disabled="true"/>
+    </event>
+</config>
