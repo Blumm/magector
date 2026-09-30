@@ -51,6 +51,10 @@ const config = {
   // works when the root is absolute (a relative MAGENTO_ROOT dropped its own path segment).
   magentoRoot: path.resolve(process.env.MAGENTO_ROOT || process.cwd()),
   watchInterval: parseInt(process.env.MAGECTOR_WATCH_INTERVAL, 10) || 300,
+  // MAGECTOR_AUTO_INDEX=0: never start an index from the server (no index, or an incompatible
+  // one). For CI and agent jobs, where indexing a whole shop in the background would compete
+  // with the job; the structural tools work without an index, semantic search reports none.
+  autoIndex: process.env.MAGECTOR_AUTO_INDEX !== '0',
   get rustBinary() { return resolveBinary(); },
   get modelCache() { return resolveModels() || process.env.MAGECTOR_MODELS || './models'; }
 };
@@ -5934,6 +5938,17 @@ const _callToolHandler = async (request) => {
   // Block search tools only when re-indexing AND no usable old DB exists.
   // If old DB is preserved, searches keep running against it during rebuild.
   const hasUsableDb = existsSync(config.dbPath) && (() => { try { return statSync(config.dbPath).size > 100; } catch { return false; } })();
+  if (!config.autoIndex && !hasUsableDb && !reindexInProgress && !indexFreeTools.includes(name)) {
+    logToFile('REQ', `${name} → no index (MAGECTOR_AUTO_INDEX=0)`);
+    return {
+      content: [{
+        type: 'text',
+        text: `No semantic index at ${config.dbPath}, and automatic indexing is off (MAGECTOR_AUTO_INDEX=0). ` +
+          'The structural tools (find_plugin, find_preference, find_observer, find_implementors, trace_dependency, …) work without it; run `magector index` to enable semantic search.'
+      }],
+      isError: true,
+    };
+  }
   if (reindexInProgress && !hasUsableDb && !indexFreeTools.includes(name)) {
     logToFile('REQ', `${name} → blocked (re-indexing, no usable DB)`);
     return {
@@ -8581,14 +8596,22 @@ async function runAsPrimary() {
     // Check DB format (uses cache → instant if already validated)
     if (existsSync(config.dbPath)) {
       if (!(await checkDbFormat())) {
-        logToFile('WARN', 'Database format incompatible — scheduling background re-index');
-        startBackgroundReindex();
+        if (config.autoIndex) {
+          logToFile('WARN', 'Database format incompatible — scheduling background re-index');
+          startBackgroundReindex();
+        } else {
+          logToFile('WARN', 'Database format incompatible — not re-indexing (MAGECTOR_AUTO_INDEX=0)');
+        }
       } else {
         logToFile('INFO', 'Existing database is compatible — reusing index');
       }
     } else if (config.magentoRoot && existsSync(config.magentoRoot)) {
-      logToFile('INFO', 'No index database found — scheduling background index');
-      startBackgroundReindex();
+      if (config.autoIndex) {
+        logToFile('INFO', 'No index database found — scheduling background index');
+        startBackgroundReindex();
+      } else {
+        logToFile('INFO', 'No index database found — not indexing (MAGECTOR_AUTO_INDEX=0)');
+      }
     }
 
     const canStartServe = !reindexInProgress || (existsSync(config.dbPath) && (() => { try { return statSync(config.dbPath).size > 100; } catch { return false; } })());

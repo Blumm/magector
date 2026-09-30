@@ -6,6 +6,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions corresp
 
 ## [Unreleased]
 
+### Changed
+- **`index` and `stats` no longer build the search graph.** Opening an index used to rebuild its whole HNSW graph, which only search needs: an incremental refresh with nothing to embed took 47 s on an 86k-vector index with 2 threads, now 2.2 s (`stats`: 41.6 s → 0.2 s), and a refresh or full index no longer inserts into a graph it never searches. The graph is built on the first search; `serve` builds it before it reports ready, so its first query is as fast as before.
+
+### Added
+- **`MAGECTOR_AUTO_INDEX=0`** stops the MCP server from starting an index when there is none (or an incompatible one) — for CI and agent jobs, where indexing a whole shop in the background competes with the job. The structural tools work without an index; semantic search says the index is missing. `trace-graphql` and `di-resolution` set it, which also removes `trace-graphql`'s flakiness (a finished background index of its fixture changed a result, or raced the cleanup).
+
 ## [2.17.2] - 2026-09-30
 
 ### Changed

@@ -355,6 +355,7 @@ The `describe` command and `magento_describe` MCP tool require an Anthropic API 
 | `OMP_NUM_THREADS` | Fallback thread limit if `MAGECTOR_THREADS` is not set (de facto standard for ONNX/OpenMP). | — |
 | `MAGECTOR_BATCH_SIZE` | Embedding batch size (higher = faster, more RAM). Equivalent to `--batch-size`. | `256` |
 | `MAGECTOR_MAX_OUTPUT_CHARS` | Cap on one MCP tool answer, in characters; a longer answer is cut at a line boundary with a note to narrow the query. | `40000` (~10k tokens) |
+| `MAGECTOR_AUTO_INDEX` | `0`: the MCP server never starts an index (none, or an incompatible one) — for CI and agent jobs that bring their own index. The structural tools work without one; semantic search reports it is missing. | `1` (index in the background) |
 | `ANTHROPIC_API_KEY` | API key for description generation (`describe` command) | — |
 
 These defaults apply to the Node.js CLI and the MCP server. The Rust core's own `-d` flag (see above) defaults to `./.magector/index.db` in its working directory.
