@@ -422,10 +422,7 @@ impl SonaEngine {
                         ewc,
                     });
                 }
-                Err(e) => {
-                    tracing::warn!("SONA V2 deserialization failed: {} — resetting", e);
-                    return Ok(Self::new());
-                }
+                Err(e) => return Ok(Self::reset_unreadable(path, "V2", e)),
             }
         }
 
@@ -436,11 +433,18 @@ impl SonaEngine {
                 lora: MicroLoRA::default(),
                 ewc: EwcRegularizer::default(),
             }),
-            Err(e) => {
-                tracing::warn!("SONA V1 deserialization failed: {} — resetting", e);
-                Ok(Self::new())
-            }
+            Err(e) => Ok(Self::reset_unreadable(path, "V1", e)),
         }
+    }
+
+    /// State that cannot be decoded starts over. The file is moved aside, not left in place:
+    /// nothing rewrites it until feedback arrives, so it would fail (and warn) on every start.
+    fn reset_unreadable(path: &Path, format: &str, e: impl std::fmt::Display) -> Self {
+        match crate::vectordb::keep_incompatible_aside(path) {
+            Some(dest) => tracing::warn!("SONA {} state could not be read ({}) — kept as {:?}, starting fresh", format, e, dest),
+            None => tracing::warn!("SONA {} state could not be read ({}) — starting fresh", format, e),
+        }
+        Self::new()
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -1147,6 +1151,29 @@ mod tests {
 
         assert_eq!(loaded.lora.a[0], 42.0);
         assert_eq!(loaded.ewc.update_count, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_sona_open_moves_unreadable_state_aside() {
+        // Nothing rewrites the file until feedback arrives, so left in place a file that
+        // cannot be decoded failed (and warned) on every start.
+        let dir = std::env::temp_dir().join(format!("magector_sona_unreadable_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.sona");
+        std::fs::write(&path, [SONA_VERSION_V2, 0xff, 0xff, 0xff]).unwrap();
+
+        SonaEngine::open(&path).unwrap();
+        assert!(!path.exists(), "the unreadable file is moved aside");
+        let kept: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("index.sona.incompatible-"))
+            .collect();
+        assert_eq!(kept.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

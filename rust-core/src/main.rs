@@ -813,7 +813,7 @@ fn handle_serve_request(
                                 match reindex_result {
                                     Ok(indexed) => {
                                         eprintln!("Re-indexed {} files with descriptions", indexed.len());
-                                        if let Err(e) = idx.save_atomic(db_path) {
+                                        if let Err(e) = idx.save_atomic_unless_replaced(db_path) {
                                             eprintln!("Warning: failed to save index after re-embed: {}", e);
                                         }
                                     }

@@ -218,6 +218,29 @@ impl FileManifest {
         db_path.with_extension("manifest")
     }
 
+    /// Before 2.17.0 the MCP background re-index swapped `index.db.new` into place but left
+    /// its manifest behind as `index.db.manifest`, so the live index had none and `index`
+    /// treated every indexed file as current, however stale. When the live sidecar is
+    /// missing, that orphan is moved into its place — it describes the index now live —
+    /// unless a temp DB it may belong to is still there. The names mirror the JS side
+    /// (`tempDbPathFor`, `manifestPath`); a DB path without an extension never had an
+    /// orphan. Returns the adopted file.
+    pub fn adopt_orphan(db_path: &Path) -> Option<PathBuf> {
+        db_path.extension()?;
+        let with_suffix = |suffix: &str| {
+            let mut name = db_path.as_os_str().to_owned();
+            name.push(suffix);
+            PathBuf::from(name)
+        };
+        let (orphan, temp_db) = (with_suffix(".manifest"), with_suffix(".new"));
+        let sidecar = Self::sidecar_path(db_path);
+        if sidecar.exists() || temp_db.exists() || !orphan.exists() || !db_path.exists() {
+            return None;
+        }
+        std::fs::rename(&orphan, &sidecar).ok()?;
+        Some(orphan)
+    }
+
     /// Mark `paths` stale in the sidecar manifest at `sidecar`: its records stop claiming
     /// that index.db holds their content, so the next `index` re-embeds them (or reports
     /// them deleted) instead of trusting an old hash. Only an existing, readable sidecar
@@ -317,6 +340,23 @@ impl FileManifest {
                 }
             }
         }
+    }
+
+    /// Track every indexed path this manifest has no record of as stale. `detect_changes`
+    /// only reports paths it tracks, so without this the vectors of an indexed file that is
+    /// gone (or now excluded) would stay in the index for good — a manifest rebuilt with
+    /// `from_existing_index` only records files the walk still finds. A tracked stale path
+    /// the walk finds is re-embedded, one it does not is reported deleted. Returns how many
+    /// were added.
+    pub fn track_indexed(&mut self, indexed_paths: &std::collections::HashSet<String>) -> usize {
+        let mut added = 0;
+        for path in indexed_paths {
+            if !self.files.contains_key(path) {
+                self.files.insert(path.clone(), FileRecord::stale());
+                added += 1;
+            }
+        }
+        added
     }
 
     /// Scan the filesystem and detect changes against the manifest
@@ -501,6 +541,22 @@ fn zero_entry_paths(
         .collect()
 }
 
+/// The watcher's manifest for the index `idx` holds: the files it has vectors for with their
+/// current stat, the content hashes and stale sentinels of the sidecar that describes that
+/// index.db, and every indexed file the walk no longer finds tracked stale, so the first scan
+/// drops its vectors.
+fn manifest_for(idx: &Indexer, magento_root: &Path, db_path: &Path) -> FileManifest {
+    let paths = idx.indexed_paths();
+    let mut manifest = FileManifest::from_existing_index(magento_root, &paths);
+    // The sidecar describes the index.db this serve just loaded: take its content hashes
+    // (and stale sentinels) so a checkout during serve is "touched", not re-embedded.
+    if let Some(sidecar) = FileManifest::load(&FileManifest::sidecar_path(db_path)) {
+        manifest.seed_from(&sidecar);
+    }
+    manifest.track_indexed(&paths);
+    manifest
+}
+
 /// Run the file watcher loop in a background thread.
 ///
 /// Sleeps for `interval`, then detects changes and incrementally re-indexes.
@@ -521,14 +577,8 @@ pub fn watcher_loop(
     // Build initial manifest
     let mut manifest = {
         let idx = lock_recover(&indexer, "indexer");
-        let paths = idx.indexed_paths();
-        FileManifest::from_existing_index(&magento_root, &paths)
+        manifest_for(&idx, &magento_root, &db_path)
     };
-    // The sidecar describes the index.db this serve just loaded: take its content hashes
-    // (and stale sentinels) so a checkout during serve is "touched", not re-embedded.
-    if let Some(sidecar) = FileManifest::load(&FileManifest::sidecar_path(&db_path)) {
-        manifest.seed_from(&sidecar);
-    }
 
     {
         let mut s = lock_recover(&status, "status");
@@ -539,6 +589,35 @@ pub fn watcher_loop(
 
     loop {
         std::thread::sleep(interval);
+
+        // Another process may have replaced index.db since this serve loaded or last saved
+        // it: `magector index`, the `magento_index` tool, another MCP instance's re-index.
+        // Load that index before anything else — answering from the old copy is stale, and
+        // this loop's next save would write it back over the new one. Not while an indexer
+        // holds the lock: it is still writing.
+        if external_reindex_pid(&magento_root).is_none() {
+            let mut idx = lock_recover(&indexer, "indexer");
+            match idx.reload_if_replaced() {
+                Ok(false) => {}
+                Ok(true) => {
+                    idx.warm_search();
+                    manifest = manifest_for(&idx, &magento_root, &db_path);
+                    lock_recover(&status, "status").tracked_files = manifest.files.len();
+                    tracing::info!(
+                        "index.db was replaced by another process — reloaded {} vectors, {} files tracked",
+                        idx.stats().vectors_created,
+                        manifest.files.len()
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "index.db was replaced by another process but could not be loaded ({:#}); keeping the loaded index and not writing index.db",
+                        e
+                    );
+                    continue;
+                }
+            }
+        }
 
         // Detect changes
         let changes = match manifest.detect_changes(&magento_root) {
@@ -671,7 +750,7 @@ pub fn watcher_loop(
                         if !indexed.is_empty() {
                             dirty = true;
                             // Persist progress for this chunk (crash-safe).
-                            if let Err(e) = idx.save_atomic(&db_path) {
+                            if let Err(e) = idx.save_atomic_unless_replaced(&db_path) {
                                 tracing::error!("Failed to persist index during watcher update: {}", e);
                             } else {
                                 dirty = false;
@@ -718,7 +797,7 @@ pub fn watcher_loop(
                 needs_save = true;
             }
             if needs_save {
-                if let Err(e) = idx.save_atomic(&db_path) {
+                if let Err(e) = idx.save_atomic_unless_replaced(&db_path) {
                     tracing::error!("Failed to save index after watcher update: {}", e);
                 }
             }
@@ -1564,6 +1643,77 @@ mod tests {
 
         assert_eq!(external_reindex_pid(&dir), None);
         assert!(!lock_path.exists(), "stale lock file should be removed");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_track_indexed_drops_gone_and_reembeds_untracked() {
+        // A lost or rebuilt manifest: `from_existing_index` records only the indexed files the
+        // walk still finds, so a deleted (or now excluded) one was never reported deleted and
+        // its vectors stayed in the index for good.
+        let dir = make_temp_dir();
+        fs::write(dir.join("kept.php"), "<?php echo 'kept';").unwrap();
+        fs::create_dir_all(dir.join("dev/tools")).unwrap();
+        fs::write(dir.join("dev/tools/excluded.php"), "<?php echo 'excluded';").unwrap();
+        let indexed: std::collections::HashSet<String> = ["kept.php", "gone.php", "dev/tools/excluded.php"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let mut manifest = FileManifest::from_existing_index(&dir, &indexed);
+        assert_eq!(manifest.files.len(), 1, "only the file the walk finds is recorded");
+        assert_eq!(manifest.track_indexed(&indexed), 2);
+        let changes = manifest.detect_changes(&dir).unwrap();
+        let mut deleted = changes.deleted.clone();
+        deleted.sort();
+        assert_eq!(deleted, vec!["dev/tools/excluded.php".to_string(), "gone.php".to_string()]);
+        assert!(changes.added.is_empty() && changes.modified.is_empty(), "the recorded file is unchanged");
+
+        // A recorded path keeps its record
+        let before = manifest.files["kept.php"].clone();
+        assert_eq!(manifest.track_indexed(&indexed), 0);
+        assert_eq!(manifest.files["kept.php"].mtime, before.mtime);
+
+        // An indexed file still on disk that a loaded manifest has no record of is
+        // re-embedded (modified), not embedded again on top of its vectors as new.
+        let mut manifest = FileManifest::new();
+        assert_eq!(manifest.track_indexed(&["kept.php".to_string()].into_iter().collect()), 1);
+        let changes = manifest.detect_changes(&dir).unwrap();
+        assert_eq!(changes.modified, vec![dir.join("kept.php")]);
+        assert!(changes.added.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_adopt_orphan_moves_the_pre_2_17_manifest_into_place() {
+        let dir = make_temp_dir();
+        let db = dir.join("index.db");
+        let orphan = dir.join("index.db.manifest");
+        let sidecar = dir.join("index.manifest");
+        fs::write(&db, "db").unwrap();
+        fs::write(&orphan, "orphan").unwrap();
+
+        // A temp DB it may belong to is still there: leave it
+        fs::write(dir.join("index.db.new"), "temp").unwrap();
+        assert_eq!(FileManifest::adopt_orphan(&db), None);
+        fs::remove_file(dir.join("index.db.new")).unwrap();
+
+        assert_eq!(FileManifest::adopt_orphan(&db), Some(orphan.clone()));
+        assert_eq!(fs::read_to_string(&sidecar).unwrap(), "orphan");
+        assert!(!orphan.exists());
+
+        // A live sidecar is never replaced
+        fs::write(&orphan, "orphan 2").unwrap();
+        assert_eq!(FileManifest::adopt_orphan(&db), None);
+        assert_eq!(fs::read_to_string(&sidecar).unwrap(), "orphan");
+
+        // No live DB, or a DB path without an extension (its temp never had its own sidecar)
+        fs::remove_file(&sidecar).unwrap();
+        fs::remove_file(&db).unwrap();
+        assert_eq!(FileManifest::adopt_orphan(&db), None);
+        assert_eq!(FileManifest::adopt_orphan(&dir.join("index")), None);
 
         let _ = fs::remove_dir_all(&dir);
     }
