@@ -1128,7 +1128,7 @@ cd /srv/magector && node tests/unit.test.js
 - [ ] **Step 3: Check for proprietary names**
 
 ```bash
-grep -ri "drmax\|dr-max\|dr\.max" src/ tests/ --include="*.js" --include="*.rs" -l
+grep -riE "<client-names-regex>" src/ tests/ --include="*.js" --include="*.rs" -l
 ```
 
 - [ ] **Step 4: Update CHANGELOG.md**

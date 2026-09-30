@@ -101,7 +101,7 @@ rust-core/queries/
 
 `magento_ast_search` changes from arbitrary pattern to named pattern selection:
 ```json
-{"tool": "magento_ast_search", "args": {"pattern": "dataobject-set-null", "path": "vendor/drmax/"}}
+{"tool": "magento_ast_search", "args": {"pattern": "dataobject-set-null", "path": "vendor/acme/"}}
 ```
 
 New Rust serve command: `ast_query {pattern_name, path, limit}` → returns JSON array of matches.
