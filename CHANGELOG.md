@@ -6,6 +6,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions corresp
 
 ## [Unreleased]
 
+## [2.17.3] - 2026-09-30
+
 ### Changed
 - **`index` and `stats` no longer build the search graph.** Opening an index used to rebuild its whole HNSW graph, which only search needs: an incremental refresh with nothing to embed took 47 s on an 86k-vector index with 2 threads, now 2.2 s (`stats`: 41.6 s → 0.2 s), and a refresh or full index no longer inserts into a graph it never searches. The graph is built on the first search; `serve` builds it before it reports ready, so its first query is as fast as before.
 
