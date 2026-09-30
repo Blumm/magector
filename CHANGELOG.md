@@ -6,6 +6,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions corresp
 
 ## [Unreleased]
 
+## [2.17.1] - 2026-09-30
+
 ### Added
 - **Effective DI state per area.** `find_plugin`, `trace_dependency` and `find_di_wiring` add an *Effective state* section: declarations with the same plugin name are merged in module load order (`app/etc/config.php`, or `<sequence>` when it is missing), so a plugin disabled by another module is reported as disabled; `find_preference` answers structurally (FQCN) with the effective preference per area, the superseded declarations and the class that is finally instantiated; `find_observer` / `find_event_flow` merge observers by name the same way.
 - **Ambiguous module order is reported.** When two modules declare the same preference, plugin or observer, neither depends on the other (no `<sequence>`, no composer `require`) and swapping them would change the result, the output warns that the outcome depends on incidental module order.
