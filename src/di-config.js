@@ -30,16 +30,17 @@ function decodeEntities(s) {
 export function parseXml(content) {
   const root = { name: '#document', attrs: {}, children: [], text: '' };
   if (!content) return root;
-  const src = content
-    .replace(/<!--[\s\S]*?-->/g, '')
-    .replace(/<\?[\s\S]*?\?>/g, '')
-    .replace(/<!DOCTYPE[^>]*>/gi, '');
+  const src = content;
   const stack = [root];
-  const tagRe = /<!\[CDATA\[([\s\S]*?)\]\]>|<(\/?)([A-Za-z_][\w:.-]*)((?:\s+[\w:.-]+\s*=\s*(?:"[^"]*"|'[^']*'))*)\s*(\/?)>|([^<]+)/g;
+  // Comments, processing instructions and DOCTYPE are tokens of the same scan as CDATA and tags, so
+  // whichever starts first wins (a "<!--" inside CDATA is text, not the start of a comment).
+  const tagRe = /<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<!DOCTYPE(?:[^[>]|\[[\s\S]*?\])*>|<!\[CDATA\[([\s\S]*?)\]\]>|<(\/?)([A-Za-z_][\w:.-]*)((?:\s+[\w:.-]+\s*=\s*(?:"[^"]*"|'[^']*'))*)\s*(\/?)>|([^<]+)|</g;
   let m;
   while ((m = tagRe.exec(src)) !== null) {
     const top = stack[stack.length - 1];
-    if (m[1] !== undefined) {           // CDATA
+    if (m[3] === undefined && m[1] === undefined && m[6] === undefined) {
+      continue;                         // comment, PI, DOCTYPE, or a stray "<"
+    } else if (m[1] !== undefined) {    // CDATA
       top.text += m[1];
     } else if (m[6] !== undefined) {    // text
       top.text += decodeEntities(m[6]);
@@ -109,8 +110,11 @@ function collectObjectRefs(node, path, out) {
 }
 
 function argumentsOf(node) {
-  const argsNode = node.children.find(c => c.name === 'arguments');
-  if (!argsNode) return { args: [], objectRefs: [] };
+  // The XSD allows several <arguments> blocks per type (xs:choice maxOccurs="unbounded"); Magento
+  // accumulates them.
+  const argsNodes = node.children.filter(c => c.name === 'arguments');
+  if (!argsNodes.length) return { args: [], objectRefs: [] };
+  const argsNode = { name: 'arguments', attrs: {}, text: '', children: argsNodes.flatMap(n => n.children) };
   const args = argsNode.children.filter(c => c.name === 'argument').map(a => ({
     name: a.attrs.name ?? '',
     xsiType: a.attrs['xsi:type'] ?? '',
@@ -177,6 +181,20 @@ export function buildDiModel(diFiles) {
   return model;
 }
 
+/**
+ * Sort declarations into module load order (stable; file order among equals), so "the last
+ * declaration wins" matches Magento's merge. Call once after buildModuleIndex.
+ */
+export function applyModuleOrder(model, idx) {
+  const key = d => idx.orderOf(idx.moduleOf(d.file));
+  const byOrder = (a, b) => key(a) - key(b);
+  model.preferences.sort(byOrder);
+  model.virtualTypes.sort(byOrder);
+  model.types.sort(byOrder);
+  for (const list of model.virtualByName.values()) list.sort(byOrder);
+  return model;
+}
+
 export function isVirtualType(model, name) {
   return model.virtualByName.has(normalizeClassName(name));
 }
@@ -191,7 +209,8 @@ export function resolveVirtualType(model, name) {
   const seen = new Set([cur]);
   while (model.virtualByName.has(cur)) {
     const decls = model.virtualByName.get(cur);
-    const decl = decls.find(d => d.area === 'global') || decls[0];
+    const globals = decls.filter(d => d.area === 'global');
+    const decl = globals.length ? globals[globals.length - 1] : decls[decls.length - 1];
     if (!decl.type || seen.has(decl.type)) break;
     cur = decl.type;
     seen.add(cur);
@@ -210,14 +229,21 @@ export function preferencesFor(model, name) {
  * The class that is instantiated for a requested type in the global area: preference (the last
  * global declaration seen; area-specific ones are reported separately) then virtual-type resolution.
  */
-export function resolveInstance(model, name) {
+export function resolveInstance(model, name, area = 'global') {
   const n = normalizeClassName(name);
   const prefs = preferencesFor(model, n);
-  const globalPrefs = prefs.filter(p => p.area === 'global');
   let target = n;
   const steps = [];
-  if (globalPrefs.length) {
-    target = globalPrefs[globalPrefs.length - 1].type;
+  const seen = new Set([n]);
+  // Preferences chain (I → J → K), like ObjectManager\Config::getPreference(); the area overrides global.
+  for (;;) {
+    const cands = preferencesFor(model, target).filter(p => p.area === 'global' || p.area === area);
+    if (!cands.length) break;
+    const areaOnes = cands.filter(p => p.area === area && area !== 'global');
+    const next = (areaOnes.length ? areaOnes : cands)[(areaOnes.length ? areaOnes : cands).length - 1].type;
+    if (!next || seen.has(next)) break;
+    seen.add(next);
+    target = next;
     steps.push(`preference ${target}`);
   }
   const { real, chain } = resolveVirtualType(model, target);
@@ -253,12 +279,14 @@ export function argumentInjectionsOf(model, className) {
         value = value.slice(0, -'Factory'.length); via = 'Factory';
       }
       const { real, chain } = resolveVirtualType(model, value);
-      const pref = preferencesFor(model, real).filter(p => p.area === 'global').pop();
-      const finalReal = pref ? resolveVirtualType(model, pref.type).real : real;
-      if (real === target || finalReal === target || value === target) {
+      // The object argument may be an interface: any area's preference (chain) can resolve it.
+      const areas = new Set(['global', owner.area, ...preferencesFor(model, value).map(p => p.area)]);
+      const hitArea = [...areas].find(a => resolveInstance(model, value, a).real === target);
+      if (real === target || value === target || hitArea) {
         out.push({
           owner: owner.name, ownerKind: owner.kind, argument: ref.path, value: ref.value,
           chain: chain.length > 1 ? chain : null, via, file: owner.file, area: owner.area,
+          preferenceArea: real === target || value === target ? null : hitArea,
         });
       }
     }
@@ -295,7 +323,10 @@ export function effectivePluginDeclarations(model, className, ancestorsOf) {
     }
   }
   if (virtual) {
-    for (const d of pluginDeclarationsOn(model, requested)) out.push({ ...d, onVirtualType: true });
+    // Every virtual type name on the chain (requested → … → real): declared there, never run.
+    for (const vt of resolveVirtualType(model, requested).chain.slice(0, -1)) {
+      for (const d of pluginDeclarationsOn(model, vt)) out.push({ ...d, onVirtualType: true });
+    }
   }
   return { real, virtual, declarations: out };
 }
@@ -320,7 +351,8 @@ export function parseEventsXml(content, relPath, eventName) {
   const doc = parseXml(content);
   const out = [];
   for (const node of walk(doc)) {
-    if (node.name !== 'event' || node.attrs.name !== eventName) continue;
+    // Magento lower-cases event names in config and in dispatch() (mb_strtolower)
+    if (node.name !== 'event' || String(node.attrs.name || '').toLowerCase() !== String(eventName).toLowerCase()) continue;
     for (const o of node.children.filter(c => c.name === 'observer')) {
       out.push({
         name: o.attrs.name ?? '',
@@ -337,104 +369,294 @@ export function parseEventsXml(content, relPath, eventName) {
   return out;
 }
 
-// ─── PHP class hierarchy ────────────────────────────────────────
+// ─── PHP source ─────────────────────────────────────────────────
 
-function resolvePhpName(name, namespace, uses) {
-  const n = name.trim();
-  if (!n) return '';
-  if (n.startsWith('\\')) return n.slice(1);
-  const [first, ...rest] = n.split('\\');
-  if (uses.has(first)) return [uses.get(first), ...rest].join('\\');
-  return namespace ? `${namespace}\\${n}` : n;
-}
-
-/** PHP source without comments; string contents kept (declarations never live in strings). */
-function stripPhpComments(source) {
-  return source
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')
-    .replace(/(^|[^:\\'"])\/\/[^\n]*/gm, '$1')
-    .replace(/(^|\s)#(?!\[)[^\n]*/gm, '$1');
+function skipQuoted(src, i) {
+  const q = src[i];
+  let j = i + 1;
+  while (j < src.length) {
+    if (src[j] === '\\') { j += 2; continue; }
+    if (src[j] === q) return j + 1;
+    j++;
+  }
+  return src.length;
 }
 
 /**
- * Import map of a PHP file: `use A\B;`, `use A\B as C;`, group uses `use A\{B, C as D, E\F};`,
- * several imports per statement. `use function` / `use const` are ignored. Only the code before the
- * first class-like declaration is read, so `use SomeTrait;` inside a class body is not an import.
+ * Blank out everything in PHP source that is not code — comments (`//`, `#`, `/* … *\/`), string,
+ * heredoc and nowdoc contents, attributes `#[…]`, inline HTML outside `<?php … ?>` — with a state
+ * machine, so `'*\/*\/edit'`, `'image/*'`, `"a//b"` or `class X {` inside a string cannot break parsing.
+ * Length and newlines are kept (offsets and brace depth stay valid). `keepStrings` keeps string contents.
  */
-function parsePhpUses(code) {
-  const firstDecl = /(?:^|[\s;{}])(?:(?:final|abstract|readonly)\s+)*(?:class|interface|trait|enum)\s+\w+/i.exec(code);
-  const head = firstDecl ? code.slice(0, firstDecl.index) : code;
-  const uses = new Map();
+export function scanPhp(source, { keepStrings = false } = {}) {
+  const src = String(source || '');
+  const n = src.length;
+  const parts = [];
+  const keep = (from, to) => { if (to > from) parts.push(src.slice(from, to)); };
+  const blank = (from, to) => { if (to > from) parts.push(src.slice(from, to).replace(/[^\n]/g, ' ')); };
+  const openRe = /<\?(?:php\b|=)?/gi;
+  const specialRe = /[?#\/'"`<]/g;                      // characters that can start a non-code token
+  let i = 0;
+  let inPhp = false;
+  while (i < n) {
+    if (!inPhp) {
+      openRe.lastIndex = i;
+      const r = openRe.exec(src);
+      if (!r) { blank(i, n); break; }
+      blank(i, r.index + r[0].length);
+      i = r.index + r[0].length;
+      inPhp = true;
+      continue;
+    }
+    specialRe.lastIndex = i;
+    const sp = specialRe.exec(src);
+    if (!sp) { keep(i, n); break; }
+    keep(i, sp.index);
+    i = sp.index;
+    const c = src[i];
+    const c2 = src[i + 1];
+    if (c === '?' && c2 === '>') { blank(i, i + 2); i += 2; inPhp = false; continue; }
+    if (c === '#' && c2 === '[') {                       // attribute, may nest and contain strings
+      let depth = 0;
+      let j = i + 1;
+      for (; j < n; j++) {
+        const ch = src[j];
+        if (ch === '[') depth++;
+        else if (ch === ']') { depth--; if (depth === 0) { j++; break; } }
+        else if (ch === "'" || ch === '"') j = skipQuoted(src, j) - 1;
+      }
+      blank(i, j);
+      i = j;
+      continue;
+    }
+    if (c === '#' || (c === '/' && c2 === '/')) {        // line comment (ends at newline or ?>)
+      let j = src.indexOf('\n', i);
+      if (j < 0) j = n;
+      const close = src.indexOf('?>', i);
+      if (close >= 0 && close < j) j = close;
+      blank(i, j);
+      i = j;
+      continue;
+    }
+    if (c === '/' && c2 === '*') {
+      const e = src.indexOf('*/', i + 2);
+      const j = e < 0 ? n : e + 2;
+      blank(i, j);
+      i = j;
+      continue;
+    }
+    if (c === "'" || c === '"' || c === '`') {
+      const j = skipQuoted(src, i);
+      keep(i, i + 1);
+      if (keepStrings) keep(i + 1, j - 1); else blank(i + 1, j - 1);
+      keep(j - 1, j);
+      i = j;
+      continue;
+    }
+    if (c === '<' && src.startsWith('<<<', i)) {          // heredoc / nowdoc
+      const h = /^<<<[ \t]*(["']?)([A-Za-z_]\w*)\1[ \t]*\r?\n/.exec(src.slice(i, i + 256));
+      if (h) {
+        const bodyStart = i + h[0].length;
+        const endRe = new RegExp(`^[ \\t]*${h[2]}(?![A-Za-z0-9_])`, 'gm');
+        endRe.lastIndex = bodyStart;
+        const e = endRe.exec(src);
+        const bodyEnd = e ? e.index : n;
+        keep(i, bodyStart);
+        if (keepStrings) keep(bodyStart, bodyEnd); else blank(bodyStart, bodyEnd);
+        const after = e ? e.index + e[0].length : n;
+        keep(bodyEnd, after);
+        i = after;
+        continue;
+      }
+    }
+    keep(i, i + 1);
+    i++;
+  }
+  return parts.join('');
+}
+
+function resolvePhpName(name, namespace, uses) {
+  const n = String(name || '').replace(/\s+/g, '');
+  if (!n) return '';
+  if (n.startsWith('\\')) return n.slice(1);
+  if (/^namespace\\/i.test(n)) return (namespace ? `${namespace}\\` : '') + n.slice('namespace\\'.length);
+  const [first, ...rest] = n.split('\\');
+  const hit = uses.get(first.toLowerCase());            // aliases are case-insensitive
+  if (hit) return [hit, ...rest].join('\\');
+  return namespace ? `${namespace}\\${n}` : n;
+}
+
+/** One `use …;` statement: plain, aliased, several, group (`A\{B, C as D}`, `A \{…}`); functions/consts skipped. */
+function parseUseStatement(raw, uses) {
+  const body = raw.replace(/\s+/g, ' ').trim();
   const add = (fq, alias) => {
-    const clean = fq.trim().replace(/^\\/, '');
-    if (clean) uses.set((alias || clean.split('\\').pop()).trim(), clean);
+    const clean = fq.replace(/\s+/g, '').replace(/^\\/, '').replace(/\\+$/, '');
+    if (clean) uses.set((alias || clean.split('\\').pop()).toLowerCase(), clean);
   };
-  const stmtRe = /(?:^|[;{}\s])use\s+(?!function\b|const\b)([^;]+);/gi;
+  if (/^(function|const)\b/i.test(body)) return;
+  const group = /^([\w\\]+?)\s*\\?\s*\{([^}]*)\}$/.exec(body);
+  if (group) {
+    const prefix = group[1].replace(/\\+$/, '');
+    for (const item of group[2].split(',')) {
+      const im = /^\s*(?:(function|const)\s+)?([\w\\]+)(?:\s+as\s+(\w+))?\s*$/i.exec(item);
+      if (im && !im[1]) add(`${prefix}\\${im[2]}`, im[3]);
+    }
+    return;
+  }
+  for (const item of body.split(',')) {
+    const im = /^\s*([\w\\]+)(?:\s+as\s+(\w+))?\s*$/i.exec(item);
+    if (im) add(im[1], im[2]);
+  }
+}
+
+const TYPE_HEADER_WORDS = new Set(['extends', 'implements']);
+const phpFileCache = new Map();
+
+/**
+ * Structural read of a PHP file: namespace segments (`namespace A;` and `namespace A { … }`, several
+ * per file), top-level imports per segment, and every named class / interface / trait / enum with its
+ * resolved parents, interfaces, own methods (only at the class body's brace depth — nested and
+ * anonymous classes do not leak in) and used traits.
+ */
+export function parsePhpFile(source) {
+  const key = source;
+  if (phpFileCache.has(key)) return phpFileCache.get(key);
+  const code = scanPhp(source);
+  const n = code.length;
+  const depthAt = new Int32Array(n + 1);
+  let depth = 0;
+  for (let k = 0; k < n; k++) {
+    depthAt[k] = depth;
+    const ch = code[k];
+    if (ch === '{') depth++;
+    else if (ch === '}') depth = Math.max(0, depth - 1);
+  }
+  depthAt[n] = depth;
+
+  const segments = [];
+  const nsRe = /(?<![\w$\\>:])namespace\s+([A-Za-z_][\w\\]*)\s*([;{])/gi;
   let m;
-  while ((m = stmtRe.exec(head)) !== null) {
-    const body = m[1].replace(/\s+/g, ' ').trim();
-    const group = /^([\w\\]+)\\\s*\{([^}]*)\}$/.exec(body);
-    const items = group ? group[2].split(',').map(x => [group[1], x]) : body.split(',').map(x => ['', x]);
-    for (const [prefix, item] of items) {
-      const im = /^\s*([\w\\]+)(?:\s+as\s+(\w+))?\s*$/i.exec(item);
-      if (im) add(prefix ? `${prefix}\\${im[1]}` : im[1], im[2]);
+  while ((m = nsRe.exec(code)) !== null) {
+    if (depthAt[m.index] === 0) segments.push({ ns: m[1], start: m.index, baseDepth: m[2] === '{' ? 1 : 0 });
+  }
+  if (!segments.length || segments[0].start > 0) segments.unshift({ ns: '', start: 0, baseDepth: 0 });
+  for (let i = 0; i < segments.length; i++) segments[i].end = i + 1 < segments.length ? segments[i + 1].start : n;
+
+  const types = [];
+  for (const seg of segments) {
+    const slice = code.slice(seg.start, seg.end);
+    const uses = new Map();
+    const useRe = /(?<![\w$\\>:])use\s+([^;{]*(?:\{[^}]*\})?[^;{]*);/gi;
+    while ((m = useRe.exec(slice)) !== null) {
+      if (depthAt[seg.start + m.index] === seg.baseDepth) parseUseStatement(m[1], uses);
+    }
+    const declRe = /(?<![\w$\\>:])((?:(?:final|abstract|readonly)\s+)*)(class|interface|trait|enum)\s+([A-Za-z_]\w*)([^{;]*)\{/gi;
+    while ((m = declRe.exec(slice)) !== null) {
+      const shortName = m[3];
+      if (TYPE_HEADER_WORDS.has(shortName.toLowerCase())) continue;
+      if (/\bnew\s*$/i.test(slice.slice(Math.max(0, m.index - 16), m.index))) continue;   // anonymous class
+      const kind = m[2].toLowerCase();
+      const tail = kind === 'enum' ? m[4].replace(/^\s*:\s*[\w\\]+/, '') : m[4];
+      const ext = (/\bextends\s+([\w\\\s,]+?)(?=\bimplements\b|$)/i.exec(tail) || [])[1] || '';
+      const impl = (/\bimplements\s+([\w\\\s,]+)$/i.exec(tail.trim()) || [])[1] || '';
+      const list = str => str.split(',').map(x => resolvePhpName(x, seg.ns, uses)).filter(Boolean);
+      const open = seg.start + m.index + m[0].length - 1;
+      const bodyDepth = depthAt[open] + 1;
+      let close = n;
+      for (let k = open + 1; k < n; k++) if (code[k] === '}' && depthAt[k] === bodyDepth) { close = k; break; }
+      const methods = new Map();
+      const traits = [];
+      const body = code.slice(open + 1, close);
+      const fnRe = /((?:\b(?:final|abstract|public|protected|private|static|var)\s+)*)function\s+&?\s*([A-Za-z_]\w*)\s*\(/gi;
+      let f;
+      while ((f = fnRe.exec(body)) !== null) {
+        if (depthAt[open + 1 + f.index + f[1].length] !== bodyDepth) continue;
+        const mods = f[1];
+        if (!methods.has(f[2].toLowerCase())) {
+          methods.set(f[2].toLowerCase(), {
+            name: f[2],
+            visibility: /\bprivate\b/i.test(mods) ? 'private' : /\bprotected\b/i.test(mods) ? 'protected' : 'public',
+            isStatic: /\bstatic\b/i.test(mods),
+            isFinal: /\bfinal\b/i.test(mods),
+          });
+        }
+      }
+      const tRe = /(?<![\w$\\>:])use\s+([^;{]+)[;{]/gi;
+      while ((f = tRe.exec(body)) !== null) {
+        if (depthAt[open + 1 + f.index] !== bodyDepth) continue;
+        for (const t of f[1].split(',')) { const r = resolvePhpName(t, seg.ns, uses); if (r) traits.push(r); }
+      }
+      const isAbstract = /\babstract\b/i.test(m[1]);
+      types.push({
+        fqcn: seg.ns ? `${seg.ns}\\${shortName}` : shortName,
+        shortName,
+        namespace: seg.ns,
+        kind,
+        isFinal: /\bfinal\b/i.test(m[1]),
+        isAbstract,
+        parents: kind === 'class' ? list(ext).slice(0, 1) : [],
+        interfaces: kind === 'interface' ? list(ext) : (kind === 'trait' ? [] : list(impl)),
+        methods,
+        traits,
+      });
     }
   }
-  return uses;
+  const result = { types };
+  if (phpFileCache.size > 5000) phpFileCache.clear();
+  phpFileCache.set(key, result);
+  return result;
+}
+
+function typeIn(file, fqcn) {
+  const lower = normalizeClassName(fqcn).toLowerCase();
+  return file.types.find(t => t.fqcn.toLowerCase() === lower) || null;
 }
 
 /** Direct parent class and interfaces declared in a PHP source file for `shortName`. */
 export function parsePhpDeclaration(source, shortName) {
-  const code = stripPhpComments(source);
-  const ns = (/^\s*namespace\s+([\w\\]+)\s*[;{]/mi.exec(code) || [])[1] || '';
-  const uses = parsePhpUses(code);
-  const declRe = new RegExp(`\\b(class|interface|enum)\\s+${shortName}\\b([^{]*)\\{`, 'i');
-  const d = declRe.exec(code);
-  if (!d) return { namespace: ns, parents: [], interfaces: [] };
-  const tail = d[2];
-  const kind = d[1].toLowerCase();
-  const ext = (/\bextends\s+([\w\\\s,]+?)(?=\bimplements\b|$)/i.exec(tail) || [])[1] || '';
-  const impl = (/\bimplements\s+([\w\\\s,]+)$/i.exec(tail.trim()) || [])[1] || '';
-  const list = s => s.split(',').map(x => resolvePhpName(x, ns, uses)).filter(Boolean);
-  return kind === 'interface'
-    ? { namespace: ns, parents: [], interfaces: list(ext) }
-    : { namespace: ns, parents: list(ext).slice(0, 1), interfaces: list(impl) };
+  const t = parsePhpFile(source).types.find(x => x.shortName.toLowerCase() === String(shortName).toLowerCase());
+  if (!t) return { namespace: '', parents: [], interfaces: [] };
+  return { namespace: t.namespace, parents: t.parents, interfaces: t.interfaces };
 }
 
 /**
- * Returns `ancestorsOf(fqcn)` → parent classes and interfaces, nearest first, transitive.
+ * Returns `ancestorsOf(fqcn)` → parent classes and interfaces, nearest first, transitive, with the
+ * declared spelling of each name (PHP class names are case-insensitive).
  * `findFile(fqcn)` returns the PHP file path or ''.
  */
 export function createAncestorResolver(findFile, readFile = p => readFileSync(p, 'utf-8')) {
-  const cache = new Map();
-  function direct(fqcn) {
-    if (cache.has(fqcn)) return cache.get(fqcn);
-    cache.set(fqcn, []);
-    let result = [];
+  const declCache = new Map();
+  function declOf(fqcn) {
+    const key = normalizeClassName(fqcn).toLowerCase();
+    if (declCache.has(key)) return declCache.get(key);
+    declCache.set(key, null);
+    let decl = null;
     try {
-      const file = findFile(fqcn);
-      if (file) {
-        const decl = parsePhpDeclaration(readFile(file), fqcn.split('\\').pop());
-        const declaredNs = decl.namespace ? `${decl.namespace}\\${fqcn.split('\\').pop()}` : fqcn;
-        if (declaredNs === fqcn) result = [...decl.parents, ...decl.interfaces];
-      }
-    } catch { /* unreadable file: no ancestors */ }
-    cache.set(fqcn, result);
-    return result;
+      const file = findFile(normalizeClassName(fqcn));
+      if (file) decl = typeIn(parsePhpFile(readFile(file)), fqcn);
+    } catch { decl = null; }
+    declCache.set(key, decl);
+    return decl;
   }
-  return function ancestorsOf(fqcn) {
+  const canonical = name => declOf(name)?.fqcn || name;
+  const ancestorsOf = function ancestorsOf(fqcn) {
     const out = [];
-    const seen = new Set([normalizeClassName(fqcn)]);
-    const queue = [...direct(normalizeClassName(fqcn))];
+    const start = normalizeClassName(fqcn);
+    const seen = new Set([start.toLowerCase()]);
+    const first = declOf(start);
+    const queue = first ? [...first.parents, ...first.interfaces] : [];
     while (queue.length) {
-      const next = queue.shift();
-      if (seen.has(next)) continue;
-      seen.add(next);
+      const next = canonical(queue.shift());
+      if (seen.has(next.toLowerCase())) continue;
+      seen.add(next.toLowerCase());
       out.push(next);
-      queue.push(...direct(next));
+      const d = declOf(next);
+      if (d) queue.push(...d.parents, ...d.interfaces);
     }
     return out;
   };
+  ancestorsOf.declOf = declOf;
+  return ancestorsOf;
 }
 
 // ─── Modules, load order and the configuration cascade ─────────
@@ -456,10 +678,21 @@ export function parseModuleXml(content) {
 /** Module list of app/etc/config.php, in file order (= the load order written by setup:upgrade). */
 export function parseConfigPhpModules(content) {
   const out = [];
-  const block = (/'modules'\s*=>\s*(?:array\s*\(|\[)([\s\S]*?)(?:\)|\])\s*,?\s*(?:'|\]|\)|$)/.exec(content || '') || [])[1] || '';
-  const re = /'([A-Za-z0-9]+_[A-Za-z0-9]+)'\s*=>\s*(\d)/g;
+  const code = scanPhp(content || '', { keepStrings: true });   // comments removed, strings kept
+  const start = /(['"])modules\1\s*=>\s*(?:array\s*\(|\[)/i.exec(code);
+  if (!start) return out;
+  // The modules array ends at its matching bracket
+  let depth = 0;
+  let end = code.length;
+  for (let k = start.index + start[0].length - 1; k < code.length; k++) {
+    const ch = code[k];
+    if (ch === '(' || ch === '[') depth++;
+    else if (ch === ')' || ch === ']') { depth--; if (depth === 0) { end = k; break; } }
+  }
+  const block = code.slice(start.index + start[0].length, end);
+  const re = /(['"])([A-Za-z0-9]+_[A-Za-z0-9]+)\1\s*=>\s*(1|0|true|false)\b/gi;
   let m;
-  while ((m = re.exec(block)) !== null) out.push({ name: m[1], enabled: m[2] === '1' });
+  while ((m = re.exec(block)) !== null) out.push({ name: m[2], enabled: m[3] === '1' || m[3].toLowerCase() === 'true' });
   return out;
 }
 
@@ -644,40 +877,47 @@ export const NONINTERCEPTABLE_INTERFACE = 'Magento\\Framework\\ObjectManager\\No
 // Mirrors Magento\Framework\Interception\Code\Generator\Interceptor::isInterceptedMethod()
 const NOT_INTERCEPTED_METHODS = ['__construct', '__destruct', '__sleep', '__wakeup', '__clone', '_resetState'];
 
-/** Class modifiers and method signatures (visibility, static, final) of `shortName` in a PHP file. */
+/** Class modifiers, method signatures (visibility, static, final) and traits of `shortName` in a PHP file. */
 export function parsePhpMembers(source, shortName) {
-  const code = stripPhpComments(source);
-  const decl = new RegExp(`((?:\\b(?:final|abstract|readonly)\\s+)*)\\b(class|interface|trait|enum)\\s+${shortName}\\b`, 'i').exec(code);
-  if (!decl) return null;
-  const methods = new Map();
-  const re = /((?:\b(?:final|abstract|public|protected|private|static)\s+)*)function\s+&?\s*(\w+)\s*\(/gi;
-  let m;
-  while ((m = re.exec(code.slice(decl.index))) !== null) {
-    const mods = m[1];
-    methods.set(m[2].toLowerCase(), {
-      name: m[2],
-      visibility: /\bprivate\b/.test(mods) ? 'private' : /\bprotected\b/.test(mods) ? 'protected' : 'public',
-      isStatic: /\bstatic\b/.test(mods),
-      isFinal: /\bfinal\b/.test(mods),
-    });
-  }
-  return { kind: decl[2].toLowerCase(), isFinal: /\bfinal\b/i.test(decl[1]), isAbstract: /\babstract\b/i.test(decl[1]), methods };
+  const t = parsePhpFile(source).types.find(x => x.shortName.toLowerCase() === String(shortName).toLowerCase());
+  if (!t) return null;
+  return { kind: t.kind, isFinal: t.isFinal, isAbstract: t.isAbstract, methods: t.methods, traits: t.traits };
 }
 
-/** `membersOf(fqcn)` → parsePhpMembers result, or null when the file cannot be found or read. */
+/** `membersOf(fqcn)` → parsePhpMembers-like result for exactly that FQCN, or null when not found. */
 export function createMemberResolver(findFile, readFile = p => readFileSync(p, 'utf-8')) {
   const cache = new Map();
   return function membersOf(fqcn) {
     const n = normalizeClassName(fqcn);
-    if (cache.has(n)) return cache.get(n);
+    const key = n.toLowerCase();
+    if (cache.has(key)) return cache.get(key);
     let info = null;
     try {
       const file = findFile(n);
-      if (file) info = parsePhpMembers(readFile(file), n.split('\\').pop());
+      if (file) {
+        const t = typeIn(parsePhpFile(readFile(file)), n);
+        if (t) info = { kind: t.kind, isFinal: t.isFinal, isAbstract: t.isAbstract, methods: t.methods, traits: t.traits };
+      }
     } catch { info = null; }
-    cache.set(n, info);
+    cache.set(key, info);
     return info;
   };
+}
+
+/** Method declared on a type or (recursively) on the traits it uses. */
+function findMethod(type, key, membersOf, seen = new Set()) {
+  if (seen.has(type.toLowerCase())) return { method: null, unknown: false };
+  seen.add(type.toLowerCase());
+  const info = membersOf(type);
+  if (!info) return { method: null, unknown: true };
+  if (info.methods.has(key)) return { method: info.methods.get(key), unknown: false };
+  let unknown = false;
+  for (const tr of info.traits || []) {
+    const r = findMethod(tr, key, membersOf, seen);
+    if (r.method) return r;
+    unknown = unknown || r.unknown;
+  }
+  return { method: null, unknown };
 }
 
 /**
@@ -689,7 +929,8 @@ export function interceptionStatus(className, methodName, ancestorsOf, membersOf
   const own = membersOf(n);
   if (!own) return { interceptable: null };
   const ancestors = ancestorsOf(n);
-  if (n === NONINTERCEPTABLE_INTERFACE || ancestors.includes(NONINTERCEPTABLE_INTERFACE)) {
+  const nonInterceptable = NONINTERCEPTABLE_INTERFACE.toLowerCase();
+  if (n.toLowerCase() === nonInterceptable || ancestors.some(a => a.toLowerCase() === nonInterceptable)) {
     return { interceptable: false, reason: `implements \`${NONINTERCEPTABLE_INTERFACE}\` — no interceptor is generated` };
   }
   if (own.kind === 'class' && own.isFinal) {
@@ -697,13 +938,19 @@ export function interceptionStatus(className, methodName, ancestorsOf, membersOf
   }
   if (!methodName) return { interceptable: true };
   const key = methodName.toLowerCase();
+  // PHP method resolution: the class (and its traits), then the parent chain, then interfaces
+  const classes = [];
+  const ifaces = [];
+  for (const a of ancestors) {
+    const info = membersOf(a);
+    (info && info.kind === 'interface' ? ifaces : classes).push(a);
+  }
   let unknown = false;
-  for (const type of [n, ...ancestors]) {
-    const info = type === n ? own : membersOf(type);
-    if (!info) { unknown = true; continue; }
-    const method = info.methods.get(key);
+  for (const type of [n, ...classes, ...ifaces]) {
+    const { method, unknown: u } = findMethod(type, key, membersOf);
+    unknown = unknown || u;
     if (!method) continue;
-    if (NOT_INTERCEPTED_METHODS.includes(method.name) || NOT_INTERCEPTED_METHODS.map(x => x.toLowerCase()).includes(key)) {
+    if (NOT_INTERCEPTED_METHODS.some(x => x.toLowerCase() === key)) {
       return { interceptable: false, reason: `\`${method.name}()\` is never intercepted` };
     }
     if (method.visibility !== 'public') return { interceptable: false, reason: `\`${method.name}()\` is ${method.visibility} — only public methods are intercepted` };
@@ -717,43 +964,37 @@ export function interceptionStatus(className, methodName, ancestorsOf, membersOf
 
 // ─── Reverse class hierarchy (instanceof) ───────────────────────
 
-/** All class / interface declarations in a PHP file with their resolved parents and interfaces. */
+/** All class / interface / enum declarations in a PHP file with their resolved parents and interfaces. */
 export function parsePhpTypes(source) {
-  const code = stripPhpComments(source);
-  const ns = (/^\s*namespace\s+([\w\\]+)\s*[;{]/mi.exec(code) || [])[1] || '';
-  const uses = parsePhpUses(code);
-  const out = [];
-  const declRe = /(?:^|[\s;{}])((?:(?:final|abstract|readonly)\s+)*)(class|interface|enum)\s+(\w+)([^{;]*)\{/gi;
-  let d;
-  while ((d = declRe.exec(code)) !== null) {
-    const kind = d[2].toLowerCase();
-    // enum Name: string implements X — drop the backing type before reading the lists
-    const tail = kind === 'enum' ? d[4].replace(/^\s*:\s*\w+/, '') : d[4];
-    const ext = (/\bextends\s+([\w\\\s,]+?)(?=\bimplements\b|$)/i.exec(tail) || [])[1] || '';
-    const impl = (/\bimplements\s+([\w\\\s,]+)$/i.exec(tail.trim()) || [])[1] || '';
-    const list = s => s.split(',').map(x => resolvePhpName(x, ns, uses)).filter(Boolean);
-    const fqcn = ns ? `${ns}\\${d[3]}` : d[3];
-    if (kind === 'interface') out.push({ fqcn, kind: 'interface', parents: [], interfaces: list(ext) });
-    else if (kind === 'enum') out.push({ fqcn, kind: 'enum', parents: [], interfaces: list(impl) });
-    else out.push({ fqcn, kind: /\babstract\b/i.test(d[1]) ? 'abstract class' : 'class', parents: list(ext).slice(0, 1), interfaces: list(impl) });
-  }
-  return out;
+  return parsePhpFile(source).types
+    .filter(t => t.kind !== 'trait')
+    .map(t => ({
+      fqcn: t.fqcn,
+      kind: t.kind === 'class' && t.isAbstract ? 'abstract class' : t.kind,
+      parents: t.parents,
+      interfaces: t.interfaces,
+    }));
 }
 
-/** Build { types: Map fqcn → decl+file, children: Map fqcn → [{ child, relation }] }. */
+/**
+ * Build { types: Map lowercase fqcn → decl+file, children: Map lowercase fqcn → [{ child, relation }] }.
+ * Keys are lower-cased because PHP class names are case-insensitive.
+ */
 export function buildClassHierarchy(entries) {
   const types = new Map();
   const children = new Map();
   const add = (parent, child, relation) => {
-    if (!children.has(parent)) children.set(parent, []);
-    children.get(parent).push({ child, relation });
+    const k = parent.toLowerCase();
+    if (!children.has(k)) children.set(k, []);
+    children.get(k).push({ child, relation });
   };
   for (const { relPath, source } of entries) {
     let decls;
     try { decls = parsePhpTypes(source); } catch { continue; }
     for (const t of decls) {
-      if (types.has(t.fqcn)) continue;
-      types.set(t.fqcn, { ...t, file: relPath });
+      const k = t.fqcn.toLowerCase();
+      if (types.has(k)) continue;
+      types.set(k, { ...t, file: relPath });
       for (const p of t.parents) add(p, t.fqcn, 'extends');
       for (const i of t.interfaces) add(i, t.fqcn, t.kind === 'interface' ? 'extends' : 'implements');
     }
@@ -768,14 +1009,14 @@ export function buildClassHierarchy(entries) {
 export function instancesOf(hierarchy, fqcn) {
   const root = normalizeClassName(fqcn);
   const out = [];
-  const seen = new Set([root]);
+  const seen = new Set([root.toLowerCase()]);
   const queue = [{ name: root, path: [root] }];
   while (queue.length) {
     const { name, path } = queue.shift();
-    for (const { child, relation } of hierarchy.children.get(name) || []) {
-      if (seen.has(child)) continue;
-      seen.add(child);
-      const decl = hierarchy.types.get(child);
+    for (const { child, relation } of hierarchy.children.get(name.toLowerCase()) || []) {
+      if (seen.has(child.toLowerCase())) continue;
+      seen.add(child.toLowerCase());
+      const decl = hierarchy.types.get(child.toLowerCase());
       const childPath = [...path, child];
       out.push({ fqcn: child, kind: decl?.kind || 'class', file: decl?.file || null, relation, via: name, depth: path.length, path: childPath });
       queue.push({ name: child, path: childPath });

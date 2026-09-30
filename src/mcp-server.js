@@ -39,7 +39,7 @@ import {
   virtualTypesResolvingTo, argumentInjectionsOf, effectivePluginDeclarations, resolvePluginType,
   parseEventsXml, parseXml, areaFromPath, createAncestorResolver,
   buildModuleIndex, preferenceCascade, mergeNamedDeclarations, pluginDeclarationsOn,
-  createMemberResolver, interceptionStatus, buildClassHierarchy, instancesOf,
+  createMemberResolver, interceptionStatus, buildClassHierarchy, instancesOf, applyModuleOrder,
 } from './di-config.js';
 import { defaultDbPath, manifestPath, tempDbPathFor, swapInIndex } from './paths.js';
 import { createRequire } from 'module';
@@ -2478,6 +2478,8 @@ async function getDiModel(root) {
     diModelCache.root = root;
     diModelCache.paths = diXmlCache.paths;
     diModelCache.model = buildDiModel(files);
+    // "Last declaration wins" in module load order, as Magento merges configuration
+    applyModuleOrder(diModelCache.model, await getModuleIndex(root));
     diModelCache.ancestorsOf = createAncestorResolver(fqcn => findClassFileFast(root, fqcn));
     diModelCache.membersOf = createMemberResolver(fqcn => findClassFileFast(root, fqcn));
   }
@@ -3766,7 +3768,7 @@ async function traceEventFlow(eventName) {
   for (const file of eventsFiles) {
     let content;
     try { content = readFileSync(file, 'utf-8'); } catch { continue; }
-    if (!content.includes(eventName)) continue;
+    if (!content.toLowerCase().includes(eventName.toLowerCase())) continue;
     const relativePath = file.replace(root + '/', '');
     for (const obs of parseEventsXml(content, relativePath, eventName)) {
       result.observers.push(obs);
@@ -4366,8 +4368,9 @@ async function findEventDispatchers(eventName) {
 
   const escaped = eventName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   // Match eventManager->dispatch('event_name' and similar patterns
+  // Magento lower-cases event names on dispatch — match case-insensitively
   const dispatchRegex = new RegExp(
-    `dispatch\\s*\\(\\s*['"]${escaped}['"]`
+    `dispatch\\s*\\(\\s*['"]${escaped}['"]`, 'i'
   );
 
   // 1. Grep PHP files for exact dispatch calls
@@ -4379,7 +4382,7 @@ async function findEventDispatchers(eventName) {
   for (const phpFile of phpFiles) {
     let content;
     try { content = readFileSync(phpFile, 'utf-8'); } catch { continue; }
-    if (!content.includes(eventName)) continue;
+    if (!content.toLowerCase().includes(eventName.toLowerCase())) continue;
 
     const relativePath = phpFile.replace(root + '/', '');
     const lines = content.split('\n');
@@ -4419,7 +4422,7 @@ async function findEventDispatchers(eventName) {
   for (const file of eventsFiles) {
     let content;
     try { content = readFileSync(file, 'utf-8'); } catch { continue; }
-    if (!content.includes(eventName)) continue;
+    if (!content.toLowerCase().includes(eventName.toLowerCase())) continue;
     result.observerCount += parseEventsXml(content, file.replace(root + '/', ''), eventName).length;
   }
 
