@@ -2410,8 +2410,9 @@ async function getDiXmlFiles(root) {
     if (content === undefined) {
       try { content = readFileSync(absPath, 'utf-8'); } catch { content = null; }
       // Blank out XML comments (same length, newlines kept) so commented-out declarations are never
-      // matched by the regex-based scanners and offsets / line numbers stay valid.
-      if (content) content = content.replace(/<!--[\s\S]*?-->/g, m => m.replace(/[^\n]/g, ' '));
+      // matched by the regex-based scanners and offsets / line numbers stay valid. CDATA is matched
+      // first so a "<!--" inside it does not blank everything up to the next comment's "-->".
+      if (content) content = content.replace(/<!\[CDATA\[[\s\S]*?\]\]>|<!--[\s\S]*?-->/g, m => m.startsWith('<!--') ? m.replace(/[^\n]/g, ' ') : m);
       diXmlCache.files.set(absPath, content);
     }
     if (content !== null) {
@@ -6263,7 +6264,8 @@ const _callToolHandler = async (request) => {
           ? await collectPluginRegistrations(args.targetClass, args.targetMethod)
           : { diRegistrations: [], virtualOf: null, classStatus: null };
 
-        let text = formatSearchResults(enrichedResults);
+        // The semantic block ranks plugin code by similarity; only the DI sections below are resolved against targetClass.
+        let text = (args.targetClass ? '### Similar plugin code (semantic, not filtered by targetClass)\n' : '') + formatSearchResults(enrichedResults);
         const exactRegs = diRegistrations.filter(r => !r.isSubNamespace);
         const subNsRegs = diRegistrations.filter(r => r.isSubNamespace);
         if (diRegistrations.length > 0) {

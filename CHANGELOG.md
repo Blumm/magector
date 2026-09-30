@@ -32,6 +32,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions corresp
 - **PHP declarations are read robustly:** group and multi-imports (`use A\\{B, C as D};`, `use A, B;`), aliases, declarations split over several lines, comments between the parts; a trait `use` inside a class body is not taken for an import; namespace aliases with relative names (`use A\\B as C;` … `implements C\\X`), enums implementing interfaces, block namespaces (`namespace X { … }`) and case-insensitive keywords.
 - **Plugin `disabled="1"` / `"0"`** is read like `true` / `false` (`BooleanUtils`, as Magento does). For observers only `disabled="true"` disables — Magento's events converter ignores `"1"`.
 - **A relative `MAGENTO_ROOT` produced non-existent file paths** (the root segment was cut out). It is resolved to an absolute path at startup.
+- **Configuration outside the modules could override them.** `app/etc/di.xml` — the primary scope, which Magento reads before any module — was ranked after the modules, so a module preference for an interface also declared there lost (`Magento\Framework\App\ScopeResolverInterface` was reported as `…\ScopeResolver` instead of `Magento\Store\Model\Resolver\Store`); and a di.xml Magento never reads (a `dev/tests/integration/tmp/sandbox-*` or `magento2-base` copy of app/etc) could win over every module. app/etc now comes first; files outside app/etc and the modules rank last.
+- **A `<!--` inside a CDATA value hid the di.xml declarations after it** (up to the next comment) from the DI tools.
+- `find_plugin` labels its semantic block (`Similar plugin code (semantic, not filtered by targetClass)`); only the DI sections are resolved against `targetClass`.
 
 ## [2.17.0] - 2026-09-29
 

@@ -151,6 +151,13 @@ async function main() {
         'app/code/Acme/Ext/Plugin/OverridePlugin.php',
       ],
     });
+    // The BasePlugin preference in Acme/Ext/etc/di.xml follows an argument whose CDATA holds "<!--".
+    check('di.xml: a comment opener inside CDATA does not hide the declarations after it', t, {
+      has: ['Runs: `Acme\\Ext\\Plugin\\OverridePlugin`'],
+    });
+    check('find_plugin: the semantic block is labelled as not resolved against targetClass', t, {
+      has: ['### Similar plugin code (semantic, not filtered by targetClass)'],
+    });
 
     t = await client.call('magento_find_plugin', { targetClass: 'Acme\\Core\\Model\\Guarded' });
     check('find_plugin: non-interceptable methods are flagged', t, {
@@ -193,6 +200,15 @@ async function main() {
     t = await client.call('magento_find_preference', { interfaceName: 'Acme\\Core\\Api\\PriceInterface' });
     check('find_preference: area override', t, {
       has: ['[global] → **`Acme\\Core\\Model\\DefaultPrice`**', '[graphql] → **`Acme\\Core\\Model\\GraphQlPrice`**'],
+    });
+    t = await client.call('magento_find_preference', { interfaceName: 'Acme\\Core\\Api\\ClockInterface' });
+    check('find_preference: a module overrides app/etc/di.xml (primary scope is read first)', t, {
+      has: ['[global] → **`Acme\\Core\\Model\\ModuleClock`**', 'superseded: `Acme\\Core\\Model\\SystemClock`'],
+    });
+    t = await client.call('magento_find_preference', { interfaceName: 'Acme\\Core\\Api\\LocaleInterface' });
+    check('find_preference: a di.xml outside app/etc and the modules (a magento2-base copy) never wins', t, {
+      has: ['[global] → **`Acme\\Core\\Model\\DefaultLocale`**'],
+      hasNot: ['**`Acme\\Core\\Model\\BaseCopyLocale`**'],
     });
 
     t = await client.call('magento_find_implementors', { interfaceName: 'Acme\\Core\\Api\\FormatterInterface' });

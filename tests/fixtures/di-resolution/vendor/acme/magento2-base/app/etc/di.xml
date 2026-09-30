@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<!-- The magento2-base package copy of app/etc: installed into app/etc, never read from here -->
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="urn:magento:framework:ObjectManager/etc/config.xsd">
+    <preference for="Acme\Core\Api\ClockInterface" type="Acme\Core\Model\BaseCopyClock"/>
+    <preference for="Acme\Core\Api\LocaleInterface" type="Acme\Core\Model\BaseCopyLocale"/>
+</config>

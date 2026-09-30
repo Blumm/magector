@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<!-- Primary scope: Magento reads app/etc/di.xml before every module's di.xml -->
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="urn:magento:framework:ObjectManager/etc/config.xsd">
+    <preference for="Acme\Core\Api\ClockInterface" type="Acme\Core\Model\SystemClock"/>
+    <preference for="Acme\Core\Api\LocaleInterface" type="Acme\Core\Model\DefaultLocale"/>
+</config>
