@@ -143,6 +143,9 @@ class McpTestClient {
         // Point MAGECTOR_DB at a path inside the fixture so the server never
         // touches the real index. Structural-first path means we don't need one.
         MAGECTOR_DB: path.join(FIXTURE_ROOT, '.magector', 'index.db'),
+        // No background index of the fixture: once it finished, a semantic hit made the
+        // "unknown mutation" case find a schema, and its writes raced the fixture cleanup.
+        MAGECTOR_AUTO_INDEX: '0',
       },
       stdio: ['pipe', 'pipe', 'pipe'],
     });

@@ -49,8 +49,10 @@ class McpClient {
       env: {
         ...process.env,
         MAGENTO_ROOT: this.opts.magentoRoot,
-        // Keep any index away from the fixture; the tools under test do not need one.
+        // Keep any index away from the fixture; the tools under test do not need one,
+        // and without MAGECTOR_AUTO_INDEX=0 the server would start indexing the fixture.
         MAGECTOR_DB: path.join(this.opts.dbDir, 'index.db'),
+        MAGECTOR_AUTO_INDEX: '0',
         ...this.opts.env,
       },
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -189,6 +191,13 @@ async function main() {
 
     t = await client.call('magento_trace_dependency', { className: 'Repo' });
     check('trace_dependency (short name, fuzzy): commented XML still ignored', t, { hasNot: ['OldRepo', 'commented_out_plugin'] });
+
+    // ── No index, automatic indexing off ────────────────────────────
+    t = await client.call('magento_search', { query: 'repository save' });
+    check('MAGECTOR_AUTO_INDEX=0: semantic search reports the missing index instead of building one', t, {
+      has: ['automatic indexing is off (MAGECTOR_AUTO_INDEX=0)'],
+      hasNot: ['Re-indexing in progress'],
+    });
 
     // ── Preferences ──────────────────────────────────────────────
     t = await client.call('magento_find_preference', { interfaceName: 'Acme\\Core\\Api\\NotifierInterface' });

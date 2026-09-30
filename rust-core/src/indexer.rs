@@ -1508,6 +1508,11 @@ impl Indexer {
         ))
     }
 
+    /// Build the search graph now rather than on the first search (see `VectorDB::warm`).
+    pub fn warm_search(&self) {
+        self.vectordb.warm();
+    }
+
     /// Get index statistics
     pub fn stats(&self) -> IndexStats {
         IndexStats {

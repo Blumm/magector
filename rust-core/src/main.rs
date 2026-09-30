@@ -532,6 +532,10 @@ fn run_serve(
         indexer.set_descriptions_db(desc_db_path.clone());
     }
     let desc_db_path_for_serve = desc_db_path;
+    // Build the search graph before signalling ready, so the first query does not pay for it.
+    let warm_start = std::time::Instant::now();
+    indexer.warm_search();
+    eprintln!("Search graph built in {:.1}s", warm_start.elapsed().as_secs_f64());
     let vectors = indexer.stats().vectors_created;
     let indexer = Arc::new(Mutex::new(indexer));
 

@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::embedder::EMBEDDING_DIM;
 
@@ -156,7 +157,10 @@ fn invalid_vector_ids(vectors: &HashMap<usize, Vec<f32>>, tombstones: &HashSet<u
 
 /// Vector database for semantic code search
 pub struct VectorDB {
-    hnsw: Hnsw<'static, f32, DistCosine>,
+    /// Search graph, built on the first search (or `warm`) rather than on open: `index`,
+    /// `stats` and the incremental refresh never search, and building the graph of a
+    /// 42k-vector index costs ~1 min on 2 vCPUs.
+    hnsw: OnceLock<Hnsw<'static, f32, DistCosine>>,
     metadata: HashMap<usize, IndexMetadata>,
     vectors: HashMap<usize, Vec<f32>>,
     next_id: usize,
@@ -177,7 +181,7 @@ impl VectorDB {
     /// Create a new empty vector database
     pub fn new() -> Self {
         Self {
-            hnsw: make_hnsw(HNSW_MIN_CAPACITY),
+            hnsw: OnceLock::new(),
             metadata: HashMap::new(),
             vectors: HashMap::new(),
             next_id: 0,
@@ -188,12 +192,32 @@ impl VectorDB {
     /// Create with a capacity hint (avoids HNSW resizing)
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            hnsw: make_hnsw(capacity),
+            hnsw: OnceLock::new(),
             metadata: HashMap::with_capacity(capacity),
             vectors: HashMap::with_capacity(capacity),
             next_id: 0,
             tombstones: HashSet::new(),
         }
+    }
+
+    /// The search graph over the live vectors, built on first use.
+    fn search_graph(&self) -> &Hnsw<'static, f32, DistCosine> {
+        self.hnsw.get_or_init(|| {
+            let data: Vec<(&Vec<f32>, usize)> = self.vectors.iter()
+                .filter(|(id, _)| !self.tombstones.contains(id))
+                .map(|(&id, vec)| (vec, id))
+                .collect();
+            let hnsw = make_hnsw(data.len());
+            if !data.is_empty() {
+                hnsw.parallel_insert(&data);
+            }
+            hnsw
+        })
+    }
+
+    /// Build the search graph now instead of on the first search (`serve`, before it reports ready).
+    pub fn warm(&self) {
+        self.search_graph();
     }
 
     /// Load from disk or create new.
@@ -305,25 +329,17 @@ impl VectorDB {
         }
     }
 
-    /// Rebuild HNSW from persisted V1 state
+    /// Load persisted V1 state (the search graph is built on first use)
     fn from_state(state: PersistedState) -> Result<Self> {
-        let capacity = state.vectors.len().max(HNSW_MIN_CAPACITY);
-        let hnsw = make_hnsw(capacity);
-
         // Tombstone any invalid vectors, and keep them out of the HNSW graph they would corrupt
         let tombstones: HashSet<usize> =
             invalid_vector_ids(&state.vectors, &HashSet::new()).into_iter().collect();
         if !tombstones.is_empty() {
             tracing::warn!("V1 load: skipped {} invalid vectors (NaN/Inf/zero)", tombstones.len());
         }
-        let data: Vec<(&Vec<f32>, usize)> = state.vectors.iter()
-            .filter(|(id, _)| !tombstones.contains(id))
-            .map(|(&id, vec)| (vec, id))
-            .collect();
-        hnsw.parallel_insert(&data);
 
         Ok(Self {
-            hnsw,
+            hnsw: OnceLock::new(),
             metadata: state.metadata,
             vectors: state.vectors,
             next_id: state.next_id,
@@ -331,26 +347,17 @@ impl VectorDB {
         })
     }
 
-    /// Rebuild HNSW from persisted V2 state (skip tombstoned vectors)
+    /// Load persisted V2 state (the search graph is built on first use, without tombstones)
     fn from_state_v2(state: PersistedStateV2) -> Result<Self> {
-        let live_count = state.vectors.len().saturating_sub(state.tombstones.len());
-        let capacity = live_count.max(HNSW_MIN_CAPACITY);
-        let hnsw = make_hnsw(capacity);
-
         // Only insert non-tombstoned AND valid vectors
         let mut tombstones = state.tombstones;
         for id in invalid_vector_ids(&state.vectors, &tombstones) {
             tracing::warn!("V2 load: tombstoning invalid vector id={}", id);
             tombstones.insert(id);
         }
-        let data: Vec<(&Vec<f32>, usize)> = state.vectors.iter()
-            .filter(|(id, _)| !tombstones.contains(id))
-            .map(|(&id, vec)| (vec, id))
-            .collect();
-        hnsw.parallel_insert(&data);
 
         Ok(Self {
-            hnsw,
+            hnsw: OnceLock::new(),
             metadata: state.metadata,
             vectors: state.vectors,
             next_id: state.next_id,
@@ -439,7 +446,10 @@ impl VectorDB {
         self.next_id += 1;
 
         let vec = vector.to_vec();
-        self.hnsw.insert((&vec, id));
+        // Not built yet: the first search builds it from `vectors`, this one included.
+        if let Some(hnsw) = self.hnsw.get() {
+            hnsw.insert((&vec, id));
+        }
         self.vectors.insert(id, vec);
         self.metadata.insert(id, metadata);
 
@@ -482,8 +492,8 @@ impl VectorDB {
             })
             .collect();
 
-        if !data.is_empty() {
-            self.hnsw.parallel_insert(&data);
+        if let (false, Some(hnsw)) = (data.is_empty(), self.hnsw.get()) {
+            hnsw.parallel_insert(&data);
         }
         self.next_id = start_id + items.len();
     }
@@ -496,7 +506,7 @@ impl VectorDB {
         let extra = if self.tombstones.is_empty() { 0 } else { self.tombstones.len().min(k) };
         let fetch = k + extra;
         let ef_search = (fetch * 2).max(50);
-        let results = self.hnsw.search(query, fetch, ef_search);
+        let results = self.search_graph().search(query, fetch, ef_search);
 
         results
             .into_iter()
@@ -531,7 +541,7 @@ impl VectorDB {
         let extra = if self.tombstones.is_empty() { 0 } else { self.tombstones.len().min(k) };
         let candidates = k * 3 + extra;
         let ef_search = (candidates * 2).max(64);
-        let results = self.hnsw.search(query, candidates, ef_search);
+        let results = self.search_graph().search(query, candidates, ef_search);
 
         // Lowercase query terms for matching
         let query_lower = query_text.to_lowercase();
@@ -698,17 +708,14 @@ impl VectorDB {
             self.vectors.remove(&id);
         }
 
-        // Rebuild HNSW from live vectors
-        let capacity = self.vectors.len().max(HNSW_MIN_CAPACITY);
-        self.hnsw = make_hnsw(capacity);
-        let data: Vec<(&Vec<f32>, usize)> = self.vectors.iter()
-            .map(|(&id, vec)| (vec, id))
-            .collect();
-        if !data.is_empty() {
-            self.hnsw.parallel_insert(&data);
-        }
-
         self.tombstones.clear();
+
+        // Drop the graph; rebuild it now only if it was in use (`serve`), so a search there
+        // does not pay for the rebuild — `index` never needs it.
+        let was_built = self.hnsw.take().is_some();
+        if was_built {
+            self.warm();
+        }
     }
 
     /// Iterate over `(id, metadata)` pairs for all non-tombstoned vectors.
@@ -732,7 +739,7 @@ impl VectorDB {
 
     /// Clear all data
     pub fn clear(&mut self) {
-        self.hnsw = make_hnsw(HNSW_MIN_CAPACITY);
+        self.hnsw = OnceLock::new();
         self.metadata.clear();
         self.vectors.clear();
         self.tombstones.clear();
