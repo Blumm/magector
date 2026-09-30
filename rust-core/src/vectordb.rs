@@ -22,7 +22,7 @@ const HNSW_MIN_CAPACITY: usize = 1_000;
 /// Move a database that can't be decoded aside, keeping it for recovery.
 /// An index costs hours of CPU to build, so a decode failure — which can also
 /// come from a truncated write, not just a schema change — must never delete it.
-fn keep_incompatible_aside(path: &Path) -> Option<PathBuf> {
+pub(crate) fn keep_incompatible_aside(path: &Path) -> Option<PathBuf> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -278,7 +278,7 @@ impl VectorDB {
 
     /// Load database from a bincode file (V2 with tombstones, V1 fallback).
     /// Returns `Err` with `FormatChanged` context if the schema is incompatible.
-    fn load(path: &Path) -> Result<Self> {
+    pub(crate) fn load(path: &Path) -> Result<Self> {
         match read_persisted(path)? {
             Persisted::Empty => Ok(Self::new()),
             Persisted::V2(state) => Self::from_state_v2(state),
@@ -920,6 +920,22 @@ mod tests {
         let db = VectorDB::open(&db_path).unwrap();
         assert!(db.tombstones.contains(&0));
         assert_eq!(db.len(), 1); // b.php live
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_leaves_unreadable_db_in_place() {
+        // `serve` reloads an index.db another process replaced with `load`: a file it cannot
+        // read may be a newer magector's index, so unlike `open` it must not move it aside.
+        let dir = std::env::temp_dir().join(format!("magector_test_load_unreadable_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let db_path = dir.join("index.db");
+        let bytes = [2u8, 0xff, 0xff, 0xff, 0xff];
+        fs::write(&db_path, bytes).unwrap();
+
+        assert!(VectorDB::load(&db_path).is_err());
+        assert_eq!(fs::read(&db_path).unwrap(), bytes, "the file stays as it was");
 
         let _ = fs::remove_dir_all(&dir);
     }

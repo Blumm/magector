@@ -115,6 +115,22 @@ pub struct Indexer {
     /// Set by a full rebuild: the old sidecar is removed just before index.db is first
     /// written (`withdraw_old_sidecar`). Never set by the serve watcher.
     withdraw_sidecar: bool,
+    /// Size and mtime of index.db when this indexer last loaded or wrote it (`None`: there
+    /// was no file). Tells that another process replaced it since: see
+    /// `save_atomic_unless_replaced`.
+    db_stamp: Option<(u64, std::time::SystemTime)>,
+}
+
+/// Size and mtime of `path`, or `None` when there is no such file.
+fn file_stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let meta = fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().unwrap_or(std::time::UNIX_EPOCH)))
+}
+
+/// Whether `path` now holds a different file than the one `stamp` describes. A file that is
+/// gone does not count: writing it again undoes nobody's work.
+fn replaced_since(path: &Path, stamp: Option<(u64, std::time::SystemTime)>) -> bool {
+    file_stamp(path).is_some_and(|now| Some(now) != stamp)
 }
 
 impl Indexer {
@@ -140,6 +156,8 @@ impl Indexer {
 
         tracing::info!("Opening vector database...");
         let vectordb = VectorDB::open(db_path)?;
+        // After `open`: a file it moved aside is no longer this index.
+        let db_stamp = file_stamp(db_path);
 
         // Check AST analyzer availability (thread-local instances created per-thread)
         let php_ok = PhpAstAnalyzer::new().is_ok();
@@ -174,6 +192,7 @@ impl Indexer {
             batch_size,
             pending_manifest: None,
             withdraw_sidecar: false,
+            db_stamp,
         })
     }
 
@@ -289,10 +308,21 @@ impl Indexer {
         // not just "is path in DB".
         let manifest_path = self.db_path.as_ref()
             .map(|p| crate::watcher::FileManifest::sidecar_path(p));
+        if resume {
+            if let Some(orphan) = self.db_path.as_deref().and_then(crate::watcher::FileManifest::adopt_orphan) {
+                println!("♻️  Adopted {:?}, the manifest a pre-2.17 background re-index left behind", orphan);
+            }
+        }
+        // Whether the sidecar needs writing: always after a full run or a rebuilt manifest,
+        // after a resume only when a record changed (set below).
+        let mut manifest_changed = true;
         let mut manifest = if resume {
-            manifest_path.as_ref()
-                .and_then(|p| crate::watcher::FileManifest::load(p))
-                .unwrap_or_else(|| {
+            match manifest_path.as_ref().and_then(|p| crate::watcher::FileManifest::load(p)) {
+                Some(loaded) => {
+                    manifest_changed = false;
+                    loaded
+                }
+                None => {
                     // No usable manifest: missing (first run after upgrade), or present but
                     // unreadable. Build from filesystem (treats all indexed files as current).
                     let present = manifest_path.as_ref().is_some_and(|p| !matches!(p.try_exists(), Ok(false)));
@@ -302,12 +332,22 @@ impl Indexer {
                         already_indexed.len()
                     );
                     crate::watcher::FileManifest::from_existing_index(&self.magento_root, &already_indexed)
-                })
+                }
+            }
         } else {
             crate::watcher::FileManifest::new()
         };
 
         let (files, skipped_resume): (Vec<PathBuf>, usize) = if resume {
+            // An indexed file the manifest has no record of — a manifest rebuilt from the
+            // index, a lost record, a crash after an incremental save — is re-embedded if it
+            // is still there, and dropped if it is gone or now excluded. Untracked, it would
+            // never be reported deleted, and embedding it as new would list it twice.
+            let untracked = manifest.track_indexed(&already_indexed);
+            if untracked > 0 {
+                println!("🔎 {} indexed files have no manifest record — re-embedding the ones still there, dropping the rest", untracked);
+            }
+
             // Detect changes against manifest
             let changes = manifest.detect_changes(&self.magento_root)?;
             manifest.apply_touched(&changes.touched);
@@ -361,26 +401,6 @@ impl Indexer {
                 }
             }
 
-            // An added file that already has vectors — a crash after an incremental save, or
-            // a lost manifest record — is replaced like a modified one; embedding it on top
-            // would list it in search results twice.
-            let mut replaced = 0;
-            for path in &changes.added {
-                let relative = path
-                    .strip_prefix(&self.magento_root)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .to_string();
-                if already_indexed.contains(&relative) {
-                    self.remove_vectors_for_path(&relative);
-                    replaced += 1;
-                }
-            }
-            if replaced > 0 {
-                stats.db_changed = true;
-                println!("♻️  {} new files already had vectors in the index (an interrupted run?) — replacing them", replaced);
-            }
-
             // Tombstone vectors for deleted files
             for path in &changes.deleted {
                 if !self.remove_vectors_for_path(path).is_empty() {
@@ -393,6 +413,7 @@ impl Indexer {
             // or a manifest built from an existing index), so the next environment — a
             // checkout, `docker cp` — can tell a touched file from a modified one.
             let backfilled = manifest.backfill_hashes(&self.magento_root);
+            manifest_changed |= untracked > 0 || !changes.is_empty() || touched_count > 0 || backfilled > 0;
 
             // Compact if many tombstones
             if self.vectordb_tombstone_ratio() > 0.20 {
@@ -459,10 +480,11 @@ impl Indexer {
         if files.is_empty() {
             println!("✓ Nothing to index — all discovered files already have vectors.\n");
             stats.vectors_created = self.vectordb.len();
-            // The manifest still changes (deleted files, new stats of touched ones, backfilled
-            // hashes); the caller saves it after index.db, and saves index.db only if
-            // stats.db_changed says the vectors did.
-            if manifest_path.is_some() {
+            // The manifest can still change (deleted files, new stats of touched ones,
+            // backfilled hashes); the caller saves it after index.db, and saves index.db only
+            // if stats.db_changed says the vectors did. A run that changed no record leaves
+            // it alone, as it does index.db.
+            if manifest_path.is_some() && manifest_changed {
                 if !resume {
                     manifest = crate::watcher::FileManifest::from_existing_index(&self.magento_root, &self.indexed_paths());
                     manifest.backfill_hashes(&self.magento_root);
@@ -523,7 +545,7 @@ impl Indexer {
                         None
                     }
                     Err(e) => {
-                        tracing::debug!("Error processing {:?}: {}", file_path, e);
+                        tracing::warn!("Error processing {:?}: {:#}", file_path, e);
                         errors.fetch_add(1, Ordering::Relaxed);
                         None
                     }
@@ -647,7 +669,7 @@ impl Indexer {
             if batch_num % SAVE_INTERVAL_BATCHES == 0 {
                 if let Some(db_path) = self.db_path.clone() {
                     self.withdraw_old_sidecar()?;
-                    if let Err(e) = self.vectordb.save_atomic(&db_path) {
+                    if let Err(e) = self.write_db(&db_path, true) {
                         tracing::warn!("Incremental save failed (non-fatal): {e}");
                     } else {
                         let msg = format!("Incremental save: {} vectors written to disk", embedded);
@@ -857,7 +879,10 @@ impl Indexer {
         ast_php: bool,
         ast_js: bool,
     ) -> Result<Option<Vec<ParsedFile>>> {
-        let content = fs::read_to_string(path).context("Failed to read file")?;
+        // Lossy: PHP allows bytes 0x80-0xff in names (Symfony's ValueWrapper declares
+        // `class ©` as one Latin-1 byte) and old modules are often Latin-1 throughout, so
+        // strict UTF-8 would drop such files from the index entirely.
+        let content = String::from_utf8_lossy(&fs::read(path).context("Failed to read file")?).into_owned();
 
         if content.is_empty() {
             return Ok(None);
@@ -1475,14 +1500,54 @@ impl Indexer {
 
     /// Save the index to disk
     pub fn save(&mut self, path: &Path) -> Result<()> {
-        self.withdraw_old_sidecar()?;
-        self.vectordb.save(path)
+        self.write_db(path, false)
     }
 
     /// Crash-safe save: write to temp file, then atomic rename
     pub fn save_atomic(&mut self, path: &Path) -> Result<()> {
+        self.write_db(path, true)
+    }
+
+    /// `save_atomic` for a long-lived `serve`: refused when another process replaced
+    /// index.db since this indexer loaded or last wrote it (`magector index`, the
+    /// `magento_index` tool, another MCP instance's re-index). This copy is then older than
+    /// the file, and writing it would undo that work; the watcher loads the new file instead
+    /// (`reload_if_replaced`). An `index` run holds the re-index lock and writes regardless.
+    pub fn save_atomic_unless_replaced(&mut self, path: &Path) -> Result<()> {
+        if self.db_path.as_deref() == Some(path) && replaced_since(path, self.db_stamp) {
+            anyhow::bail!("{:?} was replaced by another process since it was loaded; not overwriting it", path);
+        }
+        self.write_db(path, true)
+    }
+
+    fn write_db(&mut self, path: &Path, atomic: bool) -> Result<()> {
         self.withdraw_old_sidecar()?;
-        self.vectordb.save_atomic(path)
+        if atomic {
+            self.vectordb.save_atomic(path)?;
+        } else {
+            self.vectordb.save(path)?;
+        }
+        if self.db_path.as_deref() == Some(path) {
+            self.db_stamp = file_stamp(path);
+        }
+        Ok(())
+    }
+
+    /// Load index.db again if another process replaced it since this indexer loaded or
+    /// last wrote it. Returns whether it did. A file that cannot be read is left in place
+    /// (it may be a newer magector's index, so it is not moved aside as `open` would) and
+    /// the index loaded before is kept.
+    pub fn reload_if_replaced(&mut self) -> Result<bool> {
+        let Some(path) = self.db_path.clone() else { return Ok(false) };
+        if !replaced_since(&path, self.db_stamp) {
+            return Ok(false);
+        }
+        // Stat before reading: a write landing in between makes the next check reload again.
+        let stamp = file_stamp(&path);
+        self.vectordb = VectorDB::load(&path)
+            .with_context(|| format!("Failed to load {:?}", path))?;
+        self.db_stamp = stamp;
+        Ok(true)
     }
 
     /// Embed a query string with the retrieval prefix for bge-small-en-v1.5.
@@ -1522,3 +1587,33 @@ impl Indexer {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_replaced_since() {
+        let dir = std::env::temp_dir().join(format!("magector_replaced_since_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("index.db");
+
+        assert!(!replaced_since(&db, None), "no file, and none was loaded");
+        fs::write(&db, b"loaded").unwrap();
+        let stamp = file_stamp(&db);
+        assert!(stamp.is_some());
+        assert!(!replaced_since(&db, stamp), "the file this indexer loaded");
+        assert!(replaced_since(&db, None), "a file another process created after none was loaded");
+
+        // Another process writes index.db the way save_atomic does: temp file, then rename.
+        let tmp = dir.join("index.db.tmp");
+        fs::write(&tmp, b"written by magector index").unwrap();
+        fs::rename(&tmp, &db).unwrap();
+        assert!(replaced_since(&db, stamp), "a replaced file");
+
+        fs::remove_file(&db).unwrap();
+        assert!(!replaced_since(&db, stamp), "a file that is gone is not a newer one");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

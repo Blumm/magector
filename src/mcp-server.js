@@ -950,7 +950,10 @@ function startServeProcess() {
     serveReadline.on('line', (line) => {
       let parsed;
       try { parsed = JSON.parse(line); } catch {
-        logToFile('WARN', `Unparseable serve stdout: ${line.slice(0, 200)}`);
+        // hnsw_rs prints this on stdout whenever it builds the search graph
+        if (!/^\s*setting number of points \d+\s*$/.test(line)) {
+          logToFile('WARN', `Unparseable serve stdout: ${line.slice(0, 200)}`);
+        }
         return;
       }
 
@@ -1375,6 +1378,12 @@ function rustSearch(query, limit = 10) {
 
 function rustIndex(magentoRoot) {
   searchCache.clear(); // invalidate cache on reindex
+  // Hold the reindex lock like `magector index`: the serve watcher defers to it instead of
+  // saving index.db while this run writes the same file, and two indexers never race.
+  const runningPid = getRunningReindexPid();
+  if (runningPid) {
+    throw new Error(`Another indexing process (PID ${runningPid}) is already running — wait for it to finish.`);
+  }
   const indexArgs = [
     'index',
     '-m', magentoRoot,
@@ -1390,6 +1399,7 @@ function rustIndex(magentoRoot) {
   // which was too short for ~80K-file enterprise Magento installs under CPU
   // constraint and caused silent re-index loops via the MCP auto-index path.
   const indexTimeout = parseInt(process.env.MAGECTOR_INDEX_TIMEOUT, 10) || 14400000;
+  writeReindexPidFile(process.pid);
   try {
     const result = execFileSync(config.rustBinary, indexArgs, { encoding: 'utf-8', timeout: indexTimeout, stdio: ['pipe', 'pipe', 'pipe'], env: rustEnv });
     return result;
@@ -1403,6 +1413,8 @@ function rustIndex(magentoRoot) {
       );
     }
     throw err;
+  } finally {
+    removeReindexPidFile();
   }
 }
 
@@ -6236,7 +6248,7 @@ const _callToolHandler = async (request) => {
         return {
           content: [{
             type: 'text',
-            text: `Indexing complete (Rust core).\n\n${output}\n\n_Method-chain enrichment index is being built in the background. Use \`magento_enrich\` to run it manually or wait ~30-60s._`
+            text: `Indexing complete (Rust core).\n\n${output}\n\n_The search server loads the new index at its next file-watcher check (within ${config.watchInterval}s). Method-chain enrichment index is being built in the background. Use \`magento_enrich\` to run it manually or wait ~30-60s._`
           }]
         };
       }

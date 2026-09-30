@@ -6,6 +6,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions corresp
 
 ## [Unreleased]
 
+### Fixed
+- **Vectors of deleted or newly excluded files stayed in the index for good** (#28). `index` and the `serve` watcher reported a file deleted only when the manifest had a record of it, and a manifest rebuilt from the index (after an upgrade or a lost sidecar) records only the files the walk still finds. Every indexed file without a record is now tracked: re-embedded when it is still there, dropped when it is gone or excluded — which is what the 2.17.0 note promised for `vendor/bin`, `dev/tools` and the other paths it excludes. On a 92.5k-file install this dropped 22 leftover vectors.
+- **`serve` wrote a stale index back over one that `magector index` had just rebuilt** (#28). `magector index` and the `magento_index` tool rewrite `index.db` while `serve` holds the previous index in memory; its watcher's next save put that copy back, and the new manifest then vouched for the stale vectors. On each check the watcher first reloads an `index.db` that another process replaced, and `serve` never writes its copy over a file that another process wrote after it was loaded. `magento_index` also takes the re-index lock, so the watcher defers to it.
+- **A `magector-core` of any version found on `PATH` was used when the platform package could not be resolved** (#28). A leftover 1.4.3 there deleted a 2.16 index it could not decode. The PATH fallback now accepts only a binary whose `--version` matches the package, and the self-heal installs the platform package of this version instead of the latest.
+- **The manifest that pre-2.17 background re-indexes left behind as `index.db.manifest` is adopted** (#28). Without it `index` treated every indexed file as current; when `index.manifest` is missing and no temp DB is in progress, the orphan now takes its place.
+- **Files that are not valid UTF-8 were skipped** — every Magento install has one: `vendor/symfony/cache/Traits/ValueWrapper.php` declares `class ©` as a Latin-1 byte, and Latin-1 legacy modules were skipped whole (#28). Sources are read lossily, and a file that still fails is logged at warn level instead of only counting as `Errors: 1`.
+- **A run that changes nothing leaves `index.manifest` alone**, as it already did `index.db` (#28).
+- **An `index.sona` that cannot be decoded is moved aside** (`.incompatible-<ts>`) instead of failing, and warning, on every start (#28).
+- The `setting number of points` line `hnsw_rs` prints on stdout is no longer logged as `Unparseable serve stdout` (#28).
+
 ## [2.17.4] - 2026-09-30
 
 ### Changed
