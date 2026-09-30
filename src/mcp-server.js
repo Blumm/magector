@@ -7420,18 +7420,25 @@ const _callToolHandler = async (request) => {
             const items = implResult.implementors.filter(pick);
             if (!items.length) continue;
             text += `#### ${title} (${items.length})\n`;
-            for (const impl of items) {
+            // Each group is capped so a wide interface (ActionInterface: ~2k classes) still shows every group.
+            for (const impl of items.slice(0, IMPLEMENTORS_PER_GROUP)) {
               const via = impl.depth > 1 ? ` — ${impl.relation} \`${impl.via}\`` : '';
               const kind = impl.kind !== 'class' ? ` [${impl.kind}]` : '';
               text += `- \`${impl.class}\`${kind}${via} (${impl.file})\n`;
+            }
+            if (items.length > IMPLEMENTORS_PER_GROUP) {
+              text += `- … ${items.length - IMPLEMENTORS_PER_GROUP} more — narrow with a more specific interface or a subclass\n`;
             }
           }
           text += '\n';
         } else if (implResult.implementors.length > 0) {
           text += `### PHP Implementors (${implResult.implementors.length})\n`;
-          for (const impl of implResult.implementors) {
+          for (const impl of implResult.implementors.slice(0, IMPLEMENTORS_PER_GROUP)) {
             const suffix = impl.matchType === 'shortName' ? ' _(short name match)_' : '';
             text += `- \`${impl.class}\` (${impl.file})${suffix}\n`;
+          }
+          if (implResult.implementors.length > IMPLEMENTORS_PER_GROUP) {
+            text += `- … ${implResult.implementors.length - IMPLEMENTORS_PER_GROUP} more — use the full interface name\n`;
           }
           text += '\n';
         }
@@ -8504,12 +8511,31 @@ const _callToolHandler = async (request) => {
   }
 };
 
+// Every tool answer passes through here: cap it so one broad query (a short class name, a
+// framework interface) cannot flood the client's context. ~10k tokens; MCP clients reject or
+// truncate far less gracefully above ~25k.
+const MAX_OUTPUT_CHARS = Number(process.env.MAGECTOR_MAX_OUTPUT_CHARS) || 40000;
+const IMPLEMENTORS_PER_GROUP = 50;
+
+function capOutput(text) {
+  if (text.length <= MAX_OUTPUT_CHARS) return text;
+  const cut = text.lastIndexOf('\n', MAX_OUTPUT_CHARS);
+  const kept = text.slice(0, cut > 0 ? cut : MAX_OUTPUT_CHARS);
+  // An odd number of ``` fences means the cut is inside a code block: close it so the note shows.
+  const fence = (kept.match(/^\s*```/gm) || []).length % 2 ? '\n```' : '';
+  return `${kept}${fence}\n\n> ✂️ **Output truncated:** ${kept.length} of ${text.length} characters shown. ` +
+    'Narrow the query (full class name, targetMethod, a namespace) to see the rest.\n';
+}
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const result = await _callToolHandler(request);
   // Append re-index warning to non-error responses during background re-index
   if (reindexInProgress && !result?.isError && result?.content?.[0]?.type === 'text') {
     const warning = getReindexWarning();
     if (warning) result.content[0].text = warning + result.content[0].text;
+  }
+  for (const c of result?.content || []) {
+    if (c.type === 'text' && typeof c.text === 'string') c.text = capOutput(c.text);
   }
   return result;
 });

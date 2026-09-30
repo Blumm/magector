@@ -354,6 +354,7 @@ The `describe` command and `magento_describe` MCP tool require an Anthropic API 
 | `MAGECTOR_THREADS` | Max ONNX intra-op + rayon parsing threads. Equivalent to the `--threads` CLI flag. | Half of CPU cores |
 | `OMP_NUM_THREADS` | Fallback thread limit if `MAGECTOR_THREADS` is not set (de facto standard for ONNX/OpenMP). | — |
 | `MAGECTOR_BATCH_SIZE` | Embedding batch size (higher = faster, more RAM). Equivalent to `--batch-size`. | `256` |
+| `MAGECTOR_MAX_OUTPUT_CHARS` | Cap on one MCP tool answer, in characters; a longer answer is cut at a line boundary with a note to narrow the query. | `40000` (~10k tokens) |
 | `ANTHROPIC_API_KEY` | API key for description generation (`describe` command) | — |
 
 These defaults apply to the Node.js CLI and the MCP server. The Rust core's own `-d` flag (see above) defaults to `./.magector/index.db` in its working directory.
@@ -471,10 +472,13 @@ affects.
 | `magento_find_event_flow`, `magento_find_event_dispatchers` | Observers: as `find_observer`. Dispatchers: exact literal `dispatch('event')` calls | the event name is computed (`dispatch($prefix . '_save_after')`) |
 | `magento_trace_dependency`, `magento_find_di_wiring` | Exact: preferences, plugins (incl. inherited), virtual types resolving to the class (transitively), DI arguments that inject it (through virtual types, preferences, Factory, Proxy); plus the effective states above | the class is only type-hinted in a constructor without a di.xml argument (see `impact_analysis`) |
 | `magento_impact_analysis` | DI references: exact (as above); API exposure: exact (`webapi.xml` services incl. interface → preference, `schema.graphqls` resolvers); PHP files: exact FQCN occurrences + semantic candidates; runtime callers: constructor-typed properties | the class is reached through an untyped variable, `ObjectManager`, or a factory result stored in a local variable |
-| `magento_find_implementors` | Exact (FQCN): everything that is `instanceof` the type — direct implementors, extending interfaces, their implementors and all subclasses, transitively, with the path; preferences per area. Short name: fuzzy (`implements` naming the short name) | a class in the chain has no readable PHP file (e.g. generated code) |
+| `magento_find_implementors` | Exact (FQCN): everything that is `instanceof` the type — direct implementors, extending interfaces, their implementors and all subclasses, transitively, with the path; preferences per area. Short name: fuzzy (`implements` naming the short name) | a class in the chain has no readable PHP file (e.g. generated code); a group holds more than 50 classes (the first 50 are listed, the rest counted) |
 
 With a **short name** (no namespace) the DI tools fall back to fuzzy matching — useful for exploring,
 not for a complete impact list.
+
+Every tool answer is capped at 40,000 characters (`MAGECTOR_MAX_OUTPUT_CHARS`); a longer answer ends with
+`Output truncated` — narrow the query (full class name, `targetMethod`, a namespace) rather than read on.
 
 Ambiguity is reported as a problem of the project, not of the tool: when two modules declare the same
 preference, plugin or observer, neither depends on the other (no `<sequence>`, no composer `require`)

@@ -37,8 +37,8 @@ function log(status, name, detail = '') {
 }
 
 class McpClient {
-  constructor({ cwd, magentoRoot, dbDir }) {
-    this.opts = { cwd, magentoRoot, dbDir };
+  constructor({ cwd, magentoRoot, dbDir, env = {} }) {
+    this.opts = { cwd, magentoRoot, dbDir, env };
     this.nextId = 1;
     this.pending = new Map();
   }
@@ -51,6 +51,7 @@ class McpClient {
         MAGENTO_ROOT: this.opts.magentoRoot,
         // Keep any index away from the fixture; the tools under test do not need one.
         MAGECTOR_DB: path.join(this.opts.dbDir, 'index.db'),
+        ...this.opts.env,
       },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -317,6 +318,21 @@ async function main() {
     });
   } finally {
     client.stop();
+  }
+
+  // ── Output cap ─────────────────────────────────────────────────
+  const LIMIT = 1200;
+  const capped = new McpClient({ cwd: FIXTURE_ROOT, magentoRoot: FIXTURE_ROOT, dbDir, env: { MAGECTOR_MAX_OUTPUT_CHARS: String(LIMIT) } });
+  await capped.start();
+  try {
+    const t = await capped.call('magento_find_plugin', { targetClass: 'Acme\\Core\\Model\\Repo', targetMethod: 'save' });
+    check('output cap: a long answer is cut at MAGECTOR_MAX_OUTPUT_CHARS with a note', t, { has: ['**Output truncated:**'] });
+    const body = t.slice(0, t.indexOf('> ✂️'));
+    const fences = (body.match(/^\s*```/gm) || []).length;
+    log(body.length <= LIMIT + 10 && fences % 2 === 0 ? 'PASS' : 'FAIL',
+      'output cap: cut at a line boundary within the limit, code fences closed', `${body.length} chars, ${fences} fences`);
+  } finally {
+    capped.stop();
   }
 
   // ── Relative MAGENTO_ROOT ──────────────────────────────────────
