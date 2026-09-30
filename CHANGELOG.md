@@ -12,6 +12,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions corresp
 - **Declarations of modules disabled in `app/etc/config.php`** are listed but marked as ignored.
 - **Interceptability.** `find_plugin` marks plugins that never run: final class, `Magento\Framework\ObjectManager\NoninterceptableInterface`, and per plugin method a final, static, non-public or never-intercepted target method (`__construct`, `_resetState`, …) or a method the class does not have.
 - **README: "How exact are the results?"** — per tool, whether the answer is exact, a marked superset, fuzzy or semantic, and when it can return less than the codebase contains.
+- **`scripts/verify-magento/`** — ground truth from a Magento installation (PHP tokenizer, DOMDocument, the running plugin list) and `compare.mjs` to check Magector against it; open items in `docs/di-resolution-todo.md`.
 - `find_class` recognises a virtual type name and shows its di.xml declaration and the class it instantiates; `impact_analysis` lists API exposure (`webapi.xml` services, `schema.graphqls` resolvers) and the DI arguments that inject the class.
 
 ### Fixed
@@ -29,7 +30,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions corresp
 - **`find_controller` returned nothing for admin routes** (the area filter compared `/adminhtml/` with `Controller/Adminhtml/`); routes are also resolved through `routes.xml` (frontName → module → controller class).
 - **`find_implementors` listed only classes whose `implements` names the interface**, missed subclasses, implementors of extending interfaces and preferences whose attributes are in `type`/`for` order, and counted commented-out preferences. For a FQCN it now returns everything that is `instanceof` the type, transitively, from a reverse class hierarchy built once per session.
 - **PHP declarations are read robustly:** group and multi-imports (`use A\\{B, C as D};`, `use A, B;`), aliases, declarations split over several lines, comments between the parts; a trait `use` inside a class body is not taken for an import; namespace aliases with relative names (`use A\\B as C;` … `implements C\\X`), enums implementing interfaces, block namespaces (`namespace X { … }`) and case-insensitive keywords.
-- **`disabled="1"` / `"0"`** (xs:boolean, as Magento's XSDs allow) is read like `true` / `false` for plugins and observers.
+- **Plugin `disabled="1"` / `"0"`** is read like `true` / `false` (`BooleanUtils`, as Magento does). For observers only `disabled="true"` disables — Magento's events converter ignores `"1"`.
 - **A relative `MAGENTO_ROOT` produced non-existent file paths** (the root segment was cut out). It is resolved to an absolute path at startup.
 
 ## [2.17.0] - 2026-09-29

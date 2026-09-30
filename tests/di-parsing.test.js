@@ -161,6 +161,12 @@ eq('event names are matched case-insensitively', parseEventsXml(
   '<config><event name="controller_action_predispatch_customer_account_loginPost"><observer name="o" instance="O"/></event></config>',
   'etc/events.xml', 'controller_action_predispatch_customer_account_loginpost').map(o => o.name), ['o']);
 
+eq('observer disabled="1" does not disable (events converter accepts only "true"); plugin disabled="1" does', [
+  parseEventsXml('<config><event name="e"><observer name="o" instance="O" disabled="1"/></event></config>', 'etc/events.xml', 'e')[0].disabled,
+  parseEventsXml('<config><event name="e"><observer name="o" instance="O" disabled="true"/></event></config>', 'etc/events.xml', 'e')[0].disabled,
+  parseDiXml('<config><type name="T"><plugin name="p" type="P" disabled="1"/></type></config>', 'etc/di.xml').types[0].plugins[0].disabled,
+], [false, true, true]);
+
 eq('config.php: comments, array(), double quotes, true/false', parseConfigPhpModules(`<?php
 return Array(
   'modules' => ARRAY(

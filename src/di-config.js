@@ -358,8 +358,11 @@ export function parseEventsXml(content, relPath, eventName) {
         name: o.attrs.name ?? '',
         instance: o.attrs.instance ? normalizeClassName(o.attrs.instance) : null,
         method: o.attrs.method || 'execute',
-        disabled: xmlBoolean(o.attrs.disabled) === true,
-        disabledAttr: xmlBoolean(o.attrs.disabled),
+        // Event\Config\Converter disables an observer only when disabled == 'true' ("1" does not disable,
+        // unlike plugins, whose value goes through BooleanUtils). A present attribute still overrides an
+        // earlier declaration of the same observer when the XML is merged.
+        disabled: o.attrs.disabled === 'true',
+        disabledAttr: o.attrs.disabled === undefined ? null : o.attrs.disabled === 'true',
         shared: o.attrs.shared ?? null,
         file: relPath,
         area,
