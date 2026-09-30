@@ -64,4 +64,5 @@
             sortOrder="10"
         />
     </type>
+    <preference for="Acme\Core\Api\ClockInterface" type="Acme\Core\Model\ModuleClock"/>
 </config>

@@ -186,7 +186,7 @@ export function buildDiModel(diFiles) {
  * declaration wins" matches Magento's merge. Call once after buildModuleIndex.
  */
 export function applyModuleOrder(model, idx) {
-  const key = d => idx.orderOf(idx.moduleOf(d.file));
+  const key = d => idx.orderOfFile(d.file);
   const byOrder = (a, b) => key(a) - key(b);
   model.preferences.sort(byOrder);
   model.virtualTypes.sort(byOrder);
@@ -779,6 +779,16 @@ export function buildModuleIndex(moduleXmls, configPhp, composerJson = () => nul
       const o = name && modules.has(name) ? modules.get(name).order : null;
       return o === null || o === undefined ? Number.MAX_SAFE_INTEGER : o;
     },
+    /**
+     * Load position of a config file. Magento reads app/etc/di.xml and app/etc/*\/di.xml (primary
+     * scope) before any module, and never reads a file outside app/etc and the modules — a
+     * dev/tests sandbox, the magento2-base copy of app/etc, an unregistered copy of a module — so
+     * those rank lowest and never override real configuration.
+     */
+    orderOfFile(relPath, module = this.moduleOf(relPath)) {
+      if (module) return this.orderOf(module);
+      return /^app\/etc\/(?:[^/]+\/)?[^/]+\.xml$/.test(relPath || '') ? -1 : -2;
+    },
     dependsOn,
   };
 }
@@ -794,7 +804,7 @@ export function orderDeclarations(decls, idx, area = 'global', conflicts = () =>
   const disabledModule = withModule.filter(d => idx.isEnabled(d.module) === false);
   const scoped = withModule
     .filter(d => idx.isEnabled(d.module) !== false && (d.area === 'global' || d.area === area))
-    .map(d => ({ d, scope: d.area === 'global' ? 0 : 1, order: idx.orderOf(d.module) }))
+    .map(d => ({ d, scope: d.area === 'global' ? 0 : 1, order: idx.orderOfFile(d.file, d.module) }))
     .sort((a, b) => a.scope - b.scope || a.order - b.order);
   const ambiguous = [];
   for (let i = 0; i < scoped.length; i++) {

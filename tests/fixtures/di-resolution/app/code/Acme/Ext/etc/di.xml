@@ -4,6 +4,12 @@
     <type name="Acme\Core\Model\Repo">
         <plugin name="core_disable_me" disabled="true"/>
     </type>
+    <!-- a comment opener inside CDATA is text: the declarations after it must still be read -->
+    <type name="Acme\Ext\Model\Banner">
+        <arguments>
+            <argument name="header" xsi:type="string"><![CDATA[<!-- banner start ]]></argument>
+        </arguments>
+    </type>
     <preference for="Acme\Core\Plugin\BasePlugin" type="Acme\Ext\Plugin\OverridePlugin"/>
     <virtualType name="Acme\Ext\Model\Repo" type="Acme\Core\Model\BaseService"/>
     <virtualType name="Acme\Ext\Model\OtherVirtual" type="Acme\Ext\Model\Repo"/>
