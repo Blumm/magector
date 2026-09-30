@@ -6,6 +6,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions corresp
 
 ## [Unreleased]
 
+## [2.17.5] - 2026-09-30
+
 ### Fixed
 - **Vectors of deleted or newly excluded files stayed in the index for good** (#28). `index` and the `serve` watcher reported a file deleted only when the manifest had a record of it, and a manifest rebuilt from the index (after an upgrade or a lost sidecar) records only the files the walk still finds. Every indexed file without a record is now tracked: re-embedded when it is still there, dropped when it is gone or excluded — which is what the 2.17.0 note promised for `vendor/bin`, `dev/tools` and the other paths it excludes. On a 92.5k-file install this dropped 22 leftover vectors.
 - **`serve` wrote a stale index back over one that `magector index` had just rebuilt** (#28). `magector index` and the `magento_index` tool rewrite `index.db` while `serve` holds the previous index in memory; its watcher's next save put that copy back, and the new manifest then vouched for the stale vectors. On each check the watcher first reloads an `index.db` that another process replaced, and `serve` never writes its copy over a file that another process wrote after it was loaded. `magento_index` also takes the re-index lock, so the watcher defers to it.
