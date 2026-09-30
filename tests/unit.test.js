@@ -18,6 +18,7 @@ import { getRunningIndexPid, writeIndexPidFile, removeIndexPidFile, lockPathFor 
 import { shouldRespawnServe, MAX_RESPAWNS_PER_WINDOW, RESPAWN_WINDOW_MS, RESPAWN_BASE_DELAY_MS } from '../src/serve-respawn.js';
 import { defaultDbPath, dbPathForRoot, manifestPath, tempDbPathFor, swapInIndex } from '../src/paths.js';
 import { modelDownloadDir, downloadFile } from '../src/model.js';
+import { binaryVersion, acceptPathBinary } from '../src/binary.js';
 import { mcpServerEnv } from '../src/init.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -4837,6 +4838,7 @@ async function main() {
   testManifestPath();
   testTempDbPathFor();
   testSwapInIndex();
+  testPathBinaryVersionCheck();
   testModelDownloadDir();
   await testDownloadFile();
   testMcpServerEnv();
@@ -5336,6 +5338,35 @@ function testTempDbPathFor() {
       `${manifestPath(db)} vs ${manifestPath(tempDbPathFor(db))}`
     );
     assert(tempDbPathFor(db) !== db, `Temp DB of "${name}" is not the live DB`);
+  }
+}
+
+function testPathBinaryVersionCheck() {
+  console.log('\n🔧 acceptPathBinary (a magector-core on PATH must be the package version)');
+  if (process.platform === 'win32') { console.log('  (skipped on Windows)'); return; }
+  const dir = path.join(__dirname, 'tmp_path_binary_test');
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(dir, { recursive: true });
+  const fake = (name, out) => {
+    const p = path.join(dir, name);
+    writeFileSync(p, `#!/bin/sh\necho "${out}"\n`, { mode: 0o755 });
+    return p;
+  };
+  const refusal = (bin) => { try { acceptPathBinary(bin, '2.17.4'); } catch (e) { return e.message; } return null; };
+  try {
+    const current = fake('current', 'magector 2.17.4');
+    const old = fake('old', 'magector 1.4.3');
+    const silent = fake('silent', '');
+    assertEq(binaryVersion(current), '2.17.4', 'Reads the version `magector-core --version` prints');
+    assertEq(binaryVersion(silent), null, 'No version in the output: null');
+    assertEq(binaryVersion(path.join(dir, 'missing')), null, 'A binary that cannot run: null');
+    assertEq(acceptPathBinary(current, '2.17.4'), current, 'A binary of the package version is used');
+    // A leftover 1.4.3 on PATH once deleted a 2.16 index it could not decode
+    assertIncludes(refusal(old), 'version 1.4.3', 'An older binary is refused, naming its version');
+    assertIncludes(refusal(old), 'MAGECTOR_BIN', 'The refusal names the explicit override');
+    assertIncludes(refusal(silent), 'unknown version', 'A binary whose version cannot be read is refused');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 }
 

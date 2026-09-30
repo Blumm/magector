@@ -111,7 +111,7 @@ The MCP server (`src/mcp-server.js`, 20 tools) wraps the same binary in a persis
 1. `MAGECTOR_BIN` env var
 2. `@magector/cli-{os}-{arch}` npm optional dependency — if missing, auto-runs `npm install --no-save` to recover
 3. `rust-core/target/release/magector-core` (local dev build)
-4. `magector-core` in system PATH
+4. `magector-core` in system PATH — only when its `--version` matches the package version (anything else is refused; `MAGECTOR_BIN` runs a specific binary)
 
 ### Cross-Platform Distribution
 

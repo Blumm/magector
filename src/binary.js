@@ -5,7 +5,7 @@
  * 1. MAGECTOR_BIN env var
  * 2. @magector/cli-{os}-{arch} optionalDependency
  * 3. rust-core/target/release/magector-core (dev fallback)
- * 4. magector-core in PATH
+ * 4. magector-core in PATH, only of this package's version
  */
 import { existsSync, chmodSync } from 'fs';
 import { execFileSync } from 'child_process';
@@ -17,6 +17,34 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 
 const BINARY_NAME = process.platform === 'win32' ? 'magector-core.exe' : 'magector-core';
+const PACKAGE_VERSION = require('../package.json').version;
+const PLATFORM_PKG = `@magector/cli-${process.platform}-${process.arch}`;
+
+/** The version `magector-core --version` reports ("magector X.Y.Z"), or null. */
+export function binaryVersion(binPath) {
+  try {
+    const out = execFileSync(binPath, ['--version'], { encoding: 'utf-8', timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'] });
+    return out.match(/\b(\d+\.\d+\.\d+\S*)/)?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A magector-core found on PATH, if it is this package's version. Any other version is
+ * refused: nothing on PATH is guaranteed to match, an old one cannot read the current index
+ * format, and before 2.16.21 a `stats` that could not decode an index deleted it (a leftover
+ * 1.4.3 on PATH wiped a 92k-file index that way). MAGECTOR_BIN runs a specific binary.
+ */
+export function acceptPathBinary(binPath, expected = PACKAGE_VERSION) {
+  const found = binaryVersion(binPath);
+  if (found === expected) return binPath;
+  throw new Error(
+    `magector-core on PATH (${binPath}) is ${found ? `version ${found}` : 'of an unknown version'}, but magector is ${expected}.\n` +
+    `Install the platform package: npm install ${PLATFORM_PKG}@${expected}\n` +
+    `Or set MAGECTOR_BIN to run that binary anyway.`
+  );
+}
 
 export function resolveBinary() {
   // 1. Explicit env var
@@ -28,7 +56,7 @@ export function resolveBinary() {
   }
 
   // 2. Platform-specific npm package
-  const platformPkg = `@magector/cli-${process.platform}-${process.arch}`;
+  const platformPkg = PLATFORM_PKG;
   try {
     const pkgDir = path.dirname(require.resolve(`${platformPkg}/package.json`));
     const binPath = path.join(pkgDir, 'bin', BINARY_NAME);
@@ -43,7 +71,9 @@ export function resolveBinary() {
     // Package not installed — try to self-heal by installing it
     try {
       const pkgRoot = path.join(__dirname, '..');
-      execFileSync('npm', ['install', '--no-save', platformPkg], {
+      // This package's version: an unpinned install takes the latest, which can be a
+      // different binary than the JS it runs under.
+      execFileSync('npm', ['install', '--no-save', `${platformPkg}@${PACKAGE_VERSION}`], {
         cwd: pkgRoot,
         timeout: 60000,
         stdio: ['pipe', 'pipe', 'pipe']
@@ -69,16 +99,18 @@ export function resolveBinary() {
   }
 
   // 4. Global PATH
+  let pathBinary = null;
   try {
     const which = process.platform === 'win32' ? 'where' : 'which';
     const result = execFileSync(which, ['magector-core'], {
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe']
     }).trim();
-    if (result) return result.split('\n')[0];
+    pathBinary = result.split('\n')[0].trim() || null;
   } catch {
     // Not in PATH
   }
+  if (pathBinary) return acceptPathBinary(pathBinary);
 
   throw new Error(
     `Could not find magector-core binary.\n` +
