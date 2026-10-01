@@ -5,11 +5,12 @@
  *   node compare.mjs php     <magento-root> php-truth.json
  *   node compare.mjs xml     <magento-root> xml-truth.json
  *   node compare.mjs plugins <magento-root> runtime-plugins.json [area]
- *   node compare.mjs webapi|graphql|cron|dbschema <magento-root> <kind>-truth.json   (config-truth.php)
+ *   node compare.mjs webapi|graphql|cron|dbschema|modules|trace_api <magento-root> <kind>-truth.json   (config-truth.php)
  *
  * php     — src/di-config.js class / method reading vs PHP's tokenizer
  * xml     — src/di-config.js di.xml / events.xml reading vs DOMDocument (and files Magento rejects)
  * plugins — magento_find_plugin (MCP server, structural part) vs the plugins Magento runs
+ * trace_api — magento_trace_api (MCP server) per route vs the route, service and the class Magento creates (webapi_rest)
  * webapi / graphql / cron / dbschema — src/magento-config.js merged models vs what Magento reads
  *           (routes → service, type fields → resolver, cron jobs, declared tables / columns / keys).
  *           Missing = Magector returns less (must be 0); extra = more (listed, should be explainable)
@@ -35,7 +36,7 @@ import { glob } from 'glob';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const [mode, rootArg, truthFile, areaArg] = process.argv.slice(2);
 if (!mode || !rootArg || !truthFile) {
-  console.error('usage: node compare.mjs php|xml|plugins|webapi|graphql|cron|dbschema|modules <magento-root> <truth.json> [area]');
+  console.error('usage: node compare.mjs php|xml|plugins|webapi|graphql|cron|dbschema|modules|trace_api <magento-root> <truth.json> [area]');
   process.exit(2);
 }
 const root = path.resolve(rootArg);
@@ -111,10 +112,8 @@ if (mode === 'xml') {
   process.exit(bad.length ? 1 : 0);
 }
 
-if (mode === 'plugins') {
-  const area = areaArg || 'global';
-  const expected = truth[area];
-  if (!expected) { console.error(`no area "${area}" in ${truthFile}`); process.exit(2); }
+/** The MCP server on the root (structural answers need no index); call(name, args) → the answer's text. */
+async function mcpClient() {
   const child = spawn(process.execPath, [path.join(__dirname, '..', '..', 'src', 'mcp-server.js')], {
     cwd: root,
     env: { ...process.env, MAGENTO_ROOT: root },
@@ -135,12 +134,22 @@ if (mode === 'plugins') {
   });
   await request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'verify', version: '1' } });
   child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+  return {
+    call: async (name, args) => ((await request('tools/call', { name, arguments: args })).result?.content || []).map(c => c.text || '').join('\n'),
+    stop: () => child.kill(),
+  };
+}
+
+if (mode === 'plugins') {
+  const area = areaArg || 'global';
+  const expected = truth[area];
+  if (!expected) { console.error(`no area "${area}" in ${truthFile}`); process.exit(2); }
+  const mcp = await mcpClient();
 
   let tp = 0, fn = 0, fp = 0;
   const missed = [], extraActive = [];
   for (const [cls, want] of Object.entries(expected)) {
-    const res = await request('tools/call', { name: 'magento_find_plugin', arguments: { targetClass: cls } });
-    const text = (res.result?.content || []).map(c => c.text || '').join('\n');
+    const text = await mcp.call('magento_find_plugin', { targetClass: cls });
     const regs = [...text.matchAll(/^- \*\*(.+?)\*\* → (?:`[^`]*`|_\(no type[^)]*\)_)(?: \(virtual type of `[^`]*`\))? \[([a-z_]+)\]([^\n]*)/gm)];
     const byName = new Map();
     for (const [, name, a, rest] of regs) {
@@ -156,7 +165,7 @@ if (mode === 'plugins') {
     for (const w of wantSet) { if (byName.has(w)) tp++; else { fn++; missed.push(`${cls}: ${w}`); } }
     for (const a of active) if (!wantSet.has(a)) { fp++; extraActive.push(`${cls}: ${a}`); }
   }
-  child.kill();
+  mcp.stop();
   const total = tp + fn;
   console.log(`area ${area}: classes ${Object.keys(expected).length}, plugins that run ${total}`);
   console.log(`recall ${total ? Math.round((100 * tp) / total) : 100} % (${tp}/${total}), reported as running but do not: ${fp}`);
@@ -164,6 +173,26 @@ if (mode === 'plugins') {
   process.exit(fn + fp ? 1 : 0);
 }
 
+
+if (mode === 'trace_api') {
+  // magento_trace_api on every route: the route it picks, the service interface::method and the class
+  // that runs for the service in webapi_rest must be Magento's
+  const mcp = await mcpClient();
+  const bad = [];
+  for (const r of truth) {
+    const t = await mcp.call('magento_trace_api', { url: r.url, method: r.method });
+    const url = t.match(/\*\*URL:\*\* `(\S+) ([^`]+)`/);
+    const iface = t.match(/\*\*Interface:\*\* `([^`]+)::([^`(]+)\(\)`/);
+    const impl = t.match(/\*\*Class:\*\* `([^`]+)`/);
+    const got = { url: url?.[2], method: url?.[1], class: iface?.[1], serviceMethod: iface?.[2], runs: impl ? impl[1] : iface?.[1] };
+    const diff = ['url', 'method', 'class', 'serviceMethod', 'runs'].filter(k => got[k] !== r[k]);
+    if (diff.length) bad.push(`${r.method} ${r.url}: ${diff.map(k => `${k} Magento ${r[k]}, Magector ${got[k]}`).join('; ')}`);
+  }
+  mcp.stop();
+  console.log(`trace_api: ${truth.length - bad.length}/${truth.length} routes agree (route, interface::method, class that runs in webapi_rest)`);
+  show('different', bad);
+  process.exit(bad.length ? 1 : 0);
+}
 
 if (['webapi', 'graphql', 'cron', 'dbschema', 'modules'].includes(mode)) {
   // the module discovery the MCP server uses (registrations), so the check covers it too
