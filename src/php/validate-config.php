@@ -61,6 +61,15 @@ $argumentInterpreter = (static function () {
 })();
 
 $urnResolver = new UrnResolver();
+
+// Converters are created before Magento's ErrorHandler is installed: on PHP 8.4 compiling Mapper\Dom of
+// Magento <= 2.4.7 raises E_DEPRECATED ("Implicitly marking parameter … as nullable"), which the handler
+// would turn into an exception and report every di.xml as failing (review of #31)
+$diMapper = new DiMapper($argumentInterpreter);
+$eventConverter = new EventConverter();
+$magentoErrorHandler = new ErrorHandler();
+$errorHandler = static fn(int $no, string $str, string $file = '', int $line = 0) =>
+    ($no & (E_DEPRECATED | E_USER_DEPRECATED)) ? true : $magentoErrorHandler->handler($no, $str, $file, $line);
 $files = [];
 $scopes = ['di' => ['primary' => true, 'global' => true], 'events' => ['global' => true]];
 foreach ($args['files'] as $file) {
@@ -92,9 +101,9 @@ foreach ($args['files'] as $file) {
 
     [$dom, $entry['production']] = $load($path, $xml, null);
     if ($dom && $kind) {
-        set_error_handler([new ErrorHandler(), 'handler']);
+        set_error_handler($errorHandler);
         try {
-            ($kind === 'di' ? new DiMapper($argumentInterpreter) : new EventConverter())->convert($dom->getDom());
+            ($kind === 'di' ? $diMapper : $eventConverter)->convert($dom->getDom());
         } catch (\Throwable $e) {
             $entry['convert'] = $describe($e);
         } finally {
@@ -119,6 +128,11 @@ foreach ($args['files'] as $file) {
 $scopeResults = [];
 $scopeError = null;
 try {
+    // ObjectManagerFactory calls GeneratedFiles::cleanGeneratedFiles(): with var/.regenerate present it
+    // deletes generated/code, generated/metadata and var/cache — never do that from a check
+    if (is_file($root . '/var/.regenerate')) {
+        throw new \RuntimeException('var/.regenerate exists — bootstrapping Magento would delete generated/ and var/cache');
+    }
     $objectManager = Bootstrap::create($root, $_SERVER)->getObjectManager();
     $readers = ['di' => DiReader::class, 'events' => EventReader::class];
     foreach ($scopes as $kind => $names) {

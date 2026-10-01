@@ -41,6 +41,7 @@ Still open:
 | A8 | Native developer-mode verdicts cover DI and events only; other readers (`crontab.xml`, `routes.xml`, `webapi.xml`, `system.xml`, …) get the declared-schema check, which Magento's reader may not apply (`module.xml` is read without a schema). |
 | A9 | Built-in: `const` / `init_parameter` arguments (needs PHP's `defined()`); nested-array `SortItems` order is approximated (single-level stable sort) — affects only which of several errors is first. |
 | A10 | Native run over a whole project: ~10 s (3,077 files, 15 areas), no cache between calls. |
+| A10b | PHP 8.4 with Magento ≤ 2.4.7: the converters are now created before Magento's ErrorHandler and E_DEPRECATED is ignored under it (review of #31) — not run on PHP 8.4 here. |
 
 ## A2. Structural answers — done: `find_api`, `find_graphql`, `find_cron`, `find_db_schema`, `module_structure`
 

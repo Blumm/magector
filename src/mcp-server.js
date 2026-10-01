@@ -14,7 +14,7 @@ import {
   ListResourcesRequestSchema,
   ReadResourceRequestSchema
 } from '@modelcontextprotocol/sdk/types.js';
-import { execFileSync, spawn, spawnSync } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import { createInterface } from 'readline';
 import { createServer as createNetServer, createConnection } from 'net';
 import { existsSync, statSync, unlinkSync, copyFileSync, appendFileSync, writeFileSync, readFileSync, readdirSync, mkdirSync, openSync, closeSync, chmodSync, constants as fsConstants } from 'fs';
@@ -5679,7 +5679,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'magento_validate_config',
-      description: 'Check configuration XML the way Magento loads it, with Magento\'s own messages: files Magento rejects in every mode (not well-formed XML; values its converters reject — plugin disabled / type shared outside true/false/1/0, missing name, unknown nodes, invalid DI argument values), schema (XSD) errors that fail in developer mode, and values read differently than written (observer disabled other than "true", non-integer sortOrder). Native when PHP 8.1+ can run the Magento root — MAGECTOR_PHP (e.g. "docker exec -i -u www-data <container> php") with MAGECTOR_PHP_ROOT (the Magento root as PHP sees it), or `php` on PATH; otherwise a built-in check (first libxml error and the converter rules, no XSD). Run it when a DI / event answer warns about configuration problems, or after editing config XML.',
+      description: 'Check configuration XML the way Magento loads it, with Magento\'s own messages: files Magento rejects in every mode (not well-formed XML; values its converters reject — plugin disabled / type shared outside true/false/1/0, missing name, unknown nodes, invalid DI argument values), schema (XSD) errors that fail in developer mode, and values read differently than written (observer disabled other than "true", non-integer sortOrder). Native only when MAGECTOR_PHP names the PHP command (e.g. "docker exec -i -u www-data <container> php") with MAGECTOR_PHP_ROOT (the Magento root as PHP sees it); otherwise a built-in check (first libxml error and the converter rules, no XSD). Run it when a DI / event answer warns about configuration problems, or after editing config XML.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -5690,7 +5690,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           engine: {
             type: 'string',
             enum: ['auto', 'native', 'builtin'],
-            description: 'auto (default): native when PHP is available, else built-in. native: fail when PHP is not available.'
+            description: 'auto (default): native when MAGECTOR_PHP is set, else built-in. native: fail when it is not set.'
           }
         }
       }
@@ -8741,7 +8741,6 @@ async function moduleStructureText(root, { moduleName = '' } = {}, { compact = f
 
 const CONFIG_TEST_DIRS = ['**/dev/tests/**', '**/Test/**', '**/tests/**', '**/node_modules/**'];
 const configCheckCache = new Map();          // absPath → { mtimeMs, size, problems }
-const configPathsCache = { root: null, paths: null };
 
 /** Built-in problems of one file, cached until the file changes. */
 function builtinConfigProblems(root, relPath) {
@@ -8752,39 +8751,64 @@ function builtinConfigProblems(root, relPath) {
   if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.problems;
   let content;
   try { content = readFileSync(abs, 'utf-8'); } catch { return []; }
-  const xml = checkXmlWellFormed(content);
+  let xml;
   let problems;
+  try { xml = checkXmlWellFormed(content); } catch (e) {
+    problems = [{ severity: 'warning', line: 0, message: `not checked: ${e.message}` }];
+    configCheckCache.set(abs, { mtimeMs: st.mtimeMs, size: st.size, problems });
+    return problems;
+  }
   if (content === '') {
     problems = [{ severity: 'error', line: 0, message: `ValueError: ${xml[0].message}` }];
   } else if (xml.length) {
     problems = [{ severity: 'error', line: xml[0].line, message: magentoInvalidXmlMessage(abs, xml) }];
   } else {
-    problems = /(^|\/)(di|events)\.xml$/.test(relPath) ? checkConfigValues(content, relPath) : [];
+    try {
+      problems = /(^|\/)(di|events)\.xml$/.test(relPath) ? checkConfigValues(content, relPath) : [];
+    } catch (e) {                                                   // e.g. RangeError on a very deep <item> nesting
+      problems = [{ severity: 'warning', line: 0, message: `values not checked: ${e.message}` }];
+    }
   }
   configCheckCache.set(abs, { mtimeMs: st.mtimeMs, size: st.size, problems });
   return problems;
 }
 
-/** The PHP that can run the Magento root: MAGECTOR_PHP, or php 8.1+ on PATH. */
+/**
+ * The PHP that runs the native check — only when MAGECTOR_PHP names it. Never picked up from PATH:
+ * the check loads the project's autoloader and bootstraps Magento (review of #31: an agent calling
+ * the tool would otherwise run host PHP against the project, with Magento's side effects).
+ */
 function nativePhp(root) {
   if (process.env.MAGECTOR_PHP) return { cmd: process.env.MAGECTOR_PHP, root: process.env.MAGECTOR_PHP_ROOT || root };
-  if (!existsSync(path.join(root, 'app', 'autoload.php'))) return { reason: 'no app/autoload.php in the Magento root' };
-  try {
-    execFileSync('php', ['-r', 'exit(PHP_VERSION_ID >= 80100 ? 0 : 1);'], { stdio: 'ignore', timeout: 10000 });
-  } catch {
-    return { reason: 'no PHP 8.1+ on PATH — set MAGECTOR_PHP (e.g. "docker exec -i -u www-data <container> php") and MAGECTOR_PHP_ROOT' };
-  }
-  return { cmd: 'php', root };
+  return { reason: 'MAGECTOR_PHP is not set — the native check runs only on an explicit PHP command (e.g. "docker exec -i -u www-data <container> php", with MAGECTOR_PHP_ROOT)' };
 }
 
+/** Runs a command with the program on stdin, without blocking the server (review of #31). */
+function runAsync(cmd, input, timeoutMs) {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, { shell: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => { child.kill('SIGKILL'); stderr += `\n(killed after ${timeoutMs / 1000} s)`; }, timeoutMs);
+    child.stdout.on('data', d => { stdout += d; });
+    child.stderr.on('data', d => { stderr += d; });
+    child.on('error', e => { clearTimeout(timer); resolve({ status: null, stdout, stderr, error: e }); });
+    child.on('close', status => { clearTimeout(timer); resolve({ status, stdout, stderr }); });
+    child.stdin.on('error', () => { /* the command exited before reading */ });
+    child.stdin.end(input);
+  });
+}
+
+const NATIVE_TIMEOUT_MS = Number(process.env.MAGECTOR_PHP_TIMEOUT_MS) || 120000;
+
 /** Runs src/php/validate-config.php; returns { php, libxml, root, files, command } or { error }. */
-function runNativeConfigCheck(root, relPaths) {
+async function runNativeConfigCheck(root, relPaths) {
   const php = nativePhp(root);
   if (!php.cmd) return { error: php.reason };
   const script = readFileSync(new URL('./php/validate-config.php', import.meta.url), 'utf-8');
   const payload = Buffer.from(JSON.stringify({ root: php.root, files: relPaths })).toString('base64');
   const program = `<?php $magectorArgs = json_decode(base64_decode('${payload}'), true); ?>` + script;
-  const r = spawnSync(php.cmd, { shell: true, input: program, encoding: 'utf-8', maxBuffer: 512 * 1024 * 1024, timeout: 600000 });
+  const r = await runAsync(php.cmd, program, NATIVE_TIMEOUT_MS);
   const marker = (r.stdout || '').lastIndexOf('@@MAGECTOR-VALIDATE-CONFIG@@');
   if (marker < 0) {
     return { error: `${php.cmd} failed (exit ${r.status}): ${((r.stderr || '') + (r.stdout || '')).trim().slice(0, 800) || r.error?.message || 'no output'}` };
@@ -8796,13 +8820,9 @@ function runNativeConfigCheck(root, relPaths) {
   }
 }
 
-/** di.xml and events.xml files Magento can load (tests excluded), cached per session. */
+/** di.xml and events.xml files of the registered modules and app/etc (moduleEtcGlob keeps it current). */
 async function getLoadedConfigPaths(root) {
-  if (configPathsCache.root !== root || !configPathsCache.paths) {
-    configPathsCache.root = root;
-    configPathsCache.paths = await moduleEtcGlob(root, '**/etc/**/{di,events}.xml');
-  }
-  return configPathsCache.paths;
+  return moduleEtcGlob(root, '**/etc/**/{di,events}.xml');
 }
 
 /** "(module X is disabled — Magento does not load it now)" for a file of a disabled module. */
@@ -8814,7 +8834,10 @@ function moduleStateNote(idx, relPath) {
 async function validateConfigText(root, { path: scope, engine = 'auto' }) {
   let relPaths;
   if (scope) {
-    const rel = scope.replace(/^\/+/, '').replace(/\/+$/, '');
+    // Confined to the Magento root, as magento_grep / magento_read (review of #31: "/" walked the disk)
+    const raw = String(scope);
+    const rel = safeRelPath(root, raw.length > 1 ? raw.replace(/\/+$/, '') : raw);
+    if (!rel) return `## Configuration check\n\n\`${scope}\` is outside the Magento root (${root}).\n`;
     let st = null;
     try { st = statSync(path.join(root, rel)); } catch { /* reported below */ }
     if (!st) return `## Configuration check\n\n\`${rel}\` does not exist under the Magento root (${root}).\n`;
@@ -8832,7 +8855,7 @@ async function validateConfigText(root, { path: scope, engine = 'auto' }) {
 
   let native = null;
   if (engine !== 'builtin' && relPaths.length) {
-    native = runNativeConfigCheck(root, relPaths);
+    native = await runNativeConfigCheck(root, relPaths);
     if (native.error) {
       if (engine === 'native') return `## Configuration check\n\nNative check not available: ${native.error}\n`;
       notes.push(`Native check not available (${native.error}); built-in check used.`);
@@ -8926,7 +8949,11 @@ async function configProblemsNotice(root, answerText) {
     for (const p of builtinConfigProblems(root, rel)) {
       const where = `\`${rel}${p.line ? ':' + p.line : ''}\``;
       const first = p.message.split('\n').find(l => l.trim() && !l.startsWith('The XML in file')) || p.message;
-      if (p.severity === 'error' && idx.isEnabled(idx.moduleOf(rel)) !== false) {
+      // Loaded = enabled in config.php (a module registered but not yet in config.php — right after
+      // `composer require`, before setup:upgrade — is not loaded); without config.php every module
+      const mod = idx.moduleOf(rel);
+      const loaded = !mod || idx.orderSource !== 'config.php' || idx.isEnabled(mod) === true;
+      if (p.severity === 'error' && loaded) {
         rejected.push(`${where} — ${first.trim()}`);
         rejectedFiles.add(rel);
       }
@@ -8963,8 +8990,13 @@ function capOutput(text) {
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const result = await _callToolHandler(request);
   if (CONFIG_AWARE_TOOLS.has(request.params?.name) && !result?.isError && result?.content?.[0]?.type === 'text') {
-    const notice = await configProblemsNotice(config.magentoRoot, result.content[0].text);
-    if (notice) result.content[0].text = notice + result.content[0].text;
+    // The notice is an addition: if it fails, the computed answer stands (review of #31)
+    try {
+      const notice = await configProblemsNotice(config.magentoRoot, result.content[0].text);
+      if (notice) result.content[0].text = notice + result.content[0].text;
+    } catch (e) {
+      logToFile('ERR', `config notice: ${e.message}`);
+    }
   }
   // Append re-index warning to non-error responses during background re-index
   if (reindexInProgress && !result?.isError && result?.content?.[0]?.type === 'text') {

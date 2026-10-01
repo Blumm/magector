@@ -65,9 +65,9 @@ Pick classes the project plugs into — those are the ones a change-impact searc
 
 Example (Mage-OS 2.4.9 project, ~190 custom modules): php 0 differences on 18,419 classes; xml 0
 differences on 999 files; plugins 37/37 (global) and 40/40 (graphql) on 18 classes, 0 reported as
-running that do not (2.17.0: 25/37 and 3); config: same first fatal error on 3,835 files with syntax
-edits, same converter verdict on 3,500 files with value edits (3,049 converter exceptions, PHP 8.3 /
-libxml 2.9.14); `const` / `init_parameter` arguments are listed as native-only; webapi 446/446 routes,
+running that do not (2.17.0: 25/37 and 3); config: same first fatal error on 2,000 files with syntax
+edits (1,384 not well-formed), same converter verdict on 3,000 files with value edits (2,518 converter
+exceptions, PHP 8.3 / libxml 2.9.14; `mutate-xml.mjs` prints the distribution of its edits); `const` / `init_parameter` arguments are listed as native-only; webapi 446/446 routes,
 graphql 4,538/4,538 fields from schema.graphqls (+ 38 from EAV readers, noted), cron 81/81 (3 through
 core_config_data, noted), dbschema 507/507 tables, modules 598/598, trace_api 446/446 routes (route, service, class that runs). Method and reasons:
 [docs/verification.md](../../docs/verification.md).

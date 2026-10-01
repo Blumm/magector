@@ -1239,10 +1239,11 @@ export function checkXmlWellFormed(content) {
       continue;
     }
     // start tag
+    // After the root element, any '<' (not a comment / PI) is extra content — libxml says so first
+    if (rootClosed) return err(i, 'Extra content at the end of the document');
     XML_NAME.lastIndex = i + 1;
     const nm = XML_NAME.exec(src);
     if (!nm) return err(i, 'StartTag: invalid element name');
-    if (rootClosed) return err(i, 'Extra content at the end of the document');
     const name = nm[0];
     const tagLine = lineAt(i);
     let j = XML_NAME.lastIndex;

@@ -14,7 +14,7 @@
 
 import { spawn } from 'child_process';
 import { createInterface } from 'readline';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, rmSync, cpSync, writeFileSync, mkdirSync, chmodSync, readFileSync } from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -25,6 +25,10 @@ const FIXTURE_ROOT = path.join(__dirname, 'fixtures', 'validate-config');
 
 let passed = 0;
 let failed = 0;
+
+function ok(name, cond, detail = '') {
+  if (cond) { passed++; console.log(`  \x1b[32m✓\x1b[0m ${name}`); } else { failed++; console.log(`  \x1b[31m✗\x1b[0m ${name}${detail ? ` — ${detail}` : ''}`); }
+}
 
 function check(name, text, { has = [], hasNot = [] }) {
   const missing = has.filter(s => !text.includes(s));
@@ -43,8 +47,9 @@ function check(name, text, { has = [], hasNot = [] }) {
 }
 
 class McpClient {
-  constructor(env) {
+  constructor(env, root = FIXTURE_ROOT) {
     this.env = env;
+    this.root = root;
     this.nextId = 1;
     this.pending = new Map();
   }
@@ -52,10 +57,10 @@ class McpClient {
   async start() {
     this.dbDir = mkdtempSync(path.join(os.tmpdir(), 'magector-vc-'));
     this.child = spawn(process.execPath, [SERVER_PATH], {
-      cwd: FIXTURE_ROOT,
+      cwd: this.root,
       env: {
         ...process.env,
-        MAGENTO_ROOT: FIXTURE_ROOT,
+        MAGENTO_ROOT: this.root,
         MAGECTOR_DB: path.join(this.dbDir, 'index.db'),
         MAGECTOR_AUTO_INDEX: '0',
         MAGECTOR_PHP: '',
@@ -107,12 +112,12 @@ async function main() {
   console.log('\nConfiguration validation (fixture: tests/fixtures/validate-config)\n');
 
   // ── Built-in check ─────────────────────────────────────────────
-  const builtin = new McpClient({});   // the fixture has no app/autoload.php → built-in
+  const builtin = new McpClient({});   // MAGECTOR_PHP unset → built-in
   await builtin.start();
   try {
     let t = await builtin.call('magento_validate_config', {});
     check('built-in: engine and fallback reason are stated', t, {
-      has: ['**Engine:** built-in', 'Native check not available (no app/autoload.php in the Magento root)'],
+      has: ['**Engine:** built-in', 'Native check not available (MAGECTOR_PHP is not set'],
     });
     check('built-in: not well-formed file — Magento\'s message, libxml first error with its line', t, {
       has: [
@@ -143,7 +148,7 @@ async function main() {
     t = await builtin.call('magento_validate_config', { path: VALUES_EVENTS });
     check('built-in: scope to a single file', t, { has: ['**Files:** 1 under', `${VALUES_EVENTS}:4`], hasNot: [VALUES_DI] });
     t = await builtin.call('magento_validate_config', { engine: 'native' });
-    check('engine native without PHP: says so instead of falling back', t, { has: ['Native check not available: no app/autoload.php'] });
+    check('engine native without PHP: says so instead of falling back', t, { has: ['Native check not available: MAGECTOR_PHP is not set'] });
 
     // ── Notice in the DI / event tools ─────────────────────────────
     t = await builtin.call('magento_find_plugin', { targetClass: 'Acme\\Good\\Model\\Thing' });
@@ -198,6 +203,58 @@ async function main() {
     });
   } finally {
     failing.stop();
+  }
+
+  // ── Review of #31 ──────────────────────────────────────────────
+  const live = mkdtempSync(path.join(os.tmpdir(), 'magector-vc-live-'));
+  cpSync(FIXTURE_ROOT, live, { recursive: true });
+  const w = (rel, text) => { mkdirSync(path.dirname(path.join(live, rel)), { recursive: true }); writeFileSync(path.join(live, rel), text); };
+  // A PHP on PATH that would answer as the native check; app/autoload.php present
+  w('app/autoload.php', '<?php\n');
+  const bin = path.join(live, '.bin');
+  w('.bin/php', `#!/bin/sh\nif [ "$1" = "-r" ]; then exit 0; fi\nexec "${process.execPath}" "${path.join(live, 'fake-php.mjs')}"\n`);
+  chmodSync(path.join(bin, 'php'), 0o755);
+  // A module registered (module.xml) but not in config.php yet — right after `composer require`
+  w('app/code/Acme/Fresh/etc/module.xml', '<?xml version="1.0"?>\n<config><module name="Acme_Fresh"/></config>\n');
+  w('app/code/Acme/Fresh/etc/di.xml', '<?xml version="1.0"?>\n<config>\n  <type name="Acme\\Fresh\\X">\n</config>\n');
+  // A pathologically deep argument (RangeError in a recursive reader)
+  const depth = 30000;
+  w('app/code/Acme/Good/etc/di.xml', readFileSync(path.join(live, 'app/code/Acme/Good/etc/di.xml'), 'utf-8').replace('</config>',
+    `    <type name="Acme\\Good\\Model\\Deep"><arguments><argument name="a" xsi:type="array">${'<item name="i" xsi:type="array">'.repeat(depth)}${'</item>'.repeat(depth)}</argument></arguments></type>\n</config>`));
+  const onPath = new McpClient({ PATH: `${bin}:${process.env.PATH}` }, live);
+  await onPath.start();
+  try {
+    let t = await onPath.call('magento_validate_config', {});
+    check('native check: never picked up from a php on PATH — only an explicit MAGECTOR_PHP (it bootstraps the project)', t, {
+      has: ['**Engine:** built-in'], hasNot: ['FAKE-NATIVE'],
+    });
+    t = await onPath.call('magento_validate_config', { path: '/' });
+    check('validate_config: a path outside the Magento root is refused (was: "/" walked the disk)', t, { has: ['is outside the Magento root'] });
+    t = await onPath.call('magento_validate_config', { path: '../..' });
+    check('validate_config: ".." cannot leave the root', t, { has: ['is outside the Magento root'] });
+    t = await onPath.call('magento_find_plugin', { targetClass: 'Acme\\Good\\Model\\Thing' });
+    check('notice: a module not in config.php yet is not counted as loaded (was: every DI answer said "Magento rejects")', t, {
+      has: ['**Magento rejects', 'app/code/Acme/Broken/etc/frontend/di.xml'], hasNot: ['app/code/Acme/Fresh/etc/di.xml'],
+    });
+    check('notice: a file the check cannot read (deep nesting) does not replace the answer with an error', t, {
+      has: ['### DI Plugin Registrations for Acme\\Good\\Model\\Thing'],
+    });
+  } finally {
+    onPath.stop();
+  }
+  // The native check does not block the server: another call is answered while it runs
+  const slow = new McpClient({ MAGECTOR_PHP: `sleep 3; "${process.execPath}" "${path.join(live, 'fake-php.mjs')}"` }, live);
+  await slow.start();
+  try {
+    const order = [];
+    const validating = slow.call('magento_validate_config', {}).then(() => order.push('validate'));
+    await new Promise(r => setTimeout(r, 300));
+    await slow.call('magento_module_structure', { moduleName: 'Acme_Good' }).then(() => order.push('module_structure'));
+    await validating;
+    ok('native check: the server answers other calls while it runs (was: spawnSync blocked it)', order.join() === 'module_structure,validate', order.join());
+  } finally {
+    slow.stop();
+    rmSync(live, { recursive: true, force: true });
   }
 
   console.log(`\n  ${passed} passed, ${failed} failed\n`);

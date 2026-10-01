@@ -27,9 +27,14 @@ const files = readFileSync(listFile, 'utf-8').split('\n').map(l => l.trim()).fil
 const count = Number(countArg || 600);
 const edits = Number(editsArg || 1);
 let seed = Number(seedArg || 1);
-const rnd = n => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; };
+// LCG with 32-bit integer multiplication: `seed * 1103515245` exceeds 2^53 and loses the low bits, which
+// made rnd(8) return 0 in 99.5% of draws (review of #31). The distribution is printed to stderr.
+const rnd = n => { seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff; return seed % n; };
+const used = new Map();
+const tally = key => used.set(key, (used.get(key) || 0) + 1);
 const SYNTAX = ['<', '>', '"', "'", '/', '&', '=', ' ', '\n', '!', '-', '?', ']', '[', ':', ';', '#'];
 const pick = list => list[rnd(list.length)];
+const pickCounted = (kind, list) => { const v = pick(list); tally(`${kind}=${JSON.stringify(v)}`); return v; };
 const VALUES = {
   disabled: ['true', 'false', '1', '0', 'yes', 'True', '', ' true'],
   sortOrder: ['10', '10abc', '', ' 5', '1e2', '-3', 'x', '0x1A'],
@@ -48,8 +53,9 @@ function mutateValue(s) {
   if (!at.length) return s;
   const { i, m, kind: k } = pick(at);
   const cut = (text) => s.slice(0, i) + text + s.slice(i + m[0].length);
-  if (k === 'attr') return cut(` ${m[1]}="${pick(VALUES[m[1]])}"`);
-  if (k === 'text') return cut(`${m[1]}${pick(TEXTS)}${m[3]}`);
+  tally(`edit=${k}`);
+  if (k === 'attr') return cut(` ${m[1]}="${pickCounted(m[1], VALUES[m[1]])}"`);
+  if (k === 'text') return cut(`${m[1]}${pickCounted('text', TEXTS)}${m[3]}`);
   if (k === 'name') return cut(m[0].replace(/\s+name="[^"]*"/, ''));
   return cut(`${m[0]}!`);
 }
@@ -66,6 +72,8 @@ for (let k = 0; k < count; k++) {
     const i = at[rnd(at.length)];
     const c = SYNTAX[rnd(SYNTAX.length)];
     const op = rnd(3);
+    tally(`op=${['delete', 'insert', 'replace'][op]}`);
+    tally(`char=${JSON.stringify(c)}`);
     s = op === 0 ? s.slice(0, i) + s.slice(i + 1) : op === 1 ? s.slice(0, i) + c + s.slice(i) : s.slice(0, i) + c + s.slice(i + 1);
   }
   const copy = path.join(outDir, String(k), path.basename(rel));
@@ -74,3 +82,4 @@ for (let k = 0; k < count; k++) {
   out.push(copy);
 }
 console.log(out.join('\n'));
+console.error([...used].sort().map(([k, v]) => `${k}: ${v}`).join('\n'));

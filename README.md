@@ -2,7 +2,7 @@
 
 **Technology-aware MCP server for Magento 2 and Adobe Commerce with intelligent indexing and search.**
 
-Magector is a Model Context Protocol (MCP) server that deeply understands Magento 2 and Adobe Commerce. It builds a semantic vector index of your entire codebase — 18,000+ files across hundreds of modules — and exposes 47 tools that let AI assistants search, navigate, and understand the code with domain-specific intelligence. Instead of grepping for keywords, your AI asks *"how are checkout totals calculated?"* and gets ranked, relevant results in under 50ms, enriched with Magento pattern detection (plugins, observers, controllers, DI preferences, layout XML, and 20+ more).
+Magector is a Model Context Protocol (MCP) server that deeply understands Magento 2 and Adobe Commerce. It builds a semantic vector index of your entire codebase — 18,000+ files across hundreds of modules — and exposes 48 tools that let AI assistants search, navigate, and understand the code with domain-specific intelligence. Instead of grepping for keywords, your AI asks *"how are checkout totals calculated?"* and gets ranked, relevant results in under 50ms, enriched with Magento pattern detection (plugins, observers, controllers, DI preferences, layout XML, and 20+ more).
 
 [![Rust](https://img.shields.io/badge/rust-1.75+-orange.svg)](https://www.rust-lang.org)
 [![Node.js](https://img.shields.io/badge/node-18+-green.svg)](https://nodejs.org)
@@ -58,7 +58,7 @@ The result: your AI assistant calls one MCP tool and gets ranked, pattern-enrich
 - **Complexity analysis** -- cyclomatic complexity, function count, and hotspot detection across modules
 - **Fast** -- 10-45ms queries via persistent serve process, batched ONNX embedding with adaptive thread scaling
 - **LLM description enrichment** -- generate natural-language descriptions of di.xml files using Claude, stored in SQLite, and prepend them to embedding text so descriptions influence vector search ranking (not just post-retrieval display)
-- **MCP server** -- 47 tools integrating with Claude Code, Cursor, and any MCP-compatible AI tool
+- **MCP server** -- 48 tools integrating with Claude Code, Cursor, and any MCP-compatible AI tool
 - **Clean architecture** -- Rust core handles all indexing/search, Node.js MCP server delegates to it
 
 ---
@@ -70,7 +70,7 @@ flowchart LR
   subgraph node ["Node.js Layer"]
     direction TB
     G["CLI<br/>init · index · search · describe"]
-    E["MCP Server<br/>47 tools · LRU cache"]
+    E["MCP Server<br/>48 tools · LRU cache"]
     F["Persistent Serve Process"]
     G --> F
     E --> F
@@ -358,7 +358,8 @@ The `describe` command and `magento_describe` MCP tool require an Anthropic API 
 | `MAGECTOR_FILE_LIST_TTL_MS` | How long the list of the modules' `etc/` files is reused before it is listed again (files added mid-session show up after this); also how often composer's PSR-4 map and classmap are checked for a `composer dump-autoload`. Modules themselves are rediscovered as soon as `app/etc/config.php` or the composer registrations change. `0`: always fresh. | `2000` |
 | `MAGECTOR_PHP_LIST_TTL_MS` | How long the list of all PHP files (event dispatchers) is reused before the tree is walked again. | `30000` |
 | `MAGECTOR_AUTO_INDEX` | `0`: the MCP server never starts an index (none, or an incompatible one) — for CI and agent jobs that bring their own index. The structural tools work without one; semantic search reports it is missing. | `1` (index in the background) |
-| `MAGECTOR_PHP` | Command that runs PHP 8.1+ able to load the Magento root, for the native `magento_validate_config` (the PHP program is piped to its stdin), e.g. `docker exec -i -u www-data <container> php`, `warden env exec -T php-fpm php`, `ddev exec php`. Without it, `php` on `PATH` is used when it is 8.1+ and `app/autoload.php` exists; otherwise the built-in check. | — |
+| `MAGECTOR_PHP` | Command that runs PHP 8.1+ able to load the Magento root, for the native `magento_validate_config` (the PHP program is piped to its stdin), e.g. `docker exec -i -u www-data <container> php`, `warden env exec -T php-fpm php`, `ddev exec php`. Only an explicit command is used — never `php` from `PATH`: the native check loads the project's autoloader and bootstraps Magento (which writes its DI config to the configured cache; with `var/.regenerate` present the areas are not read, as bootstrapping would delete `generated/` and `var/cache`). Unset: built-in check. | — |
+| `MAGECTOR_PHP_TIMEOUT_MS` | Time limit of one native check (it runs asynchronously; the server keeps answering). | `120000` |
 | `MAGECTOR_PHP_ROOT` | The Magento root as `MAGECTOR_PHP` sees it (inside the container) | `MAGENTO_ROOT` |
 | `ANTHROPIC_API_KEY` | API key for description generation (`describe` command) | — |
 
@@ -422,7 +423,7 @@ npx magector index --force
 
 ## MCP Server Tools
 
-The MCP server exposes 47 tools for AI-assisted Magento 2 and Adobe Commerce development. All search tools return **structured JSON** with file paths, class names, methods, role badges, and content snippets -- enabling AI clients to parse results programmatically and minimize file-read round-trips.
+The MCP server exposes 48 tools for AI-assisted Magento 2 and Adobe Commerce development. All search tools return **structured JSON** with file paths, class names, methods, role badges, and content snippets -- enabling AI clients to parse results programmatically and minimize file-read round-trips.
 
 ### Output Format
 
@@ -516,8 +517,8 @@ details, with Magento's own messages:
 
 | Engine | Checks | Verified |
 |--------|--------|----------|
-| **native** (`MAGECTOR_PHP`, or `php` 8.1+ on `PATH`) | Magento's classes on every file (`Config\Dom` — not well-formed XML fails in every mode; the DI / events converters and argument interpreters under Magento's `ErrorHandler`), then Magento's readers (`ObjectManager\Config\Reader\Dom`, `Event\Config\Reader`) on every area in production **and developer mode** — the merged configuration, as Magento validates it; other files against the schema they declare | is Magento |
-| **built-in** (no PHP) | per file: the first libxml error (message and line), the converter and argument-interpreter rules ported from Magento, values read differently than written (observer `disabled="1"`, non-integer `sortOrder`, text next to `<item>`s) | against libxml 2.9.14 / Mage-OS 2.4.9 (`scripts/verify-magento`, mode `config`): same first fatal error on 3,835 files with syntax edits; same converter verdict on 3,500 files with value edits (3,049 converter exceptions); nothing reported on the 3,075 unmodified config files of the project |
+| **native** (`MAGECTOR_PHP` only) | Magento's classes on every file (`Config\Dom` — not well-formed XML fails in every mode; the DI / events converters and argument interpreters under Magento's `ErrorHandler`), then Magento's readers (`ObjectManager\Config\Reader\Dom`, `Event\Config\Reader`) on every area in production **and developer mode** — the merged configuration, as Magento validates it; other files against the schema they declare | is Magento |
+| **built-in** (no PHP) | per file: the first libxml error (message and line), the converter and argument-interpreter rules ported from Magento, values read differently than written (observer `disabled="1"`, non-integer `sortOrder`, text next to `<item>`s) | against libxml 2.9.14 / Mage-OS 2.4.9 (`scripts/verify-magento`, mode `config`): same first fatal error on 2,000 files with syntax edits (1,384 not well-formed); same converter verdict on 3,000 files with value edits (2,518 converter exceptions; `const` names native only); nothing reported on the 3,075 unmodified config files of the project |
 
 The built-in check does not validate schemas (developer mode), does not merge files (a later file can
 override a value that fails alone — the native check reports that case as masked), and cannot check
@@ -799,7 +800,7 @@ cd rust-core && cargo run --release -- validate -m ./magento2 --skip-index
 magector/
 ├── src/                          # Node.js source
 │   ├── cli.js                    # CLI entry point (npx magector <command>)
-│   ├── mcp-server.js             # MCP server (47 tools, structured JSON output)
+│   ├── mcp-server.js             # MCP server (48 tools, structured JSON output)
 │   ├── binary.js                 # Platform binary resolver
 │   ├── model.js                  # ONNX model resolver/downloader
 │   ├── init.js                   # Full init command (index + IDE config)

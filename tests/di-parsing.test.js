@@ -185,6 +185,8 @@ return Array(
 // Expected first fatal error = libxml 2.9.14 / PHP 8.3 (DOMDocument::loadXML, as Config\Dom does);
 // for comment / CDATA errors libxml appends the start of the section, the check reports the prefix.
 const WELL_FORMED_CASES = [
+  ["lone_lt_after_root", "<?xml version=\"1.0\"?>\n<config/>\n<", [3, "Extra content at the end of the document"]],
+  ["bad_name_after_root", "<?xml version=\"1.0\"?>\n<config/>\n<1", [3, "Extra content at the end of the document"]],
   ["amp_attr", "<?xml version=\"1.0\"?>\n<config>\n  <type name=\"A&B\"/>\n</config>\n", [3, "EntityRef: expecting ';'"]],
   ["amp_text", "<?xml version=\"1.0\"?>\n<config>\n  <x>a & b</x>\n</config>\n", [3, "xmlParseEntityRef: no name"]],
   ["badname", "<?xml version=\"1.0\"?>\n<config>\n  <1x/>\n</config>\n", [3, "StartTag: invalid element name"]],

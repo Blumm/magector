@@ -45,6 +45,7 @@ Three layers, each against Magento itself — never against Magector's own idea 
 | Declared tables | 507/507 with every column, key and index under Magento's name |
 | Modules | 598/598 directories, enabled state and load order |
 | `trace_api` vs Magento | 446/446 routes: same route, service class and method, and the class Magento creates in `webapi_rest` |
+| Config check, built-in vs native (`mutate-xml.mjs`) | same first libxml error on 2,000 syntax-edited files (1,384 not well-formed), same converter verdict on 3,000 value-edited files (2,518 exceptions) |
 
 ## Results (Magento Open Source 2.4.5-p14 project, ~110 custom modules, PHP 8.1, libxml 2.9.14)
 
