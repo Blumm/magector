@@ -225,6 +225,21 @@ for (const [name, src, expected] of WELL_FORMED_CASES) {
   const got = checkXmlWellFormed(src)[0] || null;
   eq(`well-formedness as libxml: ${name}`, got && [got.line, got.message], expected);
 }
+// Expected = DOMDocument::loadXML (PHP 8.3, libxml 2.9.14), first fatal error. Found by mutate-xml.mjs:
+// an attribute value left open with a '&' in it was reported at the next '<' instead of at the '&'
+eq('well-formedness as libxml: an entity reference in an attribute value is read before a later \'<\' or the end', [
+  '<config>\n<a b="x&>\n<c/></config>',
+  '<config>\n<a b="x&y>\n<c/></config>',
+  '<config>\n<a b="x&zz;>\n<c/></config>',
+  '<config>\n<a b="x&amp; ok\n<c/></config>',
+  '<config>\n<a b="x&',
+].map(x => checkXmlWellFormed(x)[0]).map(e => e && `${e.line}:${e.message}`), [
+  '2:xmlParseEntityRef: no name',
+  "2:EntityRef: expecting ';'",
+  "2:Entity 'zz' not defined",
+  "3:Unescaped '<' not allowed in attributes values",
+  '2:xmlParseEntityRef: no name',
+]);
 eq('well-formedness as libxml: a UTF-8 byte-order mark before the declaration is skipped',
   checkXmlWellFormed('\uFEFF<?xml version="1.0" encoding="UTF-8"?>\n<config/>\n'), []);
 console.log(`\n  ${passed} passed, ${failed} failed\n`);

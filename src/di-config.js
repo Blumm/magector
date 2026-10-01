@@ -1244,10 +1244,11 @@ export function checkXmlWellFormed(content) {
       if (q !== '"' && q !== "'") return err(j, 'AttValue: " or \' expected');
       let close = j + 1;
       while (close < src.length && src[close] !== q && src[close] !== '<') close++;
-      if (src[close] === '<') return err(close, "Unescaped '<' not allowed in attributes values");
-      if (close >= src.length) return err(close, 'AttValue: \' expected');
+      // libxml reads the value left to right: a bad entity reference comes before a '<' or the end
       const e = checkText(j + 1, close);
       if (e) return e;
+      if (src[close] === '<') return err(close, "Unescaped '<' not allowed in attributes values");
+      if (close >= src.length) return err(close, 'AttValue: \' expected');
       if (seen.has(an[0])) return err(close, `Attribute ${an[0]} redefined`);
       seen.add(an[0]);
       j = close + 1;
