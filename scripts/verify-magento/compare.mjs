@@ -5,12 +5,15 @@
  *   node compare.mjs php     <magento-root> php-truth.json
  *   node compare.mjs xml     <magento-root> xml-truth.json
  *   node compare.mjs plugins <magento-root> runtime-plugins.json [area]
+ *   node compare.mjs config  <magento-root> config-truth.json
  *   node compare.mjs webapi|graphql|cron|dbschema|modules|trace_api <magento-root> <kind>-truth.json   (config-truth.php)
  *
  * php     — src/di-config.js class / method reading vs PHP's tokenizer
  * xml     — src/di-config.js di.xml / events.xml reading vs DOMDocument (and files Magento rejects)
  * plugins — magento_find_plugin (MCP server, structural part) vs the plugins Magento runs
  * trace_api — magento_trace_api (MCP server) per route vs the route, service and the class Magento creates (webapi_rest)
+ * config  — the built-in configuration check (checkXmlWellFormed, checkConfigValues) vs Magento's
+ *           own classes (src/php/validate-config.php): first libxml error, converter exceptions
  * webapi / graphql / cron / dbschema — src/magento-config.js merged models vs what Magento reads
  *           (routes → service, type fields → resolver, cron jobs, declared tables / columns / keys).
  *           Missing = Magector returns less (must be 0); extra = more (listed, should be explainable)
@@ -24,7 +27,7 @@ import { createInterface } from 'readline';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import {
-  parsePhpTypes, parsePhpMembers, parseDiXml, parseXml, parseEventsXml, checkXmlWellFormed,
+  parsePhpTypes, parsePhpMembers, parseDiXml, parseXml, parseEventsXml, checkXmlWellFormed, checkConfigValues,
   buildModuleIndex,
 } from '../../src/di-config.js';
 import {
@@ -36,11 +39,14 @@ import { glob } from 'glob';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const [mode, rootArg, truthFile, areaArg] = process.argv.slice(2);
 if (!mode || !rootArg || !truthFile) {
-  console.error('usage: node compare.mjs php|xml|plugins|webapi|graphql|cron|dbschema|modules|trace_api <magento-root> <truth.json> [area]');
+  console.error('usage: node compare.mjs php|xml|plugins|config|webapi|graphql|cron|dbschema|modules|trace_api <magento-root> <truth.json> [area]');
   process.exit(2);
 }
 const root = path.resolve(rootArg);
-const truth = JSON.parse(readFileSync(truthFile, 'utf-8'));
+// config-truth.json is the raw output of validate-config.php: the JSON follows a marker line
+const truthText = readFileSync(truthFile, 'utf-8');
+const marker = truthText.lastIndexOf('@@MAGECTOR-VALIDATE-CONFIG@@');
+const truth = JSON.parse(marker < 0 ? truthText : truthText.slice(marker + '@@MAGECTOR-VALIDATE-CONFIG@@'.length));
 const show = (title, list, n = 15) => {
   console.log(`${title}: ${list.length}`);
   for (const l of list.slice(0, n)) console.log(`  ${l}`);
@@ -192,6 +198,42 @@ if (mode === 'trace_api') {
   console.log(`trace_api: ${truth.length - bad.length}/${truth.length} routes agree (route, interface::method, class that runs in webapi_rest)`);
   show('different', bad);
   process.exit(bad.length ? 1 : 0);
+}
+
+if (mode === 'config') {
+  // First fatal libxml error: same line and message (libxml appends the start of a comment / CDATA
+  // section to some messages; the built-in check reports the stable prefix).
+  const PREFIX_MESSAGES = ['Double hyphen within comment: <!--', 'CData section not finished', 'Comment not terminated'];
+  const sameXmlError = (mine, native) => (!mine && !native) || (mine && native && mine.line === native.line &&
+    (native.message === mine.message || native.message === `ValueError: ${mine.message}` ||
+      (PREFIX_MESSAGES.includes(mine.message) && native.message.startsWith(mine.message))));
+  // Converter exception text without the class, and without the file / line of a PHP warning
+  const converterText = e => e.replace(/^[\w\\]+: /, '').replace(/^(Warning: .*?) in \/.*$/s, '$1');
+  const xmlDiff = [], convertDiff = [], nativeOnly = [];
+  let files = 0, invalid = 0, converterErrors = 0;
+  for (const f of truth.files) {
+    files++;
+    const content = readFileSync(path.join(root, f.file), 'utf-8');
+    const native = content === '' ? { line: 0, message: f.production } : f.xmlErrors.find(e => e.level === 3) || null;
+    const mine = checkXmlWellFormed(content)[0] || null;
+    if (native) invalid++;
+    if (!sameXmlError(mine, native)) xmlDiff.push(`${f.file} native ${JSON.stringify(native)} built-in ${JSON.stringify(mine)}`);
+    if (native || !/(^|\/)(di|events)\.xml$/.test(f.file)) continue;
+    const errors = checkConfigValues(content, f.file).filter(p => p.severity === 'error');
+    if (f.convert) {
+      converterErrors++;
+      const want = converterText(f.convert);
+      if (/^Constant "/.test(want) || /init_parameter/.test(want)) { nativeOnly.push(`${f.file} ${want}`); continue; }
+      if (!errors.length || !errors[0].message.includes(want)) convertDiff.push(`${f.file} native "${want}" built-in ${JSON.stringify(errors[0]?.message ?? null)}`);
+    } else if (errors.length) {
+      convertDiff.push(`${f.file} loads natively, built-in reports ${JSON.stringify(errors[0].message)}`);
+    }
+  }
+  console.log(`files ${files}: ${invalid} not well-formed, ${converterErrors} with a converter exception (PHP ${truth.php}, libxml ${truth.libxml})`);
+  show('first libxml error differs', xmlDiff);
+  show('converter verdict differs', convertDiff);
+  show('native only (needs PHP: const / init_parameter arguments)', nativeOnly, 5);
+  process.exit(xmlDiff.length + convertDiff.length ? 1 : 0);
 }
 
 if (['webapi', 'graphql', 'cron', 'dbschema', 'modules'].includes(mode)) {
