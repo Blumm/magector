@@ -19,7 +19,9 @@ Magento behaviour (Mage-OS 2.4.9 source, each point checked in PHP 8.3 / libxml 
   of the **merged** document otherwise (`di.xml`: `getPerFileSchema()` is `null`). The outcome depends on
   file order — duplicate `<argument name>` fails only when no earlier file declared that argument; a bad
   value can be overridden by a later file. Only Magento's reader gives the answer, so the native check
-  reads every area with `ObjectManager\Config\Reader\Dom` / `Event\Config\Reader` in both modes.
+  reads every area with `ObjectManager\Config\Reader\Dom` / `Event\Config\Reader` in both modes. The
+  built-in check merges each area as `Config\Dom` does (`mergeConfigFiles`, verified with `compare.mjs
+  merge`) and converts the result; schema validation stays native.
 - Observer `disabled`: only `'true'` disables. `sortOrder` → PHP `(int)` (`"10abc"` → 10, `"1e2"` → 100).
 - Text (or CDATA) next to `<item>`s in an argument: `Flat` takes the first non-blank text as the value and
   drops the items (an array argument becomes empty) — found by the value mutations.

@@ -518,11 +518,11 @@ details, with Magento's own messages:
 | Engine | Checks | Verified |
 |--------|--------|----------|
 | **native** (`MAGECTOR_PHP` only) | Magento's classes on every file (`Config\Dom` — not well-formed XML fails in every mode; the DI / events converters and argument interpreters under Magento's `ErrorHandler`), then Magento's readers (`ObjectManager\Config\Reader\Dom`, `Event\Config\Reader`) on every area in production **and developer mode** — the merged configuration, as Magento validates it; other files against the schema they declare | is Magento |
-| **built-in** (no PHP) | per file: the first libxml error (message and line), the converter and argument-interpreter rules ported from Magento, values read differently than written (observer `disabled="1"`, non-integer `sortOrder`, text next to `<item>`s) | against libxml 2.9.14 / Mage-OS 2.4.9 (`scripts/verify-magento`, mode `config`): same first fatal error on 2,000 files with syntax edits (1,384 not well-formed); same converter verdict on 3,000 files with value edits (2,518 converter exceptions; `const` names native only); nothing reported on the 3,075 unmodified config files of the project |
+| **built-in** (no PHP) | per file: the first libxml error (message and line), the converter and argument-interpreter rules ported from Magento, values read differently than written (observer `disabled="1"`, non-integer `sortOrder`, text next to `<item>`s); per area: its files merged as `Config\Dom` merges them, then the same rules — a file another file completes loads, two files that load alone can fail together | against libxml 2.9.14 / Mage-OS 2.4.9 (`scripts/verify-magento`, mode `config`): same first fatal error on 2,000 files with syntax edits (1,384 not well-formed); same converter verdict on 3,000 files with value edits (2,518 converter exceptions; `const` names native only); nothing reported on the 3,075 unmodified config files of the project; merge (mode `merge`): the same merged document and verdict as Magento's readers on every DI / events area of a Mage-OS 2.4.9 and a Magento 2.4.5 project (30 areas) and on 15,008 merges of mutated files with their originals |
 
-The built-in check does not validate schemas (developer mode), does not merge files (a later file can
-override a value that fails alone — the native check reports that case as masked), and cannot check
-`const` / `init_parameter` arguments (PHP's `defined()`).
+The built-in check does not validate schemas (developer mode) and cannot check `const` /
+`init_parameter` arguments (PHP's `defined()`). The native check runs on PHP 8.1–8.4 (on Magento 2.4.5
+with PHP 8.4 it gives the same result as with PHP 8.1).
 
 The results are static analysis of the files. For a running installation, the object manager
 configuration read at runtime remains the reference — note that `bin/magento dev:di:info` lists plugins

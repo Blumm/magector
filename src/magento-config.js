@@ -143,6 +143,19 @@ export function moduleConfigFiles(idx, exists, fileName, scope = 'global') {
     .filter(f => exists(f.relPath));
 }
 
+/**
+ * The files of a DI / events scope in the order Magento reads them (App\Config\FileResolver::get):
+ * primary — app/etc/*di.xml, then app/etc/<dir>/*di.xml (Directory\Read::search, GLOB_BRACE); global — every
+ * enabled module's etc/<file>; an area — etc/<area>/<file>. `listAppEtc(pattern)` lists app/etc.
+ */
+export function configScopeFiles(idx, exists, fileName, scope, listAppEtc) {
+  if (scope === 'primary') {
+    return [...listAppEtc(`*${fileName}`).sort(), ...listAppEtc(`*/*${fileName}`).sort()]
+      .map(f => ({ module: null, relPath: `app/etc/${f}` }));
+  }
+  return moduleConfigFiles(idx, exists, fileName, scope);
+}
+
 /** Modules whose file is not read: disabled in config.php, or not listed there (not installed). */
 export function unreadModuleConfigFiles(idx, exists, fileName, scope = 'global') {
   if (idx.orderSource !== 'config.php') return [];

@@ -11,7 +11,8 @@
  * values           — 1–N well-formed edits of what the converters read: disabled / sortOrder / shared /
  *                    xsi:type values, argument text, a dropped name attribute, text next to <item>s.
  *
- * Prints the list of copies (relative to the Magento root) for validate-config.php.
+ * Prints the list of copies (relative to the Magento root) for validate-config.php, and writes
+ * <out-dir>/sources.tsv (copy, original) for merge-sets.mjs.
  */
 
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
@@ -61,6 +62,7 @@ function mutateValue(s) {
 }
 
 const out = [];
+const sources = [];
 for (let k = 0; k < count; k++) {
   const rel = files[rnd(files.length)];
   let s = readFileSync(path.join(root, rel), 'utf-8');
@@ -80,6 +82,8 @@ for (let k = 0; k < count; k++) {
   mkdirSync(path.join(root, path.dirname(copy)), { recursive: true });
   writeFileSync(path.join(root, copy), s);
   out.push(copy);
+  sources.push(`${copy}\t${rel}`);
 }
+writeFileSync(path.join(root, outDir, 'sources.tsv'), sources.join('\n') + '\n');
 console.log(out.join('\n'));
 console.error([...used].sort().map(([k, v]) => `${k}: ${v}`).join('\n'));

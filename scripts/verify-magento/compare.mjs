@@ -6,12 +6,15 @@
  *   node compare.mjs xml     <magento-root> xml-truth.json
  *   node compare.mjs plugins <magento-root> runtime-plugins.json [area]
  *   node compare.mjs config  <magento-root> config-truth.json
+ *   node compare.mjs merge   <magento-root> merge-truth.json   (merge-truth.php)
  *   node compare.mjs webapi|graphql|cron|dbschema|modules|trace_api <magento-root> <kind>-truth.json   (config-truth.php)
  *
  * php     — src/di-config.js class / method reading vs PHP's tokenizer
  * xml     — src/di-config.js di.xml / events.xml reading vs DOMDocument (and files Magento rejects)
  * plugins — magento_find_plugin (MCP server, structural part) vs the plugins Magento runs
  * trace_api — magento_trace_api (MCP server) per route vs the route, service and the class Magento creates (webapi_rest)
+ * merge   — mergeConfigFiles / checkMergedConfig vs Magento's readers: an area's di.xml / events.xml files
+ *           (order), the merged document (Config\Dom), and whether the merged configuration converts
  * config  — the built-in configuration check (checkXmlWellFormed, checkConfigValues) vs Magento's
  *           own classes (src/php/validate-config.php): first libxml error, converter exceptions
  * webapi / graphql / cron / dbschema — src/magento-config.js merged models vs what Magento reads
@@ -28,10 +31,11 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import {
   parsePhpTypes, parsePhpMembers, parseDiXml, parseXml, parseEventsXml, checkXmlWellFormed, checkConfigValues,
-  buildModuleIndex,
+  buildModuleIndex, mergeConfigFiles, checkMergedConfig, CONFIG_MERGE, ConfigMergeError,
 } from '../../src/di-config.js';
 import {
   moduleConfigFiles, buildWebapiModel, buildGraphqlModel, buildCronModel, buildDbSchemaModel, discoverModules,
+  configScopeFiles,
 } from '../../src/magento-config.js';
 import { existsSync } from 'fs';
 import { glob } from 'glob';
@@ -39,7 +43,7 @@ import { glob } from 'glob';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const [mode, rootArg, truthFile, areaArg] = process.argv.slice(2);
 if (!mode || !rootArg || !truthFile) {
-  console.error('usage: node compare.mjs php|xml|plugins|config|webapi|graphql|cron|dbschema|modules|trace_api <magento-root> <truth.json> [area]');
+  console.error('usage: node compare.mjs php|xml|plugins|config|merge|webapi|graphql|cron|dbschema|modules|trace_api <magento-root> <truth.json> [area]');
   process.exit(2);
 }
 const root = path.resolve(rootArg);
@@ -234,6 +238,73 @@ if (mode === 'config') {
   show('converter verdict differs', convertDiff);
   show('native only (needs PHP: const / init_parameter arguments)', nativeOnly, 5);
   process.exit(xmlDiff.length + convertDiff.length ? 1 : 0);
+}
+
+if (mode === 'merge') {
+  // An area's files, merged as Config\Dom merges them, then converted: the same file list, the same
+  // merged document (nodes, attributes, text, CDATA, comments) and the same verdict as Magento's readers
+  const moduleXmls = (await discoverModules(root)).moduleXmls
+    .map(rel => ({ relPath: rel, content: readFileSync(path.join(root, rel), 'utf-8') }));
+  let configPhp = null;
+  try { configPhp = readFileSync(path.join(root, 'app/etc/config.php'), 'utf-8'); } catch { /* not installed */ }
+  const idx = buildModuleIndex(moduleXmls, configPhp);
+  const exists = rel => existsSync(path.join(root, rel));
+  const listAppEtc = pattern => glob.sync(pattern, { cwd: path.join(root, 'app/etc'), nodir: true });
+  const canon = n => ['e', n.name,
+    Object.fromEntries(Object.entries(n.attrs).filter(([k]) => k !== 'xmlns' && !k.startsWith('xmlns:')).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))),
+    n.seq.map(e => (e.node ? canon(e.node) : e.text !== undefined ? ['t', e.text] : e.cdata !== undefined ? ['c', e.cdata] : e.comment ? ['#'] : e.entref ? ['x', 'DOMEntityReference'] : ['?']))];
+  const firstDiff = (a, b, at = '') => {
+    if (JSON.stringify(a) === JSON.stringify(b)) return null;
+    if (!Array.isArray(a) || !Array.isArray(b) || a[0] !== 'e' || b[0] !== 'e' || a[1] !== b[1]) return `${at || '/'}: Magento ${JSON.stringify(a).slice(0, 160)} Magector ${JSON.stringify(b).slice(0, 160)}`;
+    const name = `${at}/${a[1]}${a[2].name ? `[@name='${a[2].name}']` : ''}`;
+    if (JSON.stringify(a[2]) !== JSON.stringify(b[2])) return `${name} attributes: Magento ${JSON.stringify(a[2])} Magector ${JSON.stringify(b[2])}`;
+    if (a[3].length !== b[3].length) return `${name}: ${a[3].length} child nodes in Magento, ${b[3].length} in Magector`;
+    for (let i = 0; i < a[3].length; i++) { const d = firstDiff(a[3][i], b[3][i], name); if (d) return d; }
+    return `${name}: differs`;
+  };
+  const converterText = e => e.replace(/^[\w\\]+: /, '').replace(/^(Warning: .*?) in \/.*$/s, '$1');
+  const listDiff = [], treeDiff = [], verdictDiff = [], nativeOnly = [];
+  let failing = 0;
+  for (const item of truth.items) {
+    const label = item.scope ? `${item.kind} ${item.scope}` : `${item.kind} [${item.files.join(', ')}]`;
+    let files = item.files;
+    if (item.scope) {
+      const mine = configScopeFiles(idx, exists, `${item.kind}.xml`, item.scope, listAppEtc).map(f => f.relPath);
+      if (JSON.stringify(mine) !== JSON.stringify(item.files)) {
+        listDiff.push(`${label}: Magento ${item.files.length} files, Magector ${mine.length}; first difference at ${item.files.findIndex((f, i) => f !== mine[i])}`);
+      }
+      files = item.files;   // the merge is compared on Magento's list either way
+    }
+    const contents = files.map(f => ({ file: f, content: readFileSync(path.join(root, f), 'utf-8') }));
+    let merged = null, mergeError = null;
+    try { merged = mergeConfigFiles(contents, CONFIG_MERGE[item.kind]); } catch (e) { if (!(e instanceof ConfigMergeError)) throw e; mergeError = e.message; }
+    if (Boolean(item.mergeError) !== Boolean(mergeError)) {
+      treeDiff.push(`${label}: merge error — Magento ${JSON.stringify(item.mergeError)}, Magector ${JSON.stringify(mergeError)}`);
+      continue;
+    }
+    if (item.mergeError) {
+      failing++;
+      if (!converterText(item.mergeError).startsWith(mergeError)) treeDiff.push(`${label}: merge error text — Magento ${JSON.stringify(item.mergeError)}, Magector ${JSON.stringify(mergeError)}`);
+      continue;
+    }
+    const d = firstDiff(item.merged, merged ? canon(merged) : null);
+    if (d) treeDiff.push(`${label}: ${d}`);
+    const verdict = checkMergedConfig(contents, item.kind);
+    if (item.convert) {
+      failing++;
+      const want = converterText(item.convert);
+      if (/^Constant "/.test(want) || /init_parameter/.test(want)) { nativeOnly.push(`${label}: ${want}`); continue; }
+      if (!verdict || !verdict.message.includes(want)) verdictDiff.push(`${label}: Magento "${want}", Magector ${JSON.stringify(verdict?.message ?? null)}`);
+    } else if (verdict) {
+      verdictDiff.push(`${label}: loads in Magento, Magector reports ${JSON.stringify(verdict.message)}`);
+    }
+  }
+  console.log(`${truth.items.length} merged configurations (PHP ${truth.php}), ${failing} that Magento fails to load`);
+  show('file list differs', listDiff);
+  show('merged document differs', treeDiff);
+  show('verdict differs', verdictDiff);
+  show('native only (needs PHP: const / init_parameter arguments)', nativeOnly, 5);
+  process.exit(listDiff.length + treeDiff.length + verdictDiff.length ? 1 : 0);
 }
 
 if (['webapi', 'graphql', 'cron', 'dbschema', 'modules'].includes(mode)) {

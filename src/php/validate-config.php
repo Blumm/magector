@@ -140,11 +140,16 @@ try {
             $result = ['kind' => $kind, 'scope' => $scope];
             foreach ([State::MODE_PRODUCTION, State::MODE_DEVELOPER] as $mode) {
                 $reader = $objectManager->create($readers[$kind], ['validationState' => new ValidationState($mode)]);
+                // Under Magento's ErrorHandler, as bin/magento and Bootstrap::run() read configuration: a
+                // warning while merging (e.g. DOMXPath::query() on an id with an apostrophe) fails the area
+                set_error_handler($errorHandler);
                 try {
                     $reader->read($scope);
                     $result[$mode] = null;
                 } catch (\Throwable $e) {
                     $result[$mode] = $describe($e);
+                } finally {
+                    restore_error_handler();
                 }
             }
             $scopeResults[] = $result;

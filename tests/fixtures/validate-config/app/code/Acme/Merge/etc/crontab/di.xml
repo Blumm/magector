@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="urn:magento:framework:ObjectManager/etc/config.xsd">
+    <!-- loads alone, and so does Acme_Values's: merged, the type matches two nodes -->
+    <type name="Acme\Good\Model\Thing">
+        <plugin name="third" type="Acme\Good\Plugin\Third"/>
+    </type>
+</config>

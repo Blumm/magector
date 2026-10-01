@@ -10,6 +10,7 @@ changing the DI / event / PHP readers, or to see how Magector does on a given pr
 | `plugins` | the running installation (`runtime-plugins.php`): plugins Magento runs per class and area (`PluginListInterface::getNext()`) | `magento_find_plugin` over MCP (structural part, no index needed) |
 | `webapi` `graphql` `cron` `dbschema` `modules` | the installation (`config-truth.php`): Web API routes, GraphQL types → fields → resolver (apart from the fields EAV readers add), cron jobs (+ `core_config_data`), declared tables with columns / keys / indexes, module directories and load order | `src/magento-config.js` (the models behind `find_api`, `find_graphql`, `find_cron`, `find_db_schema`, `module_structure`) |
 | `trace_api` | the installation (`config-truth.php trace_api`): every route, its service, and the class Magento creates for the service in `webapi_rest` | `magento_trace_api` over MCP, route by route |
+| `merge` | Magento's DI / events readers (`merge-truth.php`): each area's files in order, merged by the reader's own merger and converted, under Magento's ErrorHandler | `mergeConfigFiles` / `checkMergedConfig` (`src/di-config.js`) — file list, merged document, verdict |
 | `config` | Magento's classes (`src/php/validate-config.php`, the native engine of `magento_validate_config`): first fatal libxml error per file, converter / argument-interpreter exception per di.xml / events.xml | the built-in check (`checkXmlWellFormed`, `checkConfigValues`) |
 
 ## Run
@@ -56,6 +57,19 @@ node scripts/verify-magento/mutate-xml.mjs . config-files.txt var/magector-mutat
 node scripts/verify-magento/mutate-xml.mjs . config-files.txt var/magector-mutated/v 1500 1 2 values >> mutated.txt
 php /path/to/magector/src/php/validate-config.php . $(cat mutated.txt) > config-truth.json   # in the PHP container
 node scripts/verify-magento/compare.mjs config /path/to/magento config-truth.json
+rm -rf var/magector-mutated
+```
+
+Merged configuration — every DI / events area of the installation, then conflicting merges (each
+mutated copy merged with its original, in both orders):
+
+```bash
+php /path/to/magector/scripts/verify-magento/merge-truth.php scopes > merge-scopes.json          # in the PHP container
+node scripts/verify-magento/compare.mjs merge /path/to/magento merge-scopes.json
+node scripts/verify-magento/mutate-xml.mjs . config-files.txt var/magector-mutated/v 1500 7 2 values > /dev/null
+node scripts/verify-magento/merge-sets.mjs . var/magector-mutated/v/sources.tsv > sets.json
+php /path/to/magector/scripts/verify-magento/merge-truth.php sets < sets.json > merge-sets.json  # in the PHP container
+node scripts/verify-magento/compare.mjs merge /path/to/magento merge-sets.json
 rm -rf var/magector-mutated
 ```
 

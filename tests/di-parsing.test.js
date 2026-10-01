@@ -17,6 +17,7 @@ import {
   applyModuleOrder, resolveInstance, resolveVirtualType, argumentInjectionsOf, parseEventsXml,
   parseConfigPhpModules, buildModuleIndex, effectivePluginDeclarations,
   checkXmlWellFormed, checkConfigValues, magentoInvalidXmlMessage, phpIntCast,
+  mergeConfigFiles, checkMergedConfig, CONFIG_MERGE, ConfigMergeError,
 } from '../src/di-config.js';
 
 let passed = 0;
@@ -242,6 +243,47 @@ eq('well-formedness as libxml: an entity reference in an attribute value is read
   "3:Unescaped '<' not allowed in attributes values",
   '2:xmlParseEntityRef: no name',
 ]);
+// ── Config\Dom merge (mergeConfigFiles) ──────────────────────────
+// Expected = Magento's readers (merge-truth.php sets: _createConfigMerger + merge(), Magento 2.4.5-p14 /
+// PHP 8.1): the merged document, or the exception Config\Dom throws.
+const MERGE_FILES = {
+  "a1.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"string\">old</argument></arguments></type></config>",
+  "a2.xml": "<config><type name=\"T\"><arguments><argument name=\"v\"><![CDATA[new]]></argument></arguments></type></config>",
+  "b1.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"string\"><!--c-->old</argument></arguments></type></config>",
+  "b2.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"string\">new</argument></arguments></type></config>",
+  "c1.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"array\"><item name=\"a\" xsi:type=\"string\">x</item></argument></arguments></type></config>",
+  "c2.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"string\" extra=\"1\">s</argument></arguments></type></config>",
+  "d1.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"array\"><item name=\"0\" xsi:type=\"string\">zero</item><item name=\"1\" xsi:type=\"string\">one</item></argument></arguments></type></config>",
+  "d2.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"array\"><item name=\"0\" xsi:type=\"string\">ZERO</item></argument></arguments></type></config>",
+  "e1.xml": "<?xml version=\"1.0\"?>\r\n<!DOCTYPE config [<!ENTITY list \"a|b\">]>\r\n<config>\r\n  <type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"string\" note=\"&list;\">x\r\n</argument></arguments></type>\r\n</config>\r\n",
+  "f1.xml": "<config><event name=\"e\"><observer name=\"o\" instance=\"A\"/></event></config>",
+  "f2.xml": "<config><event name=\"e\"><observer name=\"o\" disabled=\"true\"/><observer name=\"p\" instance=\"B\"/></event></config>",
+  "g1.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"array\"><item name=\"it's\" xsi:type=\"string\">a</item></argument></arguments></type></config>",
+  "g2.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"array\"><item name=\"it's\" xsi:type=\"string\">b</item></argument></arguments></type></config>",
+  "h1.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"string\">old</argument></arguments></type></config>",
+  "h2.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"string\">cron 2&gt;&amp;1</argument></arguments></type></config>",
+  "h3.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"string\">a &amp;amp; b &amp;x; c</argument></arguments></type></config>"
+};
+const mergeCanon = n => ['e', n.name, Object.fromEntries(Object.entries(n.attrs).sort(([a], [b]) => (a < b ? -1 : 1))),
+  n.seq.map(e => (e.node ? mergeCanon(e.node) : e.text !== undefined ? ['t', e.text] : e.cdata !== undefined ? ['c', e.cdata] : e.comment ? ['#'] : e.entref ? ['x', 'DOMEntityReference'] : ['?']))];
+const merged = (kind, names) => {
+  try { return mergeCanon(mergeConfigFiles(names.map(f => ({ file: f, content: MERGE_FILES[f] })), CONFIG_MERGE[kind])); }
+  catch (e) { if (e instanceof ConfigMergeError) return { error: e.message }; throw e; }
+};
+eq('merge as Config\\Dom: a CDATA value replaces the text; the attributes stay', merged('di', ["a1.xml", "a2.xml"]), ["e", "config", {}, [["e", "type", {"name": "T"}, [["e", "arguments", {}, [["e", "argument", {"name": "v", "xsi:type": "string"}, [["t", "new"]]]]]]]]]);
+eq('merge as Config\\Dom: a text value replaces the CDATA section', merged('di', ["a2.xml", "a1.xml"]), ["e", "config", {}, [["e", "type", {"name": "T"}, [["e", "arguments", {}, [["e", "argument", {"name": "v", "xsi:type": "string"}, [["t", "old"]]]]]]]]]);
+eq('merge as Config\\Dom: a node with a comment and text (no element) takes the new text', merged('di', ["b1.xml", "b2.xml"]), ["e", "config", {}, [["e", "type", {"name": "T"}, [["e", "arguments", {}, [["e", "argument", {"name": "v", "xsi:type": "string"}, [["t", "new"]]]]]]]]]);
+eq('merge as Config\\Dom: another xsi:type replaces the argument whole', merged('di', ["c1.xml", "c2.xml"]), ["e", "config", {}, [["e", "type", {"name": "T"}, [["e", "arguments", {}, [["e", "argument", {"extra": "1", "name": "v", "xsi:type": "string"}, [["t", "s"]]]]]]]]]);
+eq('merge as Config\\Dom: … in either order', merged('di', ["c2.xml", "c1.xml"]), ["e", "config", {}, [["e", "type", {"name": "T"}, [["e", "arguments", {}, [["e", "argument", {"name": "v", "xsi:type": "array"}, [["e", "item", {"name": "a", "xsi:type": "string"}, [["t", "x"]]]]]]]]]]]);
+eq('merge as Config\\Dom: item name="0" is no key (PHP: "0" is falsy) — two items match: Config\\Dom throws', merged('di', ["d1.xml", "d2.xml"]), {"error": "More than one node matching the query: /config/type[@name='T']/arguments/argument[@name='v']/item"});
+eq('merge as Config\\Dom: … with one item in the base it merges into it, the other item is appended', merged('di', ["d2.xml", "d1.xml"]), ["e", "config", {}, [["e", "type", {"name": "T"}, [["e", "arguments", {}, [["e", "argument", {"name": "v", "xsi:type": "array"}, [["e", "item", {"name": "0", "xsi:type": "string"}, [["t", "zero"]]], ["e", "item", {"name": "1", "xsi:type": "string"}, [["t", "one"]]]]]]]]]]]);
+eq('merge as Config\\Dom: CRLF line ends become LF, DTD entities expand in attribute values', merged('di', ["e1.xml"]), ["e", "config", {}, [["t", "\n  "], ["e", "type", {"name": "T"}, [["e", "arguments", {}, [["e", "argument", {"name": "v", "note": "a|b", "xsi:type": "string"}, [["t", "x\n"]]]]]]], ["t", "\n"]]]);
+eq('merge as Config\\Dom: events: observers merge by name, attributes accumulate', merged('events', ["f1.xml", "f2.xml"]), ["e", "config", {}, [["e", "event", {"name": "e"}, [["e", "observer", {"disabled": "true", "instance": "A", "name": "o"}, []], ["e", "observer", {"instance": "B", "name": "p"}, []]]]]]);
+
+// Under Magento's ErrorHandler (bin/magento, Bootstrap::run): Mage-OS 2.4.9 / PHP 8.3 / libxml 2.9.14
+eq('merge as Config\\Dom: an id with an apostrophe breaks the XPath literal — DOMXPath warns, Magento\'s ErrorHandler throws', merged('di', ['g1.xml', 'g2.xml']), { error: 'Warning: DOMXPath::query(): Invalid predicate' });
+eq('merge as Config\\Dom: a value with a bare & set as nodeValue — libxml "unterminated entity reference" (%15s)', merged('di', ['h1.xml', 'h2.xml']), { error: 'Warning: Magento\\Framework\\Config\\Dom::_mergeNode(): unterminated entity reference               1' });
+eq('merge as Config\\Dom: … &amp; becomes &, another reference an entity reference node', merged('di', ['h1.xml', 'h3.xml']), ["e", "config", {}, [["e", "type", {"name": "T"}, [["e", "arguments", {}, [["e", "argument", {"name": "v", "xsi:type": "string"}, [["t", "a & b "], ["x", "DOMEntityReference"], ["t", " c"]]]]]]]]]);
 eq('well-formedness as libxml: a UTF-8 byte-order mark before the declaration is skipped',
   checkXmlWellFormed('\uFEFF<?xml version="1.0" encoding="UTF-8"?>\n<config/>\n'), []);
 eq('Magento\'s message for a file Config\\Dom rejects (Config\\Reader\\Filesystem, ERROR_FORMAT_DEFAULT)',

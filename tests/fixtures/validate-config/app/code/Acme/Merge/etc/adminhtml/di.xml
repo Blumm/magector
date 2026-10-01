@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="urn:magento:framework:ObjectManager/etc/config.xsd">
+    <!-- no xsi:type: Acme_Good declares it, and Magento converts the merged area -->
+    <virtualType name="Acme\Good\Model\Grid">
+        <arguments>
+            <argument name="columns">
+                <item name="note" xsi:type="string">main.note</item>
+            </argument>
+        </arguments>
+    </virtualType>
+</config>

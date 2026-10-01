@@ -110,6 +110,14 @@ const BROKEN = 'app/code/Acme/Broken/etc/frontend/di.xml';
 const VALUES_DI = 'app/code/Acme/Values/etc/di.xml';
 const VALUES_EVENTS = 'app/code/Acme/Values/etc/events.xml';
 const OFF = 'app/code/Acme/Off/etc/di.xml';
+// Files that load or fail only merged with the area's other files. Verdicts from Magento's readers
+// (merge-truth.php sets, Magento 2.4.5-p14): adminhtml loads, graphql fails ("Numeric value is
+// expected."), crontab fails ("More than one node matching the query") though both files load alone
+const MERGE_ADMIN = 'app/code/Acme/Merge/etc/adminhtml/di.xml';
+const MERGE_GRAPHQL = 'app/code/Acme/Merge/etc/graphql/di.xml';
+const VALUES_CRONTAB = 'app/code/Acme/Values/etc/crontab/di.xml';
+const MERGE_CRONTAB = 'app/code/Acme/Merge/etc/crontab/di.xml';
+const section = (t, title) => { const i = t.indexOf(`### ${title}`); return i < 0 ? '' : t.slice(i, (t.indexOf('\n### ', i + 4) + 1 || t.length + 1) - 1); };
 
 async function main() {
   console.log('\nConfiguration validation (fixture: tests/fixtures/validate-config)\n');
@@ -143,6 +151,17 @@ async function main() {
     });
     check('built-in: files under Test/ are not checked (Magento does not load them)', t, { hasNot: ['Test/Unit/etc/di.xml'] });
     check('built-in: valid files are not reported', t, { hasNot: ['Acme/Good/etc/di.xml`', 'Acme/Good/etc/events.xml`', 'module.xml`'] });
+    check('built-in: an argument without xsi:type that another file of the area declares loads — Magento converts the merged area (was: fails in every mode)', section(t, 'Loads, but not as written'), {
+      has: [`- \`${MERGE_ADMIN}:6\``, 'Value for key "xsi:type" is missing in the argument data.', 'another file of it sets what this file leaves out'],
+    });
+    check('built-in: … and is not reported as failing', section(t, 'Fails in every mode'), { hasNot: [MERGE_ADMIN] });
+    check('built-in: merged, the other file\'s xsi:type="number" meets "five" — the area fails with Magento\'s message', section(t, 'Fails in every mode'), {
+      has: [`- \`${MERGE_GRAPHQL}:6\``, '**DI configuration, area graphql**', "argument \"limit\": InvalidArgumentException 'Numeric value is expected.'"],
+    });
+    check('built-in: two files that load alone fail merged — the type matches two nodes (Config\\Dom)', section(t, 'Fails in every mode'), {
+      has: ['**DI configuration, area crontab**', "LocalizedException 'More than one node matching the query: /config/type[@name='Acme\\Good\\Model\\Thing']'"],
+      hasNot: [`- \`${VALUES_CRONTAB}`, `- \`${MERGE_CRONTAB}`],
+    });
 
     t = await builtin.call('magento_validate_config', { path: 'app/code/Acme/Good' });
     check('built-in: scope to a module — no problems', t, {
@@ -156,7 +175,11 @@ async function main() {
     // ── Notice in the DI / event tools ─────────────────────────────
     t = await builtin.call('magento_find_plugin', { targetClass: 'Acme\\Good\\Model\\Thing' });
     check('find_plugin: notice lists the rejected file of an enabled module', t, {
-      has: ['**Magento rejects 2 configuration file(s)**', `\`${BROKEN}:5\` — Opening and ending tag mismatch: type line 3 and typ`, `\`${VALUES_DI}:4\``],
+      has: ['**Magento rejects 3 configuration file(s)**', `\`${BROKEN}:5\` — Opening and ending tag mismatch: type line 3 and typ`, `\`${VALUES_DI}:4\``, `\`${MERGE_GRAPHQL}:6\``],
+      hasNot: [`\`${MERGE_ADMIN}`],
+    });
+    check('find_plugin: notice names areas whose merged configuration fails although each file loads alone', t, {
+      has: ['**Magento fails to load the merged configuration of 2 area(s)**', "DI configuration, area crontab — LocalizedException 'More than one node matching the query"],
     });
     check('find_plugin: … not the one of a disabled module nor under Test/', t, { hasNot: [`${OFF}:`, 'Test/Unit/etc/di.xml'] });
     t = await builtin.call('magento_find_observer', { eventName: 'acme_good_saved' });
@@ -185,7 +208,7 @@ async function main() {
       has: ['### Fails in developer mode (schema) (1)', '- **DI configuration, area global**', 'FAKE-NATIVE merged schema error'],
     });
     check('native: converter exception of a file whose area loads → masked by a later file', t, {
-      has: ['FAKE-NATIVE converter error\n(Magento converts the merged configuration: a later file overrides this value'],
+      has: ['FAKE-NATIVE converter error\n(Magento converts the merged configuration of the area: another file of it sets what this file leaves out or overrides it'],
     });
     check('native: declared-schema violations are their own section, with the caveat', t, {
       has: ['### Violates the schema it declares (1)', 'FAKE-NATIVE declared schema error', 'module.xml is read without one'],

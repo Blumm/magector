@@ -13,28 +13,49 @@ import { readFileSync } from 'fs';
 
 const ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
 
-function decodeEntities(s) {
-  return s.replace(/&(#x[0-9a-f]+|#\d+|\w+);/gi, (m, e) => {
-    if (e[0] === '#') {
-      const code = e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
-      return Number.isFinite(code) ? String.fromCodePoint(code) : m;
-    }
-    return ENTITIES[e] ?? m;
+const charRef = (m, e) => {
+  const code = e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+  return Number.isFinite(code) ? String.fromCodePoint(code) : m;
+};
+
+/**
+ * Character and entity references, as libxml substitutes them: the predefined entities and the
+ * general entities the document's internal DTD subset declares (`declared`, name → replacement text).
+ * In an attribute value the replacement text is normalized too (literal tab / newline → space).
+ */
+function decodeEntities(s, declared = null, inAttribute = false, depth = 0) {
+  return s.replace(/&(#x[0-9a-f]+|#\d+|[A-Za-z_:][\w.:-]*);/gi, (m, e) => {
+    if (e[0] === '#') return charRef(m, e);
+    if (ENTITIES[e] !== undefined) return ENTITIES[e];
+    const value = declared?.get(e);
+    if (value === undefined || depth > 8) return m;
+    return decodeEntities(inAttribute ? value.replace(/[\t\n]/g, ' ') : value, declared, inAttribute, depth + 1);
   });
+}
+
+/** <!ENTITY name "value"> of an internal DTD subset; character references are replaced when declared. */
+function declaredEntities(doctype) {
+  const out = new Map();
+  for (const m of doctype.matchAll(/<!ENTITY\s+([A-Za-z_:][\w.:-]*)\s+(?:"([^"]*)"|'([^']*)')\s*>/g)) {
+    if (!out.has(m[1])) out.set(m[1], (m[2] ?? m[3]).replace(/\r\n?/g, '\n').replace(/&(#x[0-9a-f]+|#\d+);/gi, charRef));
+  }
+  return out;
 }
 
 /**
  * Parse an XML document into { name, attrs, children, text, seq, line } nodes. `seq` keeps the
- * child elements, text and CDATA sections in document order ({ node } | { text } | { cdata }) —
- * the converter checks of checkConfigValues read mixed content as Magento's converters do.
+ * child nodes in document order ({ node } | { text } | { cdata } | { comment } | { pi }) — the
+ * converter checks of checkConfigValues read mixed content as Magento's converters do, and
+ * mergeConfigFiles merges as Config\Dom does.
  * Tolerant: unknown or unbalanced closing tags are ignored rather than thrown, so a broken file
  * yields what it can (checkXmlWellFormed says whether Magento loads it).
  */
 export function parseXml(content) {
   const root = { name: '#document', attrs: {}, children: [], text: '', seq: [] };
   if (!content) return root;
-  const src = content;
+  const src = content.replace(/\r\n?/g, '\n');     // end-of-line handling (XML 1.0 §2.11), as libxml
   const stack = [root];
+  let entities = null;                  // general entities of the internal DTD subset
   // Comments, processing instructions and DOCTYPE are tokens of the same scan as CDATA and tags, so
   // whichever starts first wins (a "<!--" inside CDATA is text, not the start of a comment).
   const tagRe = /<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<!DOCTYPE(?:[^[>]|\[[\s\S]*?\])*>|<!\[CDATA\[([\s\S]*?)\]\]>|<(\/?)([A-Za-z_][\w:.-]*)((?:\s+[\w:.-]+\s*=\s*(?:"[^"]*"|'[^']*'))*)\s*(\/?)>|([^<]+)|</g;
@@ -44,12 +65,17 @@ export function parseXml(content) {
   while ((m = tagRe.exec(src)) !== null) {
     const top = stack[stack.length - 1];
     if (m[3] === undefined && m[1] === undefined && m[6] === undefined) {
-      continue;                         // comment, PI, DOCTYPE, or a stray "<"
+      // comment, PI, DOCTYPE, or a stray "<". Comments and PIs inside an element are child nodes of it
+      // in the DOM, which Config\Dom's merge looks at (hasChildNodes, a single text node)
+      if (top !== root && m[0].startsWith('<!--')) top.seq.push({ comment: true });
+      else if (top !== root && m[0].startsWith('<?')) top.seq.push({ pi: true });
+      else if (m[0].startsWith('<!DOCTYPE')) entities = declaredEntities(m[0]);
+      continue;
     } else if (m[1] !== undefined) {    // CDATA
       top.text += m[1];
       top.seq.push({ cdata: m[1] });
     } else if (m[6] !== undefined) {    // text
-      const text = decodeEntities(m[6]);
+      const text = decodeEntities(m[6], entities);
       top.text += text;
       top.seq.push({ text });
     } else if (m[2] === '/') {          // closing tag
@@ -60,7 +86,8 @@ export function parseXml(content) {
       const attrs = {};
       const attrRe = /([\w:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
       let a;
-      while ((a = attrRe.exec(m[4])) !== null) attrs[a[1]] = decodeEntities(a[2] ?? a[3] ?? '');
+      // attribute-value normalization (§3.3.3): literal tab / newline become a space, references stay
+      while ((a = attrRe.exec(m[4])) !== null) attrs[a[1]] = decodeEntities((a[2] ?? a[3] ?? '').replace(/[\t\n]/g, ' '), entities, true);
       const node = { name: m[3], attrs, children: [], text: '', seq: [], line: lineAt(m.index) };
       top.children.push(node);
       top.seq.push({ node });
@@ -1407,12 +1434,14 @@ const nullAttributeMessage = (converter) =>
  * validation, which only runs in developer mode, is not reproduced here — the native check does it.
  */
 export function checkConfigValues(content, relPath) {
+  const root = parseXml(String(content ?? '')).children[0];
+  return root ? checkConfigTree(root, /(^|\/)events\.xml$/.test(relPath || '')) : [];
+}
+
+/** checkConfigValues on a parsed root element — a file's, or an area's merged one (mergeConfigFiles). */
+function checkConfigTree(root, isEvents) {
   const out = [];
-  const doc = parseXml(String(content ?? ''));
-  const root = doc.children[0];
-  if (!root) return out;
-  const isEvents = /(^|\/)events\.xml$/.test(relPath || '');
-  const add = (severity, node, message) => out.push({ severity, line: node.line || 0, message });
+  const add = (severity, node, message) => out.push({ severity, line: node.line || 0, file: node.file, message });
   const label = n => (n.attrs.name ? `<${n.name} name="${n.attrs.name}">` : `<${n.name}>`);
   const BOOLEAN = ['true', '1', 'false', '0'];
   if (isEvents) {
@@ -1489,4 +1518,223 @@ export function checkConfigValues(content, relPath) {
     if (node.attrs.name === undefined) add('error', node, `<${node.name}> without name: ${nullAttributeMessage(MAPPER)}`);
   }
   return out;
+}
+
+// ─── Config\Dom merge ───────────────────────────────────────────
+// Magento reads an area's di.xml / events.xml as one document: Config\Reader\Filesystem::_readFiles()
+// loads the first file into Config\Dom and merges the next ones into it, then converts the result. A
+// value one file leaves out can come from another (an argument's xsi:type, a plugin's type), so a file
+// that fails alone can load, and two files that load alone can fail together.
+
+/** idAttributes and typeAttributeName of ObjectManager\Config\Reader\Dom and Event\Config\Reader. */
+export const CONFIG_MERGE = {
+  di: {
+    idAttributes: [
+      ['/config/preference', 'for'],
+      ['/config/(type|virtualType)', 'name'],
+      ['/config/(type|virtualType)/plugin', 'name'],
+      ['/config/(type|virtualType)/arguments/argument', 'name'],
+      ['/config/(type|virtualType)/arguments/argument(/item)+', 'name'],
+    ],
+    typeAttribute: 'xsi:type',
+  },
+  events: {
+    idAttributes: [['/config/event', 'name'], ['/config/event/observer', 'name']],
+    typeAttribute: null,
+  },
+};
+
+/** An exception Config\Dom throws while merging; Magento fails the whole area with it. */
+export class ConfigMergeError extends Error {
+  constructor(message, file) { super(message); this.file = file; }
+}
+
+/**
+ * `$element->nodeValue = $value` in Config\Dom: libxml (xmlStringGetNodeList) reads the string as
+ * content — "&" starts a reference: a predefined entity or character reference becomes text, another
+ * name an entity reference node; without a ";" after it PHP warns "unterminated entity reference",
+ * which Magento's ErrorHandler throws. Returns the warning, or null.
+ */
+const setElementValue = (n, value) => {
+  const seq = [];
+  let buf = '';
+  for (let i = 0; i < value.length;) {
+    const amp = value.indexOf('&', i);
+    if (amp < 0) { buf += value.slice(i); break; }
+    buf += value.slice(i, amp);
+    if (value[amp + 1] === '#') {
+      const hex = value[amp + 2] === 'x';
+      let j = amp + (hex ? 3 : 2), code = 0;
+      for (; j < value.length && value[j] !== ';'; j++) {
+        const d = hex ? parseInt(value[j], 16) : (value[j] >= '0' && value[j] <= '9' ? Number(value[j]) : NaN);
+        if (Number.isNaN(d)) return `${hex ? 'invalid hexadecimal' : 'invalid decimal'} character value`;
+        code = code * (hex ? 16 : 10) + d;
+      }
+      if (j >= value.length) return `${hex ? 'invalid hexadecimal' : 'invalid decimal'} character value`;
+      if (code) buf += String.fromCodePoint(code);
+      i = j + 1;
+      continue;
+    }
+    const semi = value.indexOf(';', amp + 1);
+    if (semi < 0) return `unterminated entity reference ${value.slice(amp + 1).padStart(15)}`;   // libxml: "%15s"
+    const name = value.slice(amp + 1, semi);
+    if (ENTITIES[name] !== undefined) buf += ENTITIES[name];
+    else if (name) { if (buf) seq.push({ text: buf }); buf = ''; seq.push({ entref: name }); }
+    i = semi + 1;
+  }
+  if (buf) seq.push({ text: buf });
+  n.children = [];
+  n.seq = seq;
+  n.text = seq.map(e => e.text ?? '').join('');
+  return null;
+};
+const isTextNode = n => n.seq.length === 1 && (n.seq[0].text !== undefined || n.seq[0].cdata !== undefined);  // DOMCdataSection is a DOMText
+const isCdataNode = n => !n.seq.some(e => e.node);
+// NodePathMatcher::simplifyXpath(): predicates out, then "/prefix:" → "/"
+const simplifyXpath = p => (p.includes('[') || p.includes(':') ? p.replace(/\[@[^\]]+?\]/g, '').replace(/\/[^:]+?:/g, '/') : p);
+
+/**
+ * Config\Dom::merge() over files in Magento's order ({ file, content }, all well-formed), the first one
+ * the base. Returns the merged root element; nodes keep the file and line they came from. Throws
+ * ConfigMergeError where Config\Dom throws ("More than one node matching the query").
+ */
+export function mergeConfigFiles(files, { idAttributes, typeAttribute }) {
+  const patterns = idAttributes.map(([p, a]) => [new RegExp(`^${p}$`), a]);
+  const idCache = new Map();                 // simplified path → id attribute (or null)
+  const idAttributeOf = p => {
+    const simple = simplifyXpath(p);
+    if (!idCache.has(simple)) idCache.set(simple, (patterns.find(([re]) => re.test(simple)) || [])[1] || null);
+    return idCache.get(simple);
+  };
+  const doc = { name: '#document', attrs: {}, children: [], text: '', seq: [] };
+  let file = null;
+  // _getMatchedNode(): DOMXPath::query of the path _getNodePathByParent() builds. A node's children are
+  // reached only through a parent whose own path matched exactly one node (more throws), so the query
+  // is the parent's children with that name and id value. They are indexed per parent by (name, id
+  // attribute) → value → nodes in document order, and the index follows every append, replace and
+  // attribute merge (a scan per query was quadratic: ~270 ms for the global DI area of 300 modules).
+  const index = new WeakMap();               // parent → Map(`${name}\0${attr}`) → { name, attr, byValue }
+  const parentOf = new WeakMap();
+  const valueOf = (entry, c) => (entry.attr ? c.attrs[entry.attr] : '');
+  const indexAdd = (p, c) => {
+    parentOf.set(c, p);
+    for (const entry of (index.get(p) || new Map()).values()) {
+      if (c.name !== entry.name) continue;
+      const v = valueOf(entry, c);
+      if (v === undefined) continue;
+      if (!entry.byValue.has(v)) entry.byValue.set(v, []);
+      const list = entry.byValue.get(v);
+      if (p.children[p.children.length - 1] === c) { list.push(c); continue; }   // appended
+      const at = p.children.indexOf(c);       // a replaced node keeps its place
+      let k = list.length;
+      while (k > 0 && p.children.indexOf(list[k - 1]) > at) k--;
+      list.splice(k, 0, c);
+    }
+  };
+  const indexRemove = (p, c) => {
+    for (const entry of (index.get(p) || new Map()).values()) {
+      if (c.name !== entry.name) continue;
+      for (const [v, list] of entry.byValue) {
+        const k = list.indexOf(c);
+        if (k >= 0) { list.splice(k, 1); if (!list.length) entry.byValue.delete(v); }
+      }
+    }
+  };
+  const childrenMatching = (p, name, attr, value) => {
+    if (!index.has(p)) index.set(p, new Map());
+    const key = `${name}\0${attr || ''}`;
+    let entry = index.get(p).get(key);
+    if (!entry) {
+      entry = { name, attr, byValue: new Map() };
+      for (const c of p.children) {
+        parentOf.set(c, p);
+        if (c.name !== name) continue;
+        const v = valueOf(entry, c);
+        if (v === undefined) continue;
+        if (!entry.byValue.has(v)) entry.byValue.set(v, []);
+        entry.byValue.get(v).push(c);
+      }
+      index.get(p).set(key, entry);
+    }
+    return entry.byValue.get(attr ? value : '') || [];
+  };
+  // Nodes of a merged file are moved, not copied (importNode): each file is parsed for this merge only
+  const mergeNode = (node, parent, parentPath) => {
+    let xpath = `${parentPath}/${node.name}`;
+    const attr = idAttributeOf(xpath);
+    const value = attr ? node.attrs[attr] : undefined;
+    const keyed = value !== undefined && value !== '' && value !== '0';     // PHP: ($value = getAttribute()) is truthy
+    if (keyed) xpath += `[@${attr}='${value}']`;
+    // An apostrophe ends the XPath literal: DOMXPath::query() warns, and Magento's ErrorHandler throws
+    if (keyed && value.includes("'")) throw new ConfigMergeError('Warning: DOMXPath::query(): Invalid predicate', file.file);
+    const found = childrenMatching(parent, node.name, keyed ? attr : null, value);
+    if (found.length > 1) throw new ConfigMergeError(`More than one node matching the query: ${xpath}`, file.file);
+    const matched = found[0] || null;
+    if (!matched) {
+      if (parent === doc) throw new ConfigMergeError(`the root element <${node.name}> differs from the first file's`, file.file);
+      parent.children.push(node);
+      parent.seq.push({ node });
+      indexAdd(parent, node);
+      return;
+    }
+    if (typeAttribute && node.attrs[typeAttribute] !== undefined && matched.attrs[typeAttribute] !== undefined &&
+      node.attrs[typeAttribute] !== matched.attrs[typeAttribute]) {          // another type: the node replaces the old one
+      indexRemove(parent, matched);
+      parent.children[parent.children.indexOf(matched)] = node;
+      parent.seq[parent.seq.findIndex(e => e.node === matched)] = { node };
+      indexAdd(parent, node);
+      return;
+    }
+    // _mergeAttributes(); the parent's index follows only when an attribute it is keyed by changes
+    const keyedBy = index.get(parent);
+    const reindex = keyedBy && [...keyedBy.values()].some(e => e.attr && e.name === matched.name &&
+      node.attrs[e.attr] !== undefined && matched.attrs[e.attr] !== node.attrs[e.attr]);
+    if (reindex) indexRemove(parent, matched);
+    Object.assign(matched.attrs, node.attrs);
+    if (reindex) indexAdd(parent, matched);
+    if (!node.seq.length) return;
+    const setValue = v => {
+      const warning = setElementValue(matched, v);
+      index.delete(matched);
+      if (warning) throw new ConfigMergeError(`Warning: Magento\\Framework\\Config\\Dom::_mergeNode(): ${warning}`, file.file);
+    };
+    if (isTextNode(node)) {
+      if (!matched.seq.length || isTextNode(matched) || isCdataNode(matched)) setValue(node.seq[0].text ?? node.seq[0].cdata);
+    } else if (isCdataNode(node) && isTextNode(matched)) {
+      const cdata = node.seq.find(e => e.cdata !== undefined);
+      if (cdata) setValue(cdata.cdata);
+    } else if (isCdataNode(node) && isCdataNode(matched)) {
+      const from = node.seq.find(e => e.cdata !== undefined);
+      const to = matched.seq.find(e => e.cdata !== undefined);
+      if (from && to) { to.cdata = from.cdata; matched.text = matched.seq.map(e => e.text ?? e.cdata ?? '').join(''); }
+    } else {
+      for (const e of node.seq) if (e.node) mergeNode(e.node, matched, xpath);
+    }
+  };
+  for (const f of files) {
+    const root = parseXml(f.content).children[0];
+    if (!root) continue;
+    for (const n of [root, ...walk(root)]) n.file = f.file;
+    file = f;
+    if (!doc.children.length) { doc.children.push(root); doc.seq.push({ node: root }); continue; }
+    mergeNode(root, doc, '');
+  }
+  return doc.children[0] || null;
+}
+
+/**
+ * An area's configuration as Magento loads it: the files merged (mergeConfigFiles), then converted
+ * (checkConfigTree, Mapper\Dom / Event\Config\Converter order). Returns the exception Magento stops at
+ * — { message, file, line } — or null when the area loads.
+ */
+export function checkMergedConfig(files, kind) {
+  let root;
+  try {
+    root = mergeConfigFiles(files, CONFIG_MERGE[kind]);
+  } catch (e) {
+    if (e instanceof ConfigMergeError) return { message: `LocalizedException '${e.message}'`, file: e.file, line: 0 };
+    throw e;
+  }
+  const error = root ? checkConfigTree(root, kind === 'events').find(p => p.severity === 'error') : null;
+  return error ? { message: error.message, file: error.file, line: error.line } : null;
 }
