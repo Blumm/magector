@@ -97,8 +97,11 @@ class McpClient {
     return (res.result?.content || []).map(c => c.text || '').join('\n');
   }
 
-  stop() {
-    try { this.child.kill(); } catch { /* already exited */ }
+  /** Waits for the server to exit: it logs its shutdown to <root>/.magector, which a caller removing the root races. */
+  async stop() {
+    if (this.child.exitCode === null && this.child.signalCode === null) {
+      await new Promise(resolve => { this.child.once('exit', resolve); this.child.kill(); });
+    }
     rmSync(this.dbDir, { recursive: true, force: true });
   }
 }
@@ -161,7 +164,7 @@ async function main() {
       has: ['**Read differently than written**', `\`${VALUES_EVENTS}:4\` — <observer name="values_observer"> disabled="1" does not disable the observer`],
     });
   } finally {
-    builtin.stop();
+    await builtin.stop();
   }
 
   // ── Native check (fake PHP) ────────────────────────────────────
@@ -191,7 +194,7 @@ async function main() {
       has: ['### Loads, but not as written', 'disabled="1" does not disable the observer'],
     });
   } finally {
-    native.stop();
+    await native.stop();
   }
 
   const failing = new McpClient({ MAGECTOR_PHP: 'exit 3' });
@@ -202,7 +205,7 @@ async function main() {
       has: ['Native check not available (exit 3 failed (exit 3)', '**Engine:** built-in'],
     });
   } finally {
-    failing.stop();
+    await failing.stop();
   }
 
   // ── Review of #31 ──────────────────────────────────────────────
@@ -240,7 +243,7 @@ async function main() {
       has: ['### DI Plugin Registrations for Acme\\Good\\Model\\Thing'],
     });
   } finally {
-    onPath.stop();
+    await onPath.stop();
   }
   // The native check does not block the server: another call is answered while it runs
   const slow = new McpClient({ MAGECTOR_PHP: `sleep 3; "${process.execPath}" "${path.join(live, 'fake-php.mjs')}"` }, live);
@@ -253,7 +256,7 @@ async function main() {
     await validating;
     ok('native check: the server answers other calls while it runs (was: spawnSync blocked it)', order.join() === 'module_structure,validate', order.join());
   } finally {
-    slow.stop();
+    await slow.stop();
     rmSync(live, { recursive: true, force: true });
   }
 
