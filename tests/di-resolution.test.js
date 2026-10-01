@@ -158,8 +158,11 @@ async function main() {
     check('di.xml: a comment opener inside CDATA does not hide the declarations after it', t, {
       has: ['Runs: `Acme\\Ext\\Plugin\\OverridePlugin`'],
     });
-    check('find_plugin: the semantic block is labelled as not resolved against targetClass', t, {
-      has: ['### Similar plugin code (semantic, not filtered by targetClass)'],
+    // The semantic block keeps its label ("Similar plugin code (semantic, not filtered by targetClass)")
+    // when it has results; without any (no index here) it is left out instead of printing an empty one.
+    check('find_plugin: no empty semantic block (tokens) — only the structural sections', t, {
+      hasNot: ['{"results":[],"count":0}', '### Similar plugin code'],
+      has: ['### DI Plugin Registrations for'],
     });
 
     t = await client.call('magento_find_plugin', { targetClass: 'Acme\\Core\\Model\\Guarded' });
@@ -283,6 +286,56 @@ async function main() {
     t = await client.call('magento_find_plugin', { targetClass: 'Acme\\Core\\Model\\Guarded' });
     check('find_plugin: disabled="1" (xs:boolean) disables the plugin', t, {
       has: ['**guard_plugin** [global]: `Acme\\Core\\Plugin\\GuardPlugin` — **disabled** by Acme_Ext'],
+    });
+
+    // ── Class file lookup by FQCN (two classes named Stock in different modules) ──
+    t = await client.call('magento_find_method', { methodName: 'execute', className: 'Acme\\Core\\Observer\\Stock' });
+    check('find_method: class file resolved by FQCN, not by file name', t, {
+      has: ['app/code/Acme/Core/Observer/Stock.php'],
+      hasNot: ['app/code/Acme/Mix/Observer/Stock.php'],
+    });
+    t = await client.call('magento_trace_call_chain', { className: 'Acme\\Core\\Observer\\Stock', methodName: 'execute' });
+    check('trace_call_chain: start class resolved by FQCN, not by file name', t, {
+      has: ['app/code/Acme/Core/Observer/Stock.php'],
+      hasNot: ['app/code/Acme/Mix/Observer/Stock.php'],
+    });
+
+    // Seen on a Magento 2.4.5 project: Magento runs the plugins of the class a preference substitutes
+    t = await client.call('magento_find_plugin', { targetClass: 'Acme\\Core\\Model\\Importer' });
+    check('find_plugin: a plugin on the class a preference substitutes for the target runs too (was: missing)', t, {
+      has: ['**better_importer_plugin** → `Acme\\Ext\\Plugin\\BetterImporterPlugin` [global] (on `Acme\\Ext\\Model\\BetterImporter` — the class that runs for this type, preference)'],
+    });
+    check('find_plugin: … also a plugin declared for one area on that class, when the preference is global (was: missing)', t, {
+      has: ['**better_importer_frontend_plugin** → `Acme\\Ext\\Plugin\\BetterImporterPlugin` [frontend] (on `Acme\\Ext\\Model\\BetterImporter` — the class that runs for this type, preference [frontend])'],
+    });
+    t = await client.call('magento_find_plugin', { targetClass: 'Acme\\Core\\Model\\AbstractSource' });
+    check('find_plugin: an abstract class is marked — its plugins run on its concrete subclasses, not on it (was: reported as running)', t, {
+      has: ['**abstract_source_plugin**', '[abstract class — does not run on it directly; runs on its concrete subclasses]'],
+    });
+    t = await client.call('magento_find_plugin', { targetClass: 'Acme\\Core\\Model\\TableSource' });
+    check('find_plugin: … and on a concrete subclass the inherited plugin runs, unmarked', t, {
+      has: ['**abstract_source_plugin** → `Acme\\Ext\\Plugin\\SourcePlugin` [global] (declared on `Acme\\Core\\Model\\AbstractSource`)'], hasNot: ['[abstract class'],
+    });
+
+    // Review of #31: dependencies come from constructor hints as written — short names imported by
+    // `use` (here one aliased) — and must be qualified by the file's namespace and imports
+    t = await client.call('magento_trace_call_chain', { className: 'Acme\\Core\\Model\\Checkout', methodName: 'place', depth: 3 });
+    check('trace_call_chain: a dependency hinted by a `use`-imported (aliased) short name resolves', t, {
+      has: ['**Acme\\Core\\Model\\Validator\\BasketValidator::validate**'],
+      hasNot: ['BasketValidator::validate** [unresolved]', 'Validator::validate** [unresolved]'],
+    });
+    check('trace_call_chain: an interface hint follows its own preference in module order, not another module\'s interface with the same short name', t, {
+      has: ['**Acme\\Core\\Model\\BasketRepository::save**', '**Acme\\Core\\Model\\BasketRepository::persist**'],
+      hasNot: ['GiftBasketRepository'],
+    });
+
+    t = await client.call('magento_batch', { queries: [
+      { tool: 'magento_find_method', args: { methodName: 'execute', className: 'Acme\\Core\\Observer\\Stock' } },
+      { tool: 'magento_find_class', args: { className: 'Acme\\Core\\Observer\\Stock' } },
+    ] });
+    check('magento_batch: find_method / find_class resolve the class file by FQCN', t, {
+      has: ['app/code/Acme/Core/Observer/Stock.php'],
+      hasNot: ['app/code/Acme/Mix/Observer/Stock.php'],
     });
 
     // ── Events ───────────────────────────────────────────────────

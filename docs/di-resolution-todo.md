@@ -3,41 +3,43 @@
 Follow-ups to the structural DI / event resolution (`src/di-config.js`). Verification against a
 Magento installation: `scripts/verify-magento/`.
 
-## A. Invalid XML / values — report as an error, ideally with Magento's native message
+## A2. Structural answers — done: `find_api`, `find_graphql`, `find_cron`, `find_db_schema`, `module_structure`
 
-Magento behaviour (Mage-OS 2.4.9 source):
-- Not well-formed XML → `Config\Dom::_initDom()` fails in **every mode** → `LocalizedException`
-  `The XML in file "<file>" is invalid:\n<errors>\nVerify the XML and try again.` — the area's configuration
-  does not load. Error format `Config\Dom::ERROR_FORMAT_DEFAULT` = `"%message%\nLine: %line%\n"` (libxml messages).
-- XSD validation only when validation is required (developer mode); production skips it and the
-  converters decide.
-- Plugin `disabled`: `BooleanUtils::toBoolean()` strict — `true`, `1`, `'true'`, `'1'` / `false`, `0`, `'false'`, `'0'`;
-  anything else → `InvalidArgumentException: Boolean value is expected, supported values: array (…)` in
-  every mode. `sortOrder` → `(int)` cast.
-- Observer `disabled`: only `'true'` disables; anything else is silently "not disabled".
+Verified against the installation and against Magento's readers on a synthetic fixture
+(`docs/verification.md`). Found on the way, still open:
 
-| # | Variant | Magento | Branch now | To do |
-|---|---------|---------|------------|-------|
-| A1 | Not well-formed (`/ >`, unclosed / mismatched tag, bare `&`, `<` in attribute, unquoted attribute, duplicate attribute, extra content after root) | error in every mode, area not loaded | tolerant parser salvages part of the data silently | report the file as broken with the native message; do not use its declarations; flag effective state as unreliable |
-| A2 | Plugin `disabled=" true "`, `TRUE`, `yes` | `InvalidArgumentException`, DI config fails | accepted as true / ignored | error with the native message |
-| A3 | Observer `disabled="1"`, `" true"`, `TRUE` | not disabled | not disabled (no warning) | warning |
-| A4 | `sortOrder="abc"` / `"10x"` | `(int)` → 0 / 10 | kept as text | cast like PHP + warning |
-| A5 | Missing required attribute (plugin / observer / type `name`, preference `for` / `type`, virtualType `name` / `type`) | XSD error in developer mode | ignored | warning ("developer mode: fails") |
-| A6 | Unknown element / attribute (XSD-invalid) | XSD error in developer mode only | ignored | warning |
+| # | Item |
+|---|------|
+| A13 | Cron: jobs / schedules from `core_config_data` are only noted (they are not in any file). |
+| A15 | **Class lookup reads only composer's PSR-4 map** — `autoload_classmap.php` and PSR-0 (`autoload_namespaces.php`) are not read. On the project 1,475 classes load only through the classmap (mostly dev tools, also `Cm_Cache_Backend_Redis`, `Credis_Client`); 67 of them have no namespace and a file named differently from the class, so the file-name fallback does not find them either → a class hierarchy through them is cut (inherited plugins can be missed). Fix: read both maps; verify against `Composer\Autoload\ClassLoader::findFile()` for every class. |
+| A16 | Cron (adversarial review): the `system/default/crontab` of app/etc/config.php and env.php is not read (only config.xml); several `<default>` / `<crontab>` nodes in one config.xml — only the first is read; a later `<schedule>` holding a comment does not replace the earlier one in Magento (Magector replaces it). |
+| A17 | webapi (review): two routes whose url differs only by surrounding whitespace are separate DOM nodes in Magento, and the last wins whole; Magector merges them. |
+| A18 | GraphQL (review): a duplicate definition swallowed into another type's chunk replaces the earlier one in Magento, Magector merges them (more, not less); escapes inside a block string (triple quotes) in `@resolver(class: …)`. |
+| A19 | XML attribute values: libxml turns tabs / newlines into spaces, `parseXml` keeps them (e.g. db_schema comments). |
+| A20 | Returns more, harmless: `implements` forms Magento does not recognise (one-letter interface name, leading `&`); `<schedule>0</schedule>` (Magento drops it); two indexes with the same generated name (Magento keeps the last); a foreign key to a table on another shard (Magento skips it). |
 
-Implementation plan:
-- **Native mode** (when `php` is available — `MAGECTOR_PHP` or PATH; Warden / DDEV PHP containers have it):
-  one PHP process per session runs `DOMDocument::loadXML()` + `schemaValidate()` like `Config\Dom::_initDom()`,
-  resolving `urn:magento:module:…` / `urn:magento:framework…:…` like `Config\Dom\UrnResolver` (module dirs
-  from module.xml / registration, framework from the composer PSR-4 map) → exact libxml messages in
-  Magento's format and wrapper text.
-- **Built-in fallback** (no PHP): well-formedness checks with libxml's wording for the common cases (A1),
-  value checks (A2–A4) with Magento's exact texts, required attributes (A5); schema validation (A6) only
-  in native mode.
-- New tool **`magento_validate_config`** — all config files that Magento would reject, by severity
-  (every mode / developer mode only), like a build check; DI and event tools show errors of the files
-  they read and a one-line notice when any config file in the project is broken.
-- Tests: one fixture file per variant, native and fallback paths.
+## A3. Performance (measured on the project, see docs/verification.md)
+
+Done: module discovery from the registrations and one listing of the modules' etc/ instead of a walk of
+the tree per pattern (each walk ~1 s); applyModuleOrder computed a file's module per comparison (1.6 s of
+a 2.8 s first call); `find_observer` no longer searches dispatchers (4.9 s per call); the PHP file list
+is reused for `MAGECTOR_PHP_LIST_TTL_MS` (30 s). First call now 0.15–0.5 s, repeated calls 8–110 ms for the DI / event /
+config tools.
+
+Still slower than grep on a first call (everything reads all PHP files):
+
+| # | Tool | First call | Repeat |
+|---|---|---|---|
+| P1 | `find_implementors` (class hierarchy) | 8.0 s | 1 ms |
+| P2 | `find_event_flow` / `find_event_dispatchers` | 3.0 s | 0.45 s |
+| P3 | `impact_analysis` | 2.5 s | — |
+| P4 | `find_callers` | 1.7 s | — |
+| P5 | `find_di_wiring` | 1.2 s (after the DI model) | — |
+
+Fix: an index of PHP files by content (declared types, extends / implements, dispatch() names) stored
+beside the vector index and refreshed by mtime, so a session does not re-read 73k files. Until then the
+class hierarchy behind `find_implementors` is built once per session (a class added mid-session is not
+seen until restart).
 
 ## B. Decision needed
 
@@ -51,7 +53,7 @@ Implementation plan:
 |---|------|
 | C1 | `find_callers`: calls through factory-created instances (`$f->create()->x()`) and untyped variables |
 | C2 | `trace_flow` deep for GraphQL stops at the resolver (does not follow the injected service → preference → plugins) |
-| C3 | Remaining regex readers: `trace_shipping_chain`, `trace_api`, `trace_call_chain` (only comment stripping applied) |
+| C3 | Remaining regex readers: `trace_shipping_chain`, `trace_api`, `trace_call_chain` (only comment stripping applied); semantic-only: `find_config`, `find_template`, `find_block`, `find_trigger`, `performance_profile` |
 | C4 | Generated classes (`generated/`: Factory, Proxy, Interceptor) and classes without a file → hierarchy unknown, inherited plugins can be missed, interceptability "unknown" |
 
 ## D. Not fixed — returns more / behaviour (left on purpose)

@@ -24,8 +24,9 @@ function decodeEntities(s) {
 }
 
 /**
- * Parse an XML document into { name, attrs, children, text } nodes. Tolerant: unknown or
- * unbalanced closing tags are ignored rather than thrown, so a broken file yields what it can.
+ * Parse an XML document into { name, attrs, children, text, line } nodes.
+ * Tolerant: unknown or unbalanced closing tags are ignored rather than thrown, so a broken file
+ * yields what it can (checkXmlWellFormed says whether Magento loads it).
  */
 export function parseXml(content) {
   const root = { name: '#document', attrs: {}, children: [], text: '' };
@@ -36,6 +37,8 @@ export function parseXml(content) {
   // whichever starts first wins (a "<!--" inside CDATA is text, not the start of a comment).
   const tagRe = /<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<!DOCTYPE(?:[^[>]|\[[\s\S]*?\])*>|<!\[CDATA\[([\s\S]*?)\]\]>|<(\/?)([A-Za-z_][\w:.-]*)((?:\s+[\w:.-]+\s*=\s*(?:"[^"]*"|'[^']*'))*)\s*(\/?)>|([^<]+)|</g;
   let m;
+  let line = 1, counted = 0;
+  const lineAt = off => { for (; counted < off; counted++) if (src.charCodeAt(counted) === 10) line++; return line; };
   while ((m = tagRe.exec(src)) !== null) {
     const top = stack[stack.length - 1];
     if (m[3] === undefined && m[1] === undefined && m[6] === undefined) {
@@ -53,7 +56,7 @@ export function parseXml(content) {
       const attrRe = /([\w:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
       let a;
       while ((a = attrRe.exec(m[4])) !== null) attrs[a[1]] = decodeEntities(a[2] ?? a[3] ?? '');
-      const node = { name: m[3], attrs, children: [], text: '' };
+      const node = { name: m[3], attrs, children: [], text: '', line: lineAt(m.index) };
       top.children.push(node);
       if (m[5] !== '/') stack.push(node);
     }
@@ -186,7 +189,14 @@ export function buildDiModel(diFiles) {
  * declaration wins" matches Magento's merge. Call once after buildModuleIndex.
  */
 export function applyModuleOrder(model, idx) {
-  const key = d => idx.orderOfFile(d.file);
+  // One lookup per file, not per comparison (sorting ~10k declarations compared each file's module
+  // O(n log n) times — 1.6 s of a 2.8 s first call on a 600-module project)
+  const keys = new Map();
+  const key = d => {
+    let k = keys.get(d.file);
+    if (k === undefined) { k = idx.orderOfFile(d.file); keys.set(d.file, k); }
+    return k;
+  };
   const byOrder = (a, b) => key(a) - key(b);
   model.preferences.sort(byOrder);
   model.virtualTypes.sort(byOrder);
@@ -489,6 +499,15 @@ function resolvePhpName(name, namespace, uses) {
   return namespace ? `${namespace}\\${n}` : n;
 }
 
+/**
+ * A class name as written inside a type (a type hint, a `new`, an `extends`) → its FQCN, resolved
+ * with the namespace and the `use` imports of the file that wrote it — as PHP resolves it.
+ */
+export function qualifyPhpName(name, type) {
+  if (!type) return String(name || '').replace(/^\\/, '');
+  return resolvePhpName(name, type.namespace, type.uses || new Map());
+}
+
 /** One `use …;` statement: plain, aliased, several, group (`A\{B, C as D}`, `A \{…}`); functions/consts skipped. */
 function parseUseStatement(raw, uses) {
   const body = raw.replace(/\s+/g, ' ').trim();
@@ -594,6 +613,7 @@ export function parsePhpFile(source) {
         fqcn: seg.ns ? `${seg.ns}\\${shortName}` : shortName,
         shortName,
         namespace: seg.ns,
+        uses,                                  // the `use` imports of its namespace (for qualifyPhpName)
         kind,
         isFinal: /\bfinal\b/i.test(m[1]),
         isAbstract,
@@ -693,7 +713,8 @@ export function parseConfigPhpModules(content) {
     else if (ch === ')' || ch === ']') { depth--; if (depth === 0) { end = k; break; } }
   }
   const block = code.slice(start.index + start[0].length, end);
-  const re = /(['"])([A-Za-z0-9]+_[A-Za-z0-9]+)\1\s*=>\s*(1|0|true|false)\b/gi;
+  // A module name is whatever registration.php registers — "Amasty_Mage2.4.7Fix" has dots
+  const re = /(['"])([^'"\\\s]+)\1\s*=>\s*(1|0|true|false)\b/gi;
   let m;
   while ((m = re.exec(block)) !== null) out.push({ name: m[2], enabled: m[3] === '1' || m[3].toLowerCase() === 'true' });
   return out;
@@ -713,7 +734,7 @@ export function buildModuleIndex(moduleXmls, configPhp, composerJson = () => nul
     let parsed;
     try { parsed = parseModuleXml(content); } catch { parsed = null; }
     if (!parsed || modules.has(parsed.name)) continue;
-    const dir = relPath.replace(/\/etc\/module\.xml$/, '');
+    const dir = relPath.replace(/(^|\/)etc\/module\.xml$/, '');   // '' — a module at the root (an extension repo)
     let composer = null;
     try { composer = composerJson(dir); } catch { composer = null; }
     modules.set(parsed.name, {
@@ -746,6 +767,7 @@ export function buildModuleIndex(moduleXmls, configPhp, composerJson = () => nul
   const byPackage = new Map([...modules.values()].filter(m => m.package).map(m => [m.package, m.name]));
   const dirs = [...modules.values()].sort((a, b) => b.dir.length - a.dir.length);
   const depCache = new Map();
+  const moduleOfCache = new Map();
 
   function dependsOn(a, b) {
     if (!a || !b || a === b) return false;
@@ -771,8 +793,11 @@ export function buildModuleIndex(moduleXmls, configPhp, composerJson = () => nul
     modules,
     orderSource,
     moduleOf(relPath) {
-      const hit = dirs.find(m => relPath === m.dir || relPath.startsWith(m.dir + '/'));
-      return hit ? hit.name : null;
+      if (moduleOfCache.has(relPath)) return moduleOfCache.get(relPath);
+      const hit = dirs.find(m => (m.dir === '' ? !relPath.startsWith('vendor/') : relPath === m.dir || relPath.startsWith(m.dir + '/')));
+      const name = hit ? hit.name : null;
+      moduleOfCache.set(relPath, name);
+      return name;
     },
     isEnabled(name) { return name && modules.has(name) ? modules.get(name).enabled : null; },
     orderOf(name) {
@@ -1036,4 +1061,207 @@ export function instancesOf(hierarchy, fqcn) {
     }
   }
   return out;
+}
+
+// ─── Files Magento rejects ──────────────────────────────────────
+//
+// Magento\Framework\Config\Dom::_initDom() loads each file with DOMDocument; a file that is not
+// well-formed fails in every mode with Config\Reader\Filesystem's message, and the reader of that
+// configuration (all its files) fails with it. The tolerant parseXml still reads such a file, so the
+// structural answers mark it instead of presenting its declarations as loaded.
+
+const XML_NAME = /[A-Za-z_:][\w:.-]*/y;
+
+/**
+ * Well-formedness check without PHP. Returns [] for a well-formed document, otherwise the first error
+ * libxml reports, with libxml's wording and line (checked against libxml 2.9 — see
+ * tests/di-parsing.test.js). libxml usually adds follow-up errors; only a native check lists them all.
+ * An empty file is not an XML error in Magento: DOMDocument::loadXML('') throws a ValueError (PHP 8).
+ */
+export function checkXmlWellFormed(content) {
+  const src = String(content ?? '').replace(/^\uFEFF/, '');   // a UTF-8 BOM, which libxml skips
+  const lineAt = (() => {
+    const starts = [0];
+    for (let i = 0; i < src.length; i++) if (src[i] === '\n') starts.push(i + 1);
+    return off => { let lo = 0, hi = starts.length - 1; while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (starts[mid] <= off) lo = mid; else hi = mid - 1; } return lo + 1; };
+  })();
+  const err = (off, message) => [{ line: lineAt(off), message }];
+  if (src === '') return [{ line: 0, message: 'DOMDocument::loadXML(): Argument #1 ($source) must not be empty' }];
+  const skipBlanks = off => { let k = off; while (k < src.length && /[ \t\r\n]/.test(src[k])) k++; return k; };
+  const firstContent = skipBlanks;
+  // <?xml version="…" encoding="…" standalone="…"?> — the checks and messages of xmlParseXMLDecl()
+  const parseXmlDecl = () => {
+    let j = skipBlanks(5);
+    const VALUE_CHARS = { encoding: /[\w.-]/, standalone: /[a-z]/ };
+    const value = (attr, at) => {
+      let k = skipBlanks(at + attr.length);
+      if (src[k] !== '=') return { error: err(k, "expected '='") };
+      k = skipBlanks(k + 1);
+      const q = src[k];
+      if (q !== '"' && q !== "'") return { error: err(k, 'String not started expecting \' or "') };
+      let end = k + 1;
+      if (attr === 'version') {                               // xmlParseVersionNum(): [0-9]+ '.' [0-9]*
+        const num = /^[0-9]+\.[0-9]*/.exec(src.slice(end));
+        end += num ? num[0].length : 0;
+        if (src[end] !== q) return { error: err(end, 'String not closed expecting " or \'') };
+        if (!num) return { error: err(end + 1, 'Malformed declaration expecting version') };
+        return { end: end + 1, value: num[0] };
+      }
+      while (end < src.length && VALUE_CHARS[attr].test(src[end])) end++;
+      if (src[end] !== q) return { error: err(end, 'String not closed expecting " or \'') };
+      return { end: end + 1, value: src.slice(k + 1, end) };
+    };
+    if (!src.startsWith('version', j)) return { error: err(j, 'Malformed declaration expecting version') };
+    let v = value('version', j);
+    if (v.error) return v;
+    j = v.end;
+    // a blank is required after version, and after encoding when it is present
+    let needBlank = true;
+    for (const attr of ['encoding', 'standalone']) {
+      if (needBlank) {
+        if (src.startsWith('?>', j)) return { end: j + 2 };
+        if (skipBlanks(j) === j) return { error: err(j, 'Blank needed here') };
+      }
+      j = skipBlanks(j);
+      needBlank = false;
+      if (!src.startsWith(attr, j)) continue;
+      v = value(attr, j);
+      if (v.error) return v;
+      j = v.end;
+      needBlank = attr === 'encoding';
+    }
+    j = skipBlanks(j);
+    if (src.startsWith('?>', j)) return { end: j + 2 };
+    return { error: err(j, "parsing XML declaration: '?>' expected") };
+  };
+  const stack = [];
+  const declaredEntities = new Set();   // <!ENTITY name …> in the internal DTD subset
+  let rootClosed = false;
+  let sawRoot = false;
+  const checkText = (from, to) => {
+    const t = src.slice(from, to);
+    const amp = /&/g;
+    let m;
+    while ((m = amp.exec(t)) !== null) {
+      const rest = t.slice(m.index + 1);
+      if (/^(#x[0-9a-fA-F]+|#\d+);/.test(rest)) continue;
+      const named = /^([A-Za-z_:][\w.:-]*)(;?)/.exec(rest);
+      if (!named) return err(from + m.index, 'xmlParseEntityRef: no name');
+      if (!named[2]) return err(from + m.index, "EntityRef: expecting ';'");
+      if (!['amp', 'lt', 'gt', 'quot', 'apos'].includes(named[1]) && !declaredEntities.has(named[1])) return err(from + m.index, `Entity '${named[1]}' not defined`);
+    }
+    return null;
+  };
+  let i = 0;
+  while (i < src.length) {
+    const lt = src.indexOf('<', i);
+    const textEnd = lt < 0 ? src.length : lt;
+    if (textEnd > i) {
+      const text = src.slice(i, textEnd);
+      if (text.trim() && (!stack.length)) {
+        return err(firstContent(i), sawRoot ? 'Extra content at the end of the document' : "Start tag expected, '<' not found");
+      }
+      const e = checkText(i, textEnd);
+      if (e) return e;
+    }
+    if (lt < 0) break;
+    i = lt;
+    if (src.startsWith('<!--', i)) {
+      const e = src.indexOf('-->', i + 4);
+      const dash = src.indexOf('--', i + 4);
+      if (dash >= 0 && (e < 0 || dash < e)) {
+        // libxml's fast path (ASCII) and complex path word the same error differently
+        const before = src.slice(i + 4, dash);
+        return err(dash, /[^\x00-\x7f]/.test(before) ? "Comment must not contain '--' (double-hyphen)" : 'Double hyphen within comment: <!--');
+      }
+      if (e < 0) return err(src.length, 'Comment not terminated');
+      i = e + 3; continue;
+    }
+    if (src.startsWith('<![CDATA[', i)) {
+      const e = src.indexOf(']]>', i + 9);
+      if (e < 0) return err(src.length, 'CData section not finished');
+      i = e + 3; continue;
+    }
+    if (src.startsWith('<?', i)) {
+      if (i === 0 && /^<\?xml\s/.test(src)) {                   // xmlParseXMLDecl()
+        const d = parseXmlDecl();
+        if (d.error) return d.error;
+        i = d.end; continue;
+      }
+      XML_NAME.lastIndex = i + 2;
+      const target = XML_NAME.exec(src);
+      if (target && target[0].toLowerCase() === 'xml') return err(i + 2 + target[0].length, 'XML declaration allowed only at the start of the document');
+      if (!target) return err(i + 2, 'xmlParsePI : no target name');
+      const after = i + 2 + target[0].length;
+      if (!src.startsWith('?>', after) && skipBlanks(after) === after) return err(after, `ParsePI: PI ${target[0]} space expected`);
+      const e = src.indexOf('?>', i + 2);
+      if (e < 0) return err(i, 'ParsePI: PI xml never end ...');
+      i = e + 2; continue;
+    }
+    if (src.startsWith('<!DOCTYPE', i)) {
+      const m = /^<!DOCTYPE(?:[^[>]|\[[\s\S]*?\])*>/.exec(src.slice(i));
+      if (!m) return err(i, 'DOCTYPE improperly terminated');
+      for (const d of m[0].matchAll(/<!ENTITY\s+([A-Za-z_][\w.-]*)\s/g)) declaredEntities.add(d[1]);
+      i += m[0].length; continue;
+    }
+    if (src[i + 1] === '/') {                                   // closing tag
+      if (!sawRoot) return err(i + 1, 'StartTag: invalid element name');
+      XML_NAME.lastIndex = i + 2;
+      const nm = XML_NAME.exec(src);
+      const name = nm ? nm[0] : '';
+      let j = nm ? XML_NAME.lastIndex : i + 2;
+      while (/\s/.test(src[j] || '')) j++;
+      if (!name || src[j] !== '>') return err(j, "expected '>'");
+      const open = stack.pop();
+      if (!open) return err(i, 'Extra content at the end of the document');
+      if (open.name !== name) return err(i, `Opening and ending tag mismatch: ${open.name} line ${open.line} and ${name}`);
+      i = j + 1;
+      if (!stack.length) rootClosed = true;
+      continue;
+    }
+    // start tag
+    XML_NAME.lastIndex = i + 1;
+    const nm = XML_NAME.exec(src);
+    if (!nm) return err(i, 'StartTag: invalid element name');
+    if (rootClosed) return err(i, 'Extra content at the end of the document');
+    const name = nm[0];
+    const tagLine = lineAt(i);
+    let j = XML_NAME.lastIndex;
+    const seen = new Set();
+    j = skipBlanks(j);
+    for (;;) {
+      if (src[j] === '>') { stack.push({ name, line: tagLine }); sawRoot = true; j++; break; }
+      if (src[j] === '/' && src[j + 1] === '>') { sawRoot = true; if (!stack.length) rootClosed = true; j += 2; break; }
+      if (j >= src.length) return err(j, `Couldn't find end of Start Tag ${name} line ${tagLine}`);
+      XML_NAME.lastIndex = j;
+      const an = XML_NAME.exec(src);
+      if (!an) return err(j, 'error parsing attribute name');
+      const local = an[0].slice(an[0].indexOf(':') + 1) || an[0];      // libxml names the QName's local part
+      j = skipBlanks(XML_NAME.lastIndex);
+      if (src[j] !== '=') return err(j, 'Specification mandates value for attribute ' + local);
+      j = skipBlanks(j + 1);
+      const q = src[j];
+      if (q !== '"' && q !== "'") return err(j, 'AttValue: " or \' expected');
+      let close = j + 1;
+      while (close < src.length && src[close] !== q && src[close] !== '<') close++;
+      if (src[close] === '<') return err(close, "Unescaped '<' not allowed in attributes values");
+      if (close >= src.length) return err(close, 'AttValue: \' expected');
+      const e = checkText(j + 1, close);
+      if (e) return e;
+      if (seen.has(an[0])) return err(close, `Attribute ${an[0]} redefined`);
+      seen.add(an[0]);
+      j = close + 1;
+      if (src[j] === '>' || (src[j] === '/' && src[j + 1] === '>')) continue;
+      const k = skipBlanks(j);
+      if (k === j) return err(j, 'attributes construct error');
+      j = k;
+    }
+    i = j;
+  }
+  if (stack.length) {
+    const open = stack[stack.length - 1];
+    return err(src.length, `Premature end of data in tag ${open.name} line ${open.line}`);
+  }
+  if (!sawRoot) return err(src.length, "Start tag expected, '<' not found");
+  return [];
 }

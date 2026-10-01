@@ -16,6 +16,7 @@ import {
   interceptionStatus, buildClassHierarchy, instancesOf, parseXml, parseDiXml, buildDiModel,
   applyModuleOrder, resolveInstance, resolveVirtualType, argumentInjectionsOf, parseEventsXml,
   parseConfigPhpModules, buildModuleIndex, effectivePluginDeclarations,
+  checkXmlWellFormed,
 } from '../src/di-config.js';
 
 let passed = 0;
@@ -180,5 +181,51 @@ return Array(
   'system' => [],
 );`).map(m => `${m.name}:${m.enabled}`), ['A_One:true', 'B_Two:false', 'C_Three:true', 'D_Four:false']);
 
+// ── Configuration validation (what Magento rejects) ─────────────
+// Expected first fatal error = libxml 2.9.14 / PHP 8.3 (DOMDocument::loadXML, as Config\Dom does);
+// for comment / CDATA errors libxml appends the start of the section, the check reports the prefix.
+const WELL_FORMED_CASES = [
+  ["amp_attr", "<?xml version=\"1.0\"?>\n<config>\n  <type name=\"A&B\"/>\n</config>\n", [3, "EntityRef: expecting ';'"]],
+  ["amp_text", "<?xml version=\"1.0\"?>\n<config>\n  <x>a & b</x>\n</config>\n", [3, "xmlParseEntityRef: no name"]],
+  ["badname", "<?xml version=\"1.0\"?>\n<config>\n  <1x/>\n</config>\n", [3, "StartTag: invalid element name"]],
+  ["blank", "   \n", [2, "Start tag expected, '<' not found"]],
+  ["cdata", "<?xml version=\"1.0\"?>\n<config>\n  <x><![CDATA[ a\n</config>\n", [5, "CData section not finished"]],
+  ["comment", "<?xml version=\"1.0\"?>\n<config>\n  <!-- open\n</config>\n", [5, "Comment not terminated"]],
+  ["decl_not_first", "\n<?xml version=\"1.0\"?>\n<config/>\n", [2, "XML declaration allowed only at the start of the document"]],
+  ["empty", "", [0, "DOMDocument::loadXML(): Argument #1 ($source) must not be empty"]],
+  ["entity_nosemi", "<?xml version=\"1.0\"?>\n<config>\n  <x>&amp</x>\n</config>\n", [3, "EntityRef: expecting ';'"]],
+  ["lt_attr", "<?xml version=\"1.0\"?>\n<config>\n  <type name=\"a<b\"/>\n</config>\n", [3, "Unescaped '<' not allowed in attributes values"]],
+  ["mismatch", "<?xml version=\"1.0\"?>\n<config>\n  <type name=\"A\">\n    <plugin name=\"p\" type=\"B\"/>\n  </typ>\n</config>\n", [5, "Opening and ending tag mismatch: type line 3 and typ"]],
+  ["nospace", "<?xml version=\"1.0\"?>\n<config>\n  <type name=\"A\" shared=\"false\"shared=\"true\"/>\n</config>\n", [3, "attributes construct error"]],
+  ["notxml", "text\n", [1, "Start tag expected, '<' not found"]],
+  ["novalue", "<?xml version=\"1.0\"?>\n<config>\n  <type name/>\n</config>\n", [3, "Specification mandates value for attribute name"]],
+  ["ns_ok", "<?xml version=\"1.0\"?>\n<config>\n  <a:b xmlns:a=\"u\"/>\n</config>\n", null],
+  ["premature", "<?xml version=\"1.0\"?>\n<config>\n  <type name=\"A\">\n    <plugin name=\"p\" type=\"B\"/>\n", [5, "Premature end of data in tag type line 3"]],
+  ["redefined", "<?xml version=\"1.0\"?>\n<config>\n  <type name=\"A\" name=\"B\"/>\n</config>\n", [3, "Attribute name redefined"]],
+  ["space_slash", "<?xml version=\"1.0\"?>\n<config>\n  <x a=\"1\" / >\n</config>\n", [3, "error parsing attribute name"]],
+  ["stray_close", "<?xml version=\"1.0\"?>\n<config>\n  </x>\n</config>\n", [3, "Opening and ending tag mismatch: config line 2 and x"]],
+  ["trailing", "<?xml version=\"1.0\"?>\n<config/>\ntrailing\n", [3, "Extra content at the end of the document"]],
+  ["tworoots", "<?xml version=\"1.0\"?>\n<config/>\n<config/>\n", [3, "Extra content at the end of the document"]],
+  ["unclosed_tag", "<?xml version=\"1.0\"?>\n<config>\n  <type name=\"A\"\n</config>\n", [4, "error parsing attribute name"]],
+  ["undefined_entity", "<?xml version=\"1.0\"?>\n<config>\n  <x>&nbsp;</x>\n</config>\n", [3, "Entity 'nbsp' not defined"]],
+  ["unquoted", "<?xml version=\"1.0\"?>\n<config>\n  <type name=A/>\n</config>\n", [3, "AttValue: \" or ' expected"]],
+  ["valid", "<?xml version=\"1.0\"?>\n<config>\n  <type name=\"A\"/>\n</config>\n", null],
+  ["decl_gt", "<?xml version=\"1.0\" >\n<config/>\n", [1, "parsing XML declaration: '?>' expected"]],
+  ["decl_no_blank", "<?xml version=\"1.0\"encoding=\"UTF-8\"?>\n<config/>\n", [1, "Blank needed here"]],
+  ["decl_version_bad", "<?xml version=\"1.0:\"?>\n<config/>\n", [1, "String not closed expecting \" or '"]],
+  ["decl_version_empty", "<?xml version=\"\"?>\n<config/>\n", [1, "Malformed declaration expecting version"]],
+  ["double_hyphen", "<?xml version=\"1.0\"?>\n<!--\n a -- b\n-->\n<config/>\n", [3, "Double hyphen within comment: <!--"]],
+  ["double_hyphen_nonascii", "<?xml version=\"1.0\"?>\n<!--\n \u00a9 a -- b\n-->\n<config/>\n", [3, "Comment must not contain '--' (double-hyphen)"]],
+  ["dtd_entity", "<?xml version=\"1.0\"?>\n<!DOCTYPE config [ <!ENTITY acme \"x\"> ]>\n<config>&acme;</config>\n", null],
+  ["entity_colon", "<?xml version=\"1.0\"?>\n<config a=\"urn&:x/y\"/>\n", [2, "EntityRef: expecting ';'"]],
+  ["pi_xml_prefix", "<?xmlversion=\"1.0\"?>\n<config/>\n", [1, "ParsePI: PI xmlversion space expected"]],
+  ["qname_empty_local", "<?xml version=\"1.0\"?>\n<config xsi:/>\n", [2, "Specification mandates value for attribute xsi:"]],
+];
+for (const [name, src, expected] of WELL_FORMED_CASES) {
+  const got = checkXmlWellFormed(src)[0] || null;
+  eq(`well-formedness as libxml: ${name}`, got && [got.line, got.message], expected);
+}
+eq('well-formedness as libxml: a UTF-8 byte-order mark before the declaration is skipped',
+  checkXmlWellFormed('\uFEFF<?xml version="1.0" encoding="UTF-8"?>\n<config/>\n'), []);
 console.log(`\n  ${passed} passed, ${failed} failed\n`);
 process.exit(failed ? 1 : 0);

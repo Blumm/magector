@@ -355,6 +355,8 @@ The `describe` command and `magento_describe` MCP tool require an Anthropic API 
 | `OMP_NUM_THREADS` | Fallback thread limit if `MAGECTOR_THREADS` is not set (de facto standard for ONNX/OpenMP). | — |
 | `MAGECTOR_BATCH_SIZE` | Embedding batch size (higher = faster, more RAM). Equivalent to `--batch-size`. | `256` |
 | `MAGECTOR_MAX_OUTPUT_CHARS` | Cap on one MCP tool answer, in characters; a longer answer is cut at a line boundary with a note to narrow the query. | `40000` (~10k tokens) |
+| `MAGECTOR_FILE_LIST_TTL_MS` | How long the list of the modules' `etc/` files is reused before it is listed again (files added mid-session show up after this); also how often composer's PSR-4 map and classmap are checked for a `composer dump-autoload`. Modules themselves are rediscovered as soon as `app/etc/config.php` or the composer registrations change. `0`: always fresh. | `2000` |
+| `MAGECTOR_PHP_LIST_TTL_MS` | How long the list of all PHP files (event dispatchers) is reused before the tree is walked again. | `30000` |
 | `MAGECTOR_AUTO_INDEX` | `0`: the MCP server never starts an index (none, or an incompatible one) — for CI and agent jobs that bring their own index. The structural tools work without one; semantic search reports it is missing. | `1` (index in the background) |
 | `ANTHROPIC_API_KEY` | API key for description generation (`describe` command) | — |
 
@@ -492,6 +494,11 @@ with an update.
 |------|---------|------------------------|
 | `magento_find_table_usage` | Superset: every PHP file and `db_schema.xml` with the table name as a string literal (ResourceModel `_init`, `getTableName`, setup patches) + semantic | the table name is built dynamically |
 | `magento_find_controller` | Exact: `routes.xml` → module → controller class (admin routes under `Controller/Adminhtml`); then semantic | the route is registered by a custom router |
+| `magento_find_api` | Exact: `webapi.xml` of the enabled modules merged as Magento merges it (route by url + method, service class / method attribute by attribute, ACL by ref) — every route whose URL contains the query, whose service method or class equals it, or whose service resolves to the given class; the class that runs (preference); then semantic | routes added at runtime (Magento_WebapiAsync's `/async/…` variants are noted, not listed) |
+| `magento_find_graphql` | Exact over `etc/schema.graphqls` of the enabled modules, cut into types and merged as `GraphQlReader` does (types of one name merged in module order, `extend type`, interface fields copied into object types, a type written in a `#` comment is read — as Magento reads it); resolver, `@cache` identity, typeResolver; the schema readers registered besides it are named; then semantic | fields added by the other schema readers (CatalogGraphQl's EAV attribute readers: attributes flagged for GraphQL in the database) — named, not listed |
+| `magento_find_cron` | Exact: `crontab.xml` merged by group + job, then the `crontab` defaults of `config.xml` (schedule, config path, run model) over it | schedules or jobs saved in the admin (`core_config_data`) — noted |
+| `magento_find_db_schema` | Exact: `db_schema.xml` of the enabled modules + `app/etc/db_schema.xml` merged by table / column / referenceId; columns, keys and indexes with the names Magento creates, disabled elements marked, foreign keys to the table; legacy setup scripts: semantic | tables created by legacy setup scripts or at runtime; a table prefix (names shown without it) |
+| `magento_module_structure` | Exact: every file of the module directory (from the module index, not guessed from the name), state and load position, and what the module declares in the merged configuration | — |
 | `magento_find_class` | A virtual type name resolves exactly to its di.xml declaration and real class; PHP classes: semantic + filesystem fallback | — |
 | `magento_trace_config` | system.xml definition and PHP readers (constant or literal path) | the path is concatenated at runtime |
 | `magento_grep`, `magento_ast_search` | Exact text / AST matches | — |
