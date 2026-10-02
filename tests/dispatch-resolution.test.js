@@ -119,6 +119,9 @@ const expected = {
   // F6: `$name .= '_flagged'` in a branch — both names (was: only the one without the suffix)
   acme_appended: [at('app/code/Acme/Disp/Service/Appended.php', 'dispatch('), null],
   acme_appended_flagged: [at('app/code/Acme/Disp/Service/Appended.php', 'dispatch('), null],
+  // F7: a constructor parameter di.xml does not set takes its default (was: `*`)
+  acme_ctordefault_ran: [at('app/code/Acme/Disp/Service/CtorDefault.php', 'dispatch('), 'Acme\\Disp\\Service\\CtorDefault'],
+  acme_ctoradmin_ran: [at('app/code/Acme/Disp/Service/CtorDefault.php', 'dispatch('), 'Acme\\Disp\\Service\\CtorDefaultAdmin'],
 };
 // A value assigned in an ordinary method (not the constructor): PHP dispatches it only when that method
 // ran first — the site is listed under "Possible" for the class, naming the method (was: exact)
@@ -171,6 +174,15 @@ async function main() {
     check('F5: … and the constructor\'s value when the constructor assigned it (was: the declared default it replaced)', await c.call('magento_find_event_dispatchers', { eventName: 'acme_ctorassigned_save_after' }), {
       has: ["for `Acme\\Disp\\Model\\CtorAssigned` — $_eventPrefix = 'acme_ctorassigned' assigned in Acme\\Disp\\Model\\CtorAssigned::__construct() (app/code/Acme/Disp/Model/CtorAssigned.php:"],
     });
+    let f7 = await c.call('magento_find_event_dispatchers', { eventName: 'acme_ctordefault_ran' });
+    check('F7: the default of a constructor parameter di.xml does not set — named as such', f7, {
+      has: ["for `Acme\\Disp\\Service\\CtorDefault` — $eventPrefix = 'acme_ctordefault' — the default of constructor parameter $eventPrefix (no di.xml argument; app/code/Acme/Disp/Service/CtorDefault.php:11)"],
+    });
+    check('F7: … also for a class whose di.xml argument exists only in adminhtml: the other areas take the default', f7, {
+      has: ['for `Acme\\Disp\\Service\\CtorDefaultAdmin`', 'the default of constructor parameter $eventPrefix (di.xml sets it only in [adminhtml];'],
+    });
+    f7 = await c.call('magento_find_event_dispatchers', { eventName: 'acme_ctoradmin_ran' });
+    check('F7: … and the adminhtml argument names its di.xml', f7, { has: ['for `Acme\\Disp\\Service\\CtorDefaultAdmin` — $eventPrefix from di.xml argument `eventPrefix` — [adminhtml] app/code/Acme/Disp/etc/adminhtml/di.xml'] });
     for (const [name, [where, pattern]] of Object.entries(expectedPossible)) {
       const t = await c.call('magento_find_event_dispatchers', { eventName: name });
       check(`runtime part: \`${name}\` — the site is listed as possible with \`${pattern}\``, t.split('\nPossible')[1] || '', { has: [where, `\`${pattern}\``] });

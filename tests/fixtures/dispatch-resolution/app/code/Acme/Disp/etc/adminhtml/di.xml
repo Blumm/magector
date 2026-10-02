@@ -6,4 +6,10 @@
             <argument name="eventPrefix" xsi:type="string">acme_grid</argument>
         </arguments>
     </type>
+    <!-- F7: a constructor argument in adminhtml only; the parameter's default elsewhere -->
+    <type name="Acme\Disp\Service\CtorDefaultAdmin">
+        <arguments>
+            <argument name="eventPrefix" xsi:type="string">acme_ctoradmin</argument>
+        </arguments>
+    </type>
 </config>

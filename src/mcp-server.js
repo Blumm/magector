@@ -4869,7 +4869,7 @@ function dispatchClaims(res) {
       notes: r.notes.map(n => ({
         kind: n.kind, name: n.name || null, what: n.what || null, declaredIn: n.rec?.fqcn || null, line: n.line || null,
         method: n.method || null, conditional: Boolean(n.conditional),
-        argument: n.argument || null, di: n.di ? n.di.map(d => ({ value: d.value, area: d.area, file: d.file })) : null,
+        argument: n.argument || null, di: n.di ? n.di.map(d => ({ value: d.value, area: d.area, file: d.file })) : null, expr: n.expr || null,
         values: n.values ? n.values.map(shownName) : null, ofClass: n.ofClass || null, lookedUpIn: n.lookedUpIn || null, constName: n.constName || null,
       })),
     })),
@@ -4879,38 +4879,33 @@ function dispatchClaims(res) {
 
 const shortRel = (root, rec) => rec?.file || '';
 
-/** The notes of a class result that produced one of its (shown) values — the explanation names the value used. */
-function notesFor(r) {
+/**
+ * Where a class's shown values come from: the notes — a di.xml argument, a constructor parameter's
+ * default, a constructor assignment, the declared default — that produced one of them, so the line
+ * names the value used, not another one the class could have.
+ */
+function valueSources(r) {
+  const kinds = ['di', 'default', 'assigned', 'prop'];
   const used = r.values.map(v => plainName(v).toLowerCase());
   const produced = n => (n.kind === 'di' ? n.di.map(d => d.value) : n.values || []).map(v => plainName(String(v)).toLowerCase());
-  const made = n => produced(n).some(x => used.some(u => u.includes(x)));
-  const find = pick => r.notes.find(n => pick(n) && made(n)) || r.notes.find(pick) || null;
-  return {
-    di: find(n => n.kind === 'di'),
-    prop: find(n => n.kind === 'prop'),
-    assigned: r.notes.find(n => n.kind === 'assigned' && made(n)) || null,
-    made,
-  };
+  const candidates = r.notes.filter(n => kinds.includes(n.kind) && !n.conditional);
+  const byKind = (a, b) => kinds.indexOf(a.kind) - kinds.indexOf(b.kind);
+  const sources = candidates.filter(n => produced(n).some(x => used.some(u => u.includes(x)))).sort(byKind);
+  // none matched (a value from a constant, say): the first note by kind, as before
+  return sources.length ? sources : candidates.sort(byKind).slice(0, 1);
+}
+
+function valueSourceText(root, n) {
+  const at = `${shortRel(root, n.rec)}:${n.line}`;
+  if (n.kind === 'di') return `$${n.name} from di.xml argument \`${n.argument}\` — ${n.di.map(d => `${d.area === 'global' ? '' : `[${d.area}] `}${d.file}`).join(', ')}`;
+  if (n.kind === 'default') return `$${n.name} = ${n.expr} — the default of constructor parameter $${n.argument} (${n.outside ? `di.xml sets it only in ${n.outside.map(a => `[${a}]`).join(' ')}` : 'no di.xml argument'}; ${at})`;
+  if (n.kind === 'assigned') return `$${n.name} = ${n.values?.map(v => `'${shownName(v)}'`).join(' | ') || '?'} assigned in ${n.rec.fqcn}::${n.method}() (${at})`;
+  return `$${n.name} = ${n.rec.props.get(n.name)?.expr ?? '?'} (${at})`;
 }
 
 /** One line per class: where its value comes from, and the classes between the site's class and it. */
 function dispatchClassLine(root, site, r) {
-  const parts = [];
-  const { made, ...found } = notesFor(r);
-  // the source of the value shown first: a di.xml argument, a constructor assignment or the default
-  const order = [found.di, found.assigned, found.prop].filter(Boolean);
-  const first = order.find(made) || order[0] || null;
-  const di = first?.kind === 'di' ? first : null;
-  const prop = first?.kind === 'prop' ? first : null;
-  const assigned = first?.kind === 'assigned' ? first : null;
-  if (di) {
-    const where = di.di.map(d => `${d.area === 'global' ? '' : `[${d.area}] `}${d.file}`).join(', ');
-    parts.push(`$${di.name} from di.xml argument \`${di.argument}\` — ${where}`);
-  } else if (prop) {
-    parts.push(`$${prop.name} = ${prop.rec.props.get(prop.name)?.expr ?? '?'} (${shortRel(root, prop.rec)}:${prop.line})`);
-  } else if (assigned) {
-    parts.push(`$${assigned.name} = ${assigned.values?.map(v => `'${shownName(v)}'`).join(' | ') || '?'} assigned in ${assigned.rec.fqcn}::${assigned.method}() (${shortRel(root, assigned.rec)}:${assigned.line})`);
-  }
+  const parts = [...new Set(valueSources(r).map(n => valueSourceText(root, n)))];
   const between = r.path.slice(1, -1);
   if (between.length) parts.push(`via ${between.map(c => `\`${c}\``).join(' → ')}`);
   if (r.virtualTypeOf) parts.push(`virtual type of \`${r.virtualTypeOf}\``);

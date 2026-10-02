@@ -224,11 +224,18 @@ export function extractPhpFacts(source) {
       if (!atBody(at(f.index + f[1].length))) continue;
       const paramsOpen = at(f.index + f[0].length);
       const paramsClose = expressionEnd(text, paramsOpen, '');
-      const params = [...text.slice(paramsOpen, paramsClose).matchAll(/\$(\w+)/g)].map(p => p[1]);
+      // parameters, and the default of each that has one (`$eventPrefix = 'x'`)
+      const params = [], defaults = new Map();
+      for (const p of topLevelSplit(text.slice(paramsOpen, paramsClose), (s, k) => (s[k] === ',' ? 1 : 0))) {
+        const pm = /\$(\w+)\s*(?:=\s*([\s\S]*\S))?\s*$/.exec(p);
+        if (!pm) continue;
+        params.push(pm[1]);
+        if (pm[2] !== undefined) defaults.set(pm[1], pm[2]);
+      }
       let k = paramsClose + 1;
       while (k < close && code[k] !== '{' && code[k] !== ';') k++;
       const hasBody = code[k] === '{';       // an abstract or interface method has none
-      const method = { name: f[2], params, hasBody, bodyStart: k, bodyEnd: hasBody ? closeOf(k) : k, line: lineAt(at(f.index)) };
+      const method = { name: f[2], params, defaults, hasBody, bodyStart: k, bodyEnd: hasBody ? closeOf(k) : k, line: lineAt(at(f.index)) };
       if (!rec.methods.has(f[2].toLowerCase())) rec.methods.set(f[2].toLowerCase(), method);
     }
     const methodAt = off => [...rec.methods.values()].find(mt => off > mt.bodyStart && off < mt.bodyEnd) || null;
@@ -501,13 +508,23 @@ export function createDispatchResolver({ typeOf, diStringArgs = () => [] }) {
         const param = /^\$(\w+)$/.exec(a.expr);
         if (param && method && method.params.includes(param[1]) && a.method.toLowerCase() === '__construct') {
           const di = diStringArgs(ctx.diOwner || K.fqcn, param[1]);
+          // ObjectManager passes the di.xml argument; an area where di.xml sets none gets the default
+          const defaultExpr = method.defaults?.get(param[1]);
+          const byDefault = areasWithArgument => {
+            const v = evaluate(parseNameExpr(defaultExpr), { ...ctx, self: l.via, lexical: l.rec, before: '', params: [] });
+            values.push(...v);
+            ctx.notes.push({ kind: 'default', name, argument: param[1], expr: defaultExpr, values: v, rec: l.rec, line: method.line, outside: areasWithArgument });
+          };
           if (di.length) {
             for (const d of di) values.push(d.value);
             ctx.notes.push({ kind: 'di', name, argument: param[1], di, rec: l.rec });
-            if (constructorRuns(K, l.via)) fromConstructor = true;
+            if (defaultExpr !== undefined && !di.some(d => d.area === 'global')) byDefault(di.map(d => d.area));
+          } else if (defaultExpr !== undefined) {
+            byDefault(null);
           } else {
             values.push(...unknown(ctx, `$${param[1]} (constructor of ${l.via.fqcn})`));
           }
+          if ((di.length || defaultExpr !== undefined) && constructorRuns(K, l.via)) fromConstructor = true;
         } else {
           const v = evaluate(parseNameExpr(a.expr), { ...ctx, self: l.via, lexical: l.rec, before: '', params: method?.params || [] });
           // the constructor always runs; any other method only if something called it before the dispatch

@@ -99,6 +99,15 @@
         ],
         "F6 append, branch not taken": [
             "acme_appended"
+        ],
+        "F7 constructor default": [
+            "acme_ctordefault_ran"
+        ],
+        "F7 constructor default, another area": [
+            "acme_ctordefault_ran"
+        ],
+        "F7 di.xml [adminhtml]": [
+            "acme_ctoradmin_ran"
         ]
     }
 }

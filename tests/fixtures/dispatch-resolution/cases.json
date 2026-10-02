@@ -213,5 +213,28 @@
       false
     ],
     "em": "eventManager"
+  },
+  {
+    "id": "F7 constructor default",
+    "class": "Acme\\Disp\\Service\\CtorDefault",
+    "ctor": [],
+    "method": "run",
+    "em": "eventManager"
+  },
+  {
+    "id": "F7 constructor default, another area",
+    "class": "Acme\\Disp\\Service\\CtorDefaultAdmin",
+    "ctor": [],
+    "method": "run",
+    "em": "eventManager"
+  },
+  {
+    "id": "F7 di.xml [adminhtml]",
+    "class": "Acme\\Disp\\Service\\CtorDefaultAdmin",
+    "ctor": [
+      "acme_ctoradmin"
+    ],
+    "method": "run",
+    "em": "eventManager"
   }
 ]
