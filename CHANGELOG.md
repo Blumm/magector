@@ -6,6 +6,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions corresp
 
 ## [Unreleased]
 
+### Fixed
+- **`magento_search` answered empty when the serve process was not ready** (startup, a 45–60 s index load, or serve returning nothing). The fallback runs `magector-core search -f json`, which prints its results pretty-printed over many lines, and read the last line that parsed as JSON: a fragment such as `"reindexEntity"` from a methods list. The search returned `[]`, and that non-answer was cached, so the same query stayed empty for the rest of the session, also after serve was ready. The output is now parsed as a whole first (`src/cli-json.js`); a single line is taken only if it is an object or an array, and only non-empty results are cached.
+
 ## [2.18.0] - 2026-10-01
 
 ### Added
