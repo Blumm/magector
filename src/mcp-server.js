@@ -47,6 +47,7 @@ import {
   discoverModules, listModuleEtcFiles, etcPatternRegExp, MODULE_XML_IGNORE, configScopeFiles,
 } from './magento-config.js';
 import { defaultDbPath, manifestPath, tempDbPathFor, swapInIndex } from './paths.js';
+import { extractJson } from './cli-json.js';
 import { createRequire } from 'module';
 const __pkg = createRequire(import.meta.url)('../package.json');
 
@@ -187,41 +188,6 @@ const rustEnv = {
   ORT_LOG_LEVEL: 'error',
   RUST_LOG: 'info',
 };
-
-/**
- * Extract JSON from stdout that may contain tracing/log lines.
- * The npm-distributed binary can emit ANSI-colored tracing lines to stdout
- * even with RUST_LOG=error. This strips non-JSON lines before parsing.
- */
-function extractJson(stdout) {
-  const lines = stdout.split('\n');
-  // Try each line from the end (JSON output is typically last)
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i].trim();
-    if (!line) continue;
-    try {
-      return JSON.parse(line);
-    } catch {
-      // not JSON, skip
-    }
-  }
-  // Fallback: try parsing the entire output (handles multi-line JSON)
-  // Strip lines that look like tracing (start with ANSI escape or timestamp bracket)
-  // Also skip non-JSON prefix lines (e.g. "setting number of points 50000" from HNSW)
-  const logLineRe = /^\s*(\x1b\[|\[[\d\-T:.Z]+)/;
-  const jsonStartRe = /^\s*[\[{"\-0-9tfn]/;
-  let startIdx = lines.findIndex(l => l.trim() && !logLineRe.test(l) && jsonStartRe.test(l));
-  if (startIdx < 0) startIdx = 0;
-  const cleaned = lines
-    .slice(startIdx)
-    .filter(l => !logLineRe.test(l) && l.trim())
-    .join('\n')
-    .trim();
-  if (cleaned) {
-    return JSON.parse(cleaned);
-  }
-  throw new SyntaxError('No valid JSON found in command output');
-}
 
 // ─── PID File & Orphan Cleanup ──────────────────────────────────
 // Track the serve process PID to clean up orphans on restart.
@@ -1385,8 +1351,11 @@ function rustSearchSync(query, limit = 10) {
     '-f', 'json'
   ], { encoding: 'utf-8', timeout: 120000, stdio: ['pipe', 'pipe', 'pipe'], env: rustEnv });
   const parsed = extractJson(result);
-  cacheSet(cacheKey, parsed);
-  return parsed;
+  // Only real results are cached: a cached non-answer kept the query empty for the whole session,
+  // also after the serve process was ready.
+  const results = Array.isArray(parsed) ? parsed : [];
+  if (results.length > 0) cacheSet(cacheKey, results);
+  return results;
 }
 
 // Keep backward compat: synchronous wrapper (used by tools)
