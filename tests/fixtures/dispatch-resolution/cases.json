@@ -188,5 +188,12 @@
     "class": "Acme\\Disp\\Model\\TraitLoud",
     "method": "afterSave",
     "em": "_eventManager"
+  },
+  {
+    "id": "F5 constructor assignment",
+    "class": "Acme\\Disp\\Model\\CtorAssigned",
+    "ctor": [],
+    "method": "afterSave",
+    "em": "_eventManager"
   }
 ]

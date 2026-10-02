@@ -14,6 +14,13 @@ import { scanPhp, parsePhpFile, qualifyPhpName, normalizeClassName } from './di-
 
 /** Marks the part of a name that is only known at runtime. */
 export const WILD = '\u0001';
+/**
+ * Marks a value that holds only after an ordinary method ran (`$this->_eventPrefix = 'b'` in `useB()`):
+ * a possible name, not an exact one. Kept in the string like WILD, so it survives concatenation.
+ */
+export const COND = '\u0002';
+/** The name without the COND marks. */
+export const plainName = value => value.split(COND).join('');
 
 // ─── Scanning helpers (strings kept, comments blanked; offsets as in the source) ───────────
 
@@ -495,8 +502,10 @@ export function createDispatchResolver({ typeOf, diStringArgs = () => [] }) {
           }
         } else {
           const v = evaluate(parseNameExpr(a.expr), { ...ctx, self: l.via, lexical: l.rec, before: '', params: method?.params || [] });
-          values.push(...v);
-          ctx.notes.push({ kind: 'assigned', name, rec: l.rec, method: a.method, line: a.line });
+          // the constructor always runs; any other method only if something called it before the dispatch
+          const conditional = a.method.toLowerCase() !== '__construct';
+          values.push(...(conditional ? v.map(x => COND + x) : v));
+          ctx.notes.push({ kind: 'assigned', name, rec: l.rec, method: a.method, line: a.line, values: v, conditional });
         }
       }
     }
@@ -618,14 +627,14 @@ export function createDispatchResolver({ typeOf, diStringArgs = () => [] }) {
 
 /** A name pattern (WILD = unknown part) as a RegExp; Magento lower-cases event names on dispatch. */
 export function patternRegExp(value) {
-  const esc = value.toLowerCase().split(WILD).map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  const esc = plainName(value).toLowerCase().split(WILD).map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
   return new RegExp(`^${esc.join('.*')}$`);
 }
 
 /** A user's query (`*` = any) against a resolved value (WILD = unknown at runtime): can they meet? */
 export function nameMatches(query, value) {
   const q = query.toLowerCase();
-  const v = value.toLowerCase();
+  const v = plainName(value).toLowerCase();
   if (!q.includes('*') && !v.includes(WILD)) return q === v;
   if (!v.includes(WILD)) return new RegExp(`^${q.split('*').map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*')}$`).test(v);
   if (!q.includes('*')) return patternRegExp(v).test(q);
@@ -636,7 +645,7 @@ export function nameMatches(query, value) {
 }
 
 /** A name with a known part worth navigating by (not only wildcards and separators). */
-export const isInformative = value => value.split(WILD).some(part => part.replace(/[_\-.]/g, '').length >= 3);
+export const isInformative = value => plainName(value).split(WILD).some(part => part.replace(/[_\-.]/g, '').length >= 3);
 
 /**
  * For a query with `*`: the runtime name shares the query's known parts (`*_save_after` → its known
@@ -645,9 +654,9 @@ export const isInformative = value => value.split(WILD).some(part => part.replac
  */
 export function sharesKnownParts(query, value) {
   if (!query.includes('*')) return true;
-  const known = value.toLowerCase().split(WILD).join('\u0000');
+  const known = plainName(value).toLowerCase().split(WILD).join('\u0000');
   return query.toLowerCase().split('*').filter(f => f.replace(/[_\-.]/g, '').length >= 3).every(f => known.includes(f));
 }
 
-/** WILD → `*` for display. */
-export const shownName = value => value.split(WILD).join('*');
+/** WILD → `*` for display (COND marks dropped). */
+export const shownName = value => plainName(value).split(WILD).join('*');

@@ -96,7 +96,6 @@ const expected = {
   acme_trait_emitted: [EMIT, 'Acme\\Disp\\Emitter\\Traited'],
   acme_nested_emitted: [EMIT, 'Acme\\Disp\\Emitter\\NestedTraited'],
   acme_switch_a_save_after: [SAVE_AFTER, 'Acme\\Disp\\Model\\Switching'],
-  acme_switch_b_save_after: [SAVE_AFTER, 'Acme\\Disp\\Model\\Switching'],
   acme_other_save_after: [SAVE_AFTER, 'Acme\\Disp\\Other\\AbstractModel'],
   acme_grid_load_after: [LOAD_AFTER, 'Acme\\Disp\\Model\\ResourceModel\\Grid\\Collection'],
   acme_other_grid_load_after: [LOAD_AFTER, 'AcmeOtherGridCollection'],
@@ -116,6 +115,12 @@ const expected = {
   acme_line_first: [at('app/code/Acme/Disp/Service/OneLine.php', 'acme_line_first'), null],
   acme_line_second: [at('app/code/Acme/Disp/Service/OneLine.php', 'acme_line_second'), null],
   acme_traitloud_save_after: [SAVE_AFTER, 'Acme\\Disp\\Model\\TraitLoud'],
+  acme_ctorassigned_save_after: [SAVE_AFTER, 'Acme\\Disp\\Model\\CtorAssigned'],
+};
+// A value assigned in an ordinary method (not the constructor): PHP dispatches it only when that method
+// ran first — the site is listed under "Possible" for the class, naming the method (was: exact)
+const expectedConditional = {
+  acme_switch_b_save_after: [SAVE_AFTER, 'Acme\\Disp\\Model\\Switching', 'Acme\\Disp\\Model\\Switching::useB()'],
 };
 // Names with a part known only at runtime: the site is listed under "Possible", with the pattern
 const expectedPossible = {
@@ -141,7 +146,7 @@ async function main() {
   await c.start();
   try {
     const dispatched = [...new Set(Object.values(truth).flat())];
-    const unlisted = dispatched.filter(n => !expected[n] && !expectedPossible[n]);
+    const unlisted = dispatched.filter(n => !expected[n] && !expectedPossible[n] && !expectedConditional[n]);
     ok(`every name PHP dispatched has an expectation (${dispatched.length} names from ${cases.length} cases)`, !unlisted.length, unlisted.join(', '));
     for (const name of dispatched.filter(n => expected[n])) {
       const [where, cls] = expected[name];
@@ -151,6 +156,18 @@ async function main() {
         has: [where, ...(cls ? [`for \`${cls}\``] : [])],
       });
     }
+    for (const [name, [where, cls, method]] of Object.entries(expectedConditional)) {
+      const t = await c.call('magento_find_event_dispatchers', { eventName: name });
+      const [exactPart, possiblePart = ''] = t.split('\nPossible');
+      check(`F5: \`${name}\` — assigned in ${method}: not exact for \`${cls}\` (was: exact)`, exactPart, { hasNot: [`for \`${cls}\``] });
+      check(`F5: \`${name}\` — listed as possible at ${where}, for \`${cls}\`, naming ${method}`, possiblePart, { has: [where, `for \`${cls}\``, method] });
+    }
+    check('F5: the explanation of an exact value names where that value comes from (the default, not the assignment)', await c.call('magento_find_event_dispatchers', { eventName: 'acme_switch_a_save_after' }), {
+      has: ["for `Acme\\Disp\\Model\\Switching` — $_eventPrefix = 'acme_switch_a' (app/code/Acme/Disp/Model/Switching.php:"],
+    });
+    check('F5: … and the constructor\'s value when the constructor assigned it (was: the declared default it replaced)', await c.call('magento_find_event_dispatchers', { eventName: 'acme_ctorassigned_save_after' }), {
+      has: ["for `Acme\\Disp\\Model\\CtorAssigned` — $_eventPrefix = 'acme_ctorassigned' assigned in Acme\\Disp\\Model\\CtorAssigned::__construct() (app/code/Acme/Disp/Model/CtorAssigned.php:"],
+    });
     for (const [name, [where, pattern]] of Object.entries(expectedPossible)) {
       const t = await c.call('magento_find_event_dispatchers', { eventName: name });
       check(`runtime part: \`${name}\` — the site is listed as possible with \`${pattern}\``, t.split('\nPossible')[1] || '', { has: [where, `\`${pattern}\``] });

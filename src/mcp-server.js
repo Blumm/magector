@@ -47,7 +47,7 @@ import {
   discoverModules, listModuleEtcFiles, etcPatternRegExp, MODULE_XML_IGNORE,
 } from './magento-config.js';
 import { defaultDbPath, manifestPath, tempDbPathFor, swapInIndex } from './paths.js';
-import { extractPhpFacts, createDispatchResolver, parseNameExpr, dependsOnCalledClass, nameMatches, shownName, isInformative, sharesKnownParts, WILD } from './php-dispatch.js';
+import { extractPhpFacts, createDispatchResolver, parseNameExpr, dependsOnCalledClass, nameMatches, shownName, isInformative, sharesKnownParts, WILD, COND, plainName } from './php-dispatch.js';
 import { createRequire } from 'module';
 const __pkg = createRequire(import.meta.url)('../package.json');
 
@@ -4789,8 +4789,12 @@ async function findEventDispatchers(query, { match = 'exact' } = {}) {
     for (const r of results) {
       const values = r.values.filter(v => nameMatches(query, v));
       if (!values.length) continue;
-      if (values.some(v => !v.includes(WILD))) hitExact.push({ ...r, values: values.filter(v => !v.includes(WILD)) });
-      else hitPossible.push({ ...r, values });
+      const known = values.filter(v => !v.includes(WILD) && !v.includes(COND));
+      // a value that holds only after an ordinary method ran is possible, unless it is also known outright
+      const afterMethod = values.filter(v => v.includes(COND) && !v.includes(WILD) && !known.includes(plainName(v)));
+      const runtime = known.length ? [] : values.filter(v => v.includes(WILD));
+      if (known.length) hitExact.push({ ...r, values: known });
+      if (afterMethod.length || runtime.length) hitPossible.push({ ...r, values: [...afterMethod, ...runtime] });
     }
     if (hitExact.length) exact.push({ site, classes: hitExact });
     if (hitPossible.length) possible.push({ site, classes: hitPossible });
@@ -4864,6 +4868,7 @@ function dispatchClaims(res) {
       values: r.values.map(shownName),
       notes: r.notes.map(n => ({
         kind: n.kind, name: n.name || null, what: n.what || null, declaredIn: n.rec?.fqcn || null, line: n.line || null,
+        method: n.method || null, conditional: Boolean(n.conditional),
         argument: n.argument || null, di: n.di ? n.di.map(d => ({ value: d.value, area: d.area, file: d.file })) : null,
         values: n.values ? n.values.map(shownName) : null, ofClass: n.ofClass || null, lookedUpIn: n.lookedUpIn || null, constName: n.constName || null,
       })),
@@ -4874,19 +4879,37 @@ function dispatchClaims(res) {
 
 const shortRel = (root, rec) => rec?.file || '';
 
+/** The notes of a class result that produced one of its (shown) values — the explanation names the value used. */
+function notesFor(r) {
+  const used = r.values.map(v => plainName(v).toLowerCase());
+  const produced = n => (n.kind === 'di' ? n.di.map(d => d.value) : n.values || []).map(v => plainName(String(v)).toLowerCase());
+  const made = n => produced(n).some(x => used.some(u => u.includes(x)));
+  const find = pick => r.notes.find(n => pick(n) && made(n)) || r.notes.find(pick) || null;
+  return {
+    di: find(n => n.kind === 'di'),
+    prop: find(n => n.kind === 'prop'),
+    assigned: r.notes.find(n => n.kind === 'assigned' && made(n)) || null,
+    made,
+  };
+}
+
 /** One line per class: where its value comes from, and the classes between the site's class and it. */
 function dispatchClassLine(root, site, r) {
   const parts = [];
-  const di = r.notes.find(n => n.kind === 'di');
-  const prop = r.notes.find(n => n.kind === 'prop');
-  const assigned = r.notes.find(n => n.kind === 'assigned');
+  const { made, ...found } = notesFor(r);
+  // the source of the value shown first: a di.xml argument, a constructor assignment or the default
+  const order = [found.di, found.assigned, found.prop].filter(Boolean);
+  const first = order.find(made) || order[0] || null;
+  const di = first?.kind === 'di' ? first : null;
+  const prop = first?.kind === 'prop' ? first : null;
+  const assigned = first?.kind === 'assigned' ? first : null;
   if (di) {
     const where = di.di.map(d => `${d.area === 'global' ? '' : `[${d.area}] `}${d.file}`).join(', ');
     parts.push(`$${di.name} from di.xml argument \`${di.argument}\` — ${where}`);
   } else if (prop) {
     parts.push(`$${prop.name} = ${prop.rec.props.get(prop.name)?.expr ?? '?'} (${shortRel(root, prop.rec)}:${prop.line})`);
   } else if (assigned) {
-    parts.push(`$${assigned.name} assigned in ${assigned.rec.fqcn}::${assigned.method}() (${shortRel(root, assigned.rec)}:${assigned.line})`);
+    parts.push(`$${assigned.name} = ${assigned.values?.map(v => `'${shownName(v)}'`).join(' | ') || '?'} assigned in ${assigned.rec.fqcn}::${assigned.method}() (${shortRel(root, assigned.rec)}:${assigned.line})`);
   }
   const between = r.path.slice(1, -1);
   if (between.length) parts.push(`via ${between.map(c => `\`${c}\``).join(' → ')}`);
@@ -4919,10 +4942,15 @@ function formatEventDispatchers(root, res) {
   if (!res.exact.length && !informative.length && !res.eventName.includes('*')) informative = res.possible;
   const opaque = res.possible.length - informative.length;
   if (informative.length) {
-    text += `\nPossible — the name is partly known only at runtime (${informative.length}):\n`;
+    text += `\nPossible — the name is partly known only at runtime, or holds only after a method ran (${informative.length}):\n`;
     for (const p of informative.slice(0, 10)) {
-      const names = [...new Set(p.classes.flatMap(r => r.values))].map(v => `\`${shownName(v)}\``);
-      const why = [...new Set(p.classes.flatMap(r => r.notes.filter(n => n.kind === 'runtime').map(n => n.what)))].slice(0, 2).join(', ');
+      const names = [...new Set(p.classes.flatMap(r => r.values.map(shownName)))].map(v => `\`${v}\``);
+      const why = [...new Set(p.classes.flatMap(r => [
+        ...r.notes.filter(n => n.kind === 'runtime').map(n => n.what),
+        // a value assigned in an ordinary method: the class, the value and the method that must run first
+        ...(r.values.some(v => v.includes(COND)) ? r.notes.filter(n => n.kind === 'assigned' && n.conditional).map(n =>
+          `for \`${r.forClass}\`, $${n.name} = ${(n.values || []).map(v => `'${shownName(v)}'`).join(' | ')} once ${n.rec.fqcn}::${n.method}() ran (${shortRel(root, n.rec)}:${n.line})`) : []),
+      ]))].slice(0, 2).join(', ');
       text += `- ${site(p.site)} — ${names.slice(0, 3).join(', ')}${why ? ` (${why})` : ''}\n`;
     }
     if (informative.length > 10) text += `- … ${informative.length - 10} more (match=wildcard)\n`;

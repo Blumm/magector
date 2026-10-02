@@ -89,6 +89,10 @@
         "F4 trait override with parent": [
             "acme_model_save_after",
             "acme_traitloud_save_after"
+        ],
+        "F5 constructor assignment": [
+            "acme_model_save_after",
+            "acme_ctorassigned_save_after"
         ]
     }
 }
