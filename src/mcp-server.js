@@ -8845,17 +8845,30 @@ function nativePhp(root) {
   return { reason: 'MAGECTOR_PHP is not set — the native check runs only on an explicit PHP command (e.g. "docker exec -i -u www-data <container> php", with MAGECTOR_PHP_ROOT)' };
 }
 
-/** Runs a command with the program on stdin, without blocking the server (review of #31). */
+/**
+ * Runs a command with the program on stdin, without blocking the server (review of #31). On POSIX the
+ * command gets its own process group, which the timeout kills whole: killing only the `sh -c` left
+ * what it started running (dash, Debian's /bin/sh, does not exec even a single command — a hung
+ * `docker exec … php` kept the call open past the timeout, until it exited on its own).
+ */
 function runAsync(cmd, input, timeoutMs) {
   return new Promise((resolve) => {
-    const child = spawn(cmd, { shell: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    const group = process.platform !== 'win32';
+    const child = spawn(cmd, { shell: true, detached: group, stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
-    const timer = setTimeout(() => { child.kill('SIGKILL'); stderr += `\n(killed after ${timeoutMs / 1000} s)`; }, timeoutMs);
+    let settled = false;
+    const settle = r => { if (!settled) { settled = true; clearTimeout(timer); resolve(r); } };
+    const timer = setTimeout(() => {
+      try { if (group) process.kill(-child.pid, 'SIGKILL'); else child.kill('SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* exited */ } }
+      child.stdout.destroy();
+      child.stderr.destroy();
+      settle({ status: null, stdout, stderr: `${stderr}\n(killed after ${timeoutMs / 1000} s)` });
+    }, timeoutMs);
     child.stdout.on('data', d => { stdout += d; });
     child.stderr.on('data', d => { stderr += d; });
-    child.on('error', e => { clearTimeout(timer); resolve({ status: null, stdout, stderr, error: e }); });
-    child.on('close', status => { clearTimeout(timer); resolve({ status, stdout, stderr }); });
+    child.on('error', e => settle({ status: null, stdout, stderr, error: e }));
+    child.on('close', status => settle({ status, stdout, stderr }));
     child.stdin.on('error', () => { /* the command exited before reading */ });
     child.stdin.end(input);
   });

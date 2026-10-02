@@ -289,6 +289,36 @@ async function main() {
     rmSync(live, { recursive: true, force: true });
   }
 
+  // ── Native check timeout ends the command and what it started (review of #33; POSIX only) ──
+  // The timeout killed only the `sh -c`: the command it started kept running and kept the call open
+  // until it exited (dash does not exec even a single command)
+  if (process.platform !== 'win32') {
+    const pidDir = mkdtempSync(path.join(os.tmpdir(), 'magector-vc-timeout-'));
+    const pidFile = path.join(pidDir, 'pid');
+    const hang = new McpClient({
+      MAGECTOR_PHP: `cd . && "${process.execPath}" -e "require('fs').writeFileSync('${pidFile}', String(process.pid)); setTimeout(() => {}, 20000)"`,
+      MAGECTOR_PHP_TIMEOUT_MS: '1000',
+    });
+    await hang.start();
+    try {
+      const t0 = Date.now();
+      const t = await hang.call('magento_validate_config', { path: VALUES_EVENTS, engine: 'native' });
+      const ms = Date.now() - t0;
+      ok(`native check timeout: the call ends at the timeout (${ms} ms for a 1 s limit; was 20 s)`, ms < 5000, t);
+      check('native check timeout: says so', t, { has: ['Native check not available', '(killed after 1 s)'] });
+      const pid = Number(readFileSync(pidFile, 'utf-8'));
+      let alive = true;
+      for (let i = 0; i < 20 && alive; i++) {
+        try { process.kill(pid, 0); await new Promise(r => setTimeout(r, 100)); } catch { alive = false; }
+      }
+      ok('native check timeout: the command the shell started is killed too', !alive, `pid ${pid} still runs`);
+      if (alive) try { process.kill(pid, 'SIGKILL'); } catch { /* exited */ }
+    } finally {
+      await hang.stop();
+      rmSync(pidDir, { recursive: true, force: true });
+    }
+  }
+
   // ── Config prewarm: off with MAGECTOR_AUTO_INDEX=0 unless asked for (review of #33) ──
   // CI and agent jobs set MAGECTOR_AUTO_INDEX=0 to keep background CPU off; the prewarm ran anyway,
   // and on a root that is no Magento install it walked the whole tree (31 CPU-s on 516k files)
