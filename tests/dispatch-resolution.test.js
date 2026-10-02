@@ -176,6 +176,10 @@ async function main() {
     check('E17: a parent whose file is missing is named — the part it would declare stays a wildcard', t, {
       has: [at('app/code/Acme/Disp/Model/Orphan.php', 'dispatch('), 'inheritance broken at Acme\\Missing\\Base'],
     });
+    t = await c.call('magento_find_event_dispatchers', { eventName: 'acme_ghost_save_after' });
+    check('F1: a class no autoloader can load never runs — it is not searched for in the tree (was: found by a glob of the whole tree, ~1.4 s per class on a large project)', t, {
+      hasNot: ['for `Acme\\Hidden\\Ghost`'],
+    });
 
     // ── 5. Modes and wildcards ────────────────────────────────────
     t = await c.call('magento_find_event_dispatchers', { eventName: '*_save_after' });
@@ -204,6 +208,13 @@ async function main() {
     w(MODEL, model);
     t = await lc.call('magento_find_event_dispatchers', { eventName: 'acme_product_saved' });
     check('fresh: an edited dispatch site is read again', t, { has: ['for `Acme\\Disp\\Model\\Product`'] });
+    t = await lc.call('magento_find_event_dispatchers', { eventName: 'acme_found_orphan' });
+    ok('fresh: before — the parent of Orphan is missing, its prefix unknown', !t.split('\nPossible')[0].includes('for `Acme\\Disp\\Model\\Orphan`'));
+    w('app/code/Acme/Missing/Base.php', "<?php\nnamespace Acme\\Missing;\n\nclass Base\n{\n    protected $prefix = 'acme_found';\n}\n");
+    t = await lc.call('magento_find_event_dispatchers', { eventName: 'acme_found_orphan' });
+    check('fresh: a class missing before is found once its file is added (a remembered miss is forgotten)', t.split('\nPossible')[0], {
+      has: ['for `Acme\\Disp\\Model\\Orphan`', "$prefix = 'acme_found' (app/code/Acme/Missing/Base.php:6)"],
+    });
   } finally {
     await lc.stop();
     rmSync(live, { recursive: true, force: true });
