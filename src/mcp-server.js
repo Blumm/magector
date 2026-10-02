@@ -49,6 +49,7 @@ import {
 import { defaultDbPath, manifestPath, tempDbPathFor, swapInIndex } from './paths.js';
 import { extractPhpFacts, createDispatchResolver, parseNameExpr, dependsOnCalledClass, nameMatches, shownName, isInformative, sharesKnownParts, WILD, COND, plainName } from './php-dispatch.js';
 import { extractJson } from './cli-json.js';
+import { loadSnapshot, writeSnapshot, acquireScanLock, releaseScanLock, scanLockHolder, waitForScanLock } from './php-scan-snapshot.js';
 import { createRequire } from 'module';
 const __pkg = createRequire(import.meta.url)('../package.json');
 
@@ -3996,7 +3997,14 @@ async function findTests(className, methodName) {
 const classHierarchyCache = {
   root: null, hierarchy: null, dispatchSites: null, traitUsers: null, building: null,
   files: null, dispatchFiles: null, checkedAt: 0,   // freshness: the files scanned, the files with dispatch sites (rel → stamp)
+  stamps: null, typeFiles: null,                    // for the shared snapshot: every file read (rel → stamp), the files with classes / traits
 };
+
+// The scan is shared by the instances of one root through .magector/php-scan.json (src/php-scan-snapshot.js):
+// MAGECTOR_PHP_SNAPSHOT=0 keeps every instance on its own scan. An instance that finds another one
+// scanning waits up to MAGECTOR_PHP_SCAN_WAIT_MS for its snapshot before it reads the tree itself.
+const PHP_SNAPSHOT = process.env.MAGECTOR_PHP_SNAPSHOT !== '0';
+const PHP_SCAN_WAIT_MS = envMs('MAGECTOR_PHP_SCAN_WAIT_MS', 180000);
 
 /**
  * Reverse class hierarchy of all PHP classes / interfaces under root (tests excluded) — and, from the
@@ -4005,9 +4013,52 @@ const classHierarchyCache = {
 async function getClassHierarchy(root) {
   if (classHierarchyCache.root === root && classHierarchyCache.hierarchy) return classHierarchyCache.hierarchy;
   if (classHierarchyCache.building && classHierarchyCache.building.root === root) return classHierarchyCache.building.promise;
-  const promise = buildPhpScan(root).finally(() => { classHierarchyCache.building = null; });
+  const promise = obtainPhpScan(root).finally(() => { classHierarchyCache.building = null; });
   classHierarchyCache.building = { root, promise };
   return promise;
+}
+
+/** The scan from the shared snapshot when it is usable, else read here — once per root at a time. */
+async function obtainPhpScan(root) {
+  if (!PHP_SNAPSHOT) return buildPhpScan(root);
+  if (useScanSnapshot(root)) return classHierarchyCache.hierarchy;
+  if (!acquireScanLock(root)) {
+    logToFile('INFO', `PHP scan in progress in PID ${scanLockHolder(root)} — waiting for its snapshot`);
+    await waitForScanLock(root, PHP_SCAN_WAIT_MS);
+    if (useScanSnapshot(root)) return classHierarchyCache.hierarchy;
+    if (!acquireScanLock(root)) logToFile('WARN', `PHP scan still locked by PID ${scanLockHolder(root)} after ${PHP_SCAN_WAIT_MS}ms — reading the tree here too`);
+  }
+  try {
+    const hierarchy = await buildPhpScan(root);
+    const t0 = Date.now();
+    const written = writeSnapshot(root, classHierarchyCache, __pkg.version);
+    logToFile(written ? 'INFO' : 'WARN', written ? `PHP scan snapshot written (${Date.now() - t0}ms)` : 'PHP scan snapshot not written');
+    return hierarchy;
+  } finally {
+    releaseScanLock(root);
+  }
+}
+
+/**
+ * The scan from .magector/php-scan.json into the cache, when it was made by this version for this root
+ * and no file with classes / traits changed since. Other changed files are read again, files added
+ * since and dispatching files edited since are picked up by refreshPhpScan — as a fresh scan would.
+ */
+function useScanSnapshot(root) {
+  const t0 = Date.now();
+  const snap = loadSnapshot(root, __pkg.version);
+  if (!snap.scan) { logToFile('INFO', `PHP scan snapshot not used (${snap.reason})`); return false; }
+  const scan = snap.scan;
+  for (const rel of snap.deleted) scan.stamps.delete(rel);
+  for (const rel of snap.changed) if (!scan.dispatchFiles.has(rel)) scanPhpFile(root, rel, scan);
+  Object.assign(classHierarchyCache, {
+    root, hierarchy: scan.hierarchy, dispatchSites: scan.dispatchSites, traitUsers: scan.traitUsers,
+    dispatchFiles: scan.dispatchFiles, stamps: scan.stamps, typeFiles: scan.typeFiles,
+    files: new Set(scan.stamps.keys()), checkedAt: 0,
+  });
+  refreshPhpScan(root);
+  logToFile('INFO', `PHP scan loaded from snapshot: ${scan.stamps.size} files, ${scan.hierarchy.types.size} types with parents, ${classHierarchyCache.dispatchSites.length} dispatch sites, ${snap.changed.length} changed (${Date.now() - t0}ms)`);
+  return true;
 }
 
 const SCAN_SKIP_TOP = new Set(['generated', 'var', 'pub', 'setup', 'dev']);
@@ -4038,7 +4089,7 @@ function walkPhpFiles(root) {
 async function buildPhpScan(root) {
   const t0 = Date.now();
   const files = walkPhpFiles(root);
-  const scan = { hierarchy: { types: new Map(), children: new Map() }, dispatchSites: [], traitUsers: new Map(), dispatchFiles: new Map() };
+  const scan = { hierarchy: { types: new Map(), children: new Map() }, dispatchSites: [], traitUsers: new Map(), dispatchFiles: new Map(), stamps: new Map(), typeFiles: new Set() };
   let n = 0;
   for (const rel of files) {
     // ~50k files: give pending requests a turn every few hundred files
@@ -4047,7 +4098,7 @@ async function buildPhpScan(root) {
   }
   Object.assign(classHierarchyCache, {
     root, hierarchy: scan.hierarchy, dispatchSites: scan.dispatchSites, traitUsers: scan.traitUsers,
-    dispatchFiles: scan.dispatchFiles, files: new Set(files), checkedAt: Date.now(),
+    dispatchFiles: scan.dispatchFiles, stamps: scan.stamps, typeFiles: scan.typeFiles, files: new Set(files), checkedAt: Date.now(),
   });
   logToFile('INFO', `PHP scan: ${files.length} files, ${scan.hierarchy.types.size} types with parents, ${scan.dispatchSites.length} dispatch sites (${Date.now() - t0}ms)`);
   return classHierarchyCache.hierarchy;
@@ -4056,20 +4107,21 @@ async function buildPhpScan(root) {
 /** One PHP file into the scan: its dispatch sites, the traits its classes use, its types with parents. */
 function scanPhpFile(root, rel, scan) {
   const abs = path.join(root, rel);
-  let source;
-  try { source = readFileSync(abs, 'utf-8'); } catch { return; }
+  let source, stamp;
+  try { const st = statSync(abs); stamp = `${st.mtimeMs}:${st.size}`; source = readFileSync(abs, 'utf-8'); } catch { return; }
+  scan.stamps?.set(rel, stamp);
   if (/->\s*dispatch\s*\(/.test(source)) {
     try {
       const facts = extractPhpFacts(source);
       for (const d of facts.dispatches) scan.dispatchSites.push({ ...d, file: rel });
       cachePhpFacts(abs, facts);
-      const st = statSync(abs);
-      scan.dispatchFiles.set(rel, `${st.mtimeMs}:${st.size}`);
+      scan.dispatchFiles.set(rel, stamp);
     } catch { /* a file the scanner cannot read: its dispatches are not resolved */ }
   }
   const hasParents = /\b(?:extends|implements)\b/i.test(source);
   const usesTraits = /^\s+use\s+[\\\w]+(\s*,\s*[\\\w]+)*\s*[;{]/m.test(source);
   if (!hasParents && !usesTraits) return;
+  scan.typeFiles?.add(rel);
   let types;
   try { types = parsePhpFile(source).types; } catch { return; }       // parsed once per file
   for (const t of types) {
@@ -4098,13 +4150,13 @@ function refreshPhpScan(root) {
     if (now === stamp) continue;
     c.dispatchSites = c.dispatchSites.filter(d => d.file !== rel);
     c.dispatchFiles.delete(rel);
-    if (now) scanPhpFile(root, rel, { hierarchy: c.hierarchy, dispatchSites: c.dispatchSites, traitUsers: c.traitUsers, dispatchFiles: c.dispatchFiles });
+    if (now) scanPhpFile(root, rel, c);
     changed = true;
   }
   const files = walkPhpFiles(root);
   for (const rel of files) {
     if (c.files.has(rel)) continue;
-    scanPhpFile(root, rel, { hierarchy: c.hierarchy, dispatchSites: c.dispatchSites, traitUsers: c.traitUsers, dispatchFiles: c.dispatchFiles });
+    scanPhpFile(root, rel, c);
     changed = true;
   }
   c.files = new Set(files);
@@ -9566,8 +9618,76 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
  * from main() on initial startup and from attemptTakeover() when a
  * secondary takes over after the primary disappears.
  */
+// ─── Background prewarms ────────────────────────────────────────
+// MAGECTOR_PREWARM_PHP / MAGECTOR_PREWARM_CONFIG: =1 in every instance, =0 never; unset, in the primary
+// instance only, and only when the server may index on its own (a CI or agent job sets
+// MAGECTOR_AUTO_INDEX=0 to keep background CPU off; the first call prepares it then). Secondaries do
+// not read the tree at start: several sessions started together each read ~100k files on a large
+// install. They take the PHP scan from the primary's snapshot (.magector/php-scan.json) when a tool needs it.
+
+/** 'always' | 'primary' | 'never' for a MAGECTOR_PREWARM_* variable. */
+function prewarmMode(envName) {
+  const v = process.env[envName];
+  if (v === '1') return 'always';
+  if (v === '0' || !config.autoIndex) return 'never';
+  return 'primary';
+}
+
+function isMagentoInstall() {
+  return Boolean(config.magentoRoot) && existsSync(path.join(config.magentoRoot, 'app/etc/config.php'));
+}
+
+let phpPrewarmScheduled = false;
+let configPrewarmScheduled = false;
+
+/**
+ * The class hierarchy and the dispatch sites (find_event_dispatchers, find_implementors) take seconds
+ * to read on a large tree: prepared in the background, in slices, so requests in the meantime run.
+ */
+function schedulePhpPrewarm() {
+  if (phpPrewarmScheduled || !config.magentoRoot) return;
+  phpPrewarmScheduled = true;
+  setTimeout(() => {
+    const t0 = Date.now();
+    prewarmDispatchSites(config.magentoRoot)
+      .then(() => logToFile('INFO', `PHP scan and dispatch sites prewarmed (${Date.now() - t0}ms)`))
+      .catch(e => logToFile('WARN', `PHP prewarm failed: ${e.message}`));
+  }, 1500).unref?.();
+}
+
+/**
+ * The configuration notice of the DI / event answers reads every di.xml / events.xml and merges each
+ * area (0.2–0.6 s on 300–600 modules): done once in the background after 1.5 s without a tool call,
+ * so neither the first DI answer nor an answer asked meanwhile waits for it. Never outside a Magento
+ * install (no app/etc/config.php): the module discovery would walk the whole tree (31 CPU-s on a
+ * 516k-file directory).
+ */
+function scheduleConfigPrewarm() {
+  if (configPrewarmScheduled || !isMagentoInstall()) return;
+  configPrewarmScheduled = true;
+  const IDLE_MS = 1500;
+  const prewarm = () => {
+    const idleFor = Date.now() - lastToolCallAt;
+    if (toolCallsInFlight || idleFor < IDLE_MS) { setTimeout(prewarm, IDLE_MS - Math.min(idleFor, IDLE_MS) + 50).unref?.(); return; }
+    const t0 = Date.now();
+    configProblemsNotice(config.magentoRoot, '')
+      .then(() => logToFile('INFO', `Configuration check prewarmed (${Date.now() - t0}ms)`))
+      .catch(e => logToFile('WARN', `Configuration check prewarm failed: ${e.message}`));
+  };
+  lastToolCallAt = Date.now();
+  setTimeout(prewarm, IDLE_MS).unref?.();
+}
+
+/** The prewarms left to the primary instance — started once it is one (at start or on takeover). */
+function startPrimaryPrewarms() {
+  if (!config.magentoRoot) return;
+  if (prewarmMode('MAGECTOR_PREWARM_PHP') === 'primary') schedulePhpPrewarm();
+  if (prewarmMode('MAGECTOR_PREWARM_CONFIG') === 'primary') scheduleConfigPrewarm();
+}
+
 async function runAsPrimary() {
   isPrimary = true; // gates startServeProcess's 'ready' handler to start the proxy — persists across later respawns/restarts too
+  startPrimaryPrewarms();
   try {
     // Check DB format (uses cache → instant if already validated)
     if (existsSync(config.dbPath)) {
@@ -9628,48 +9748,18 @@ async function main() {
   logToFile('INFO', 'Magector MCP server connected (warming up...)');
   console.error('Magector MCP server connected (warming up...)');
 
-  // The class hierarchy and the dispatch sites (find_event_dispatchers, find_implementors) take seconds
-  // to read on a large tree: prepared in the background, in slices, so requests in the meantime run.
-  // MAGECTOR_PREWARM_PHP=1 always, =0 never; unset, only when the server may index on its own: a CI or
-  // agent job sets MAGECTOR_AUTO_INDEX=0 to keep background CPU off, and the first call reads the tree then.
-  const prewarmPhp = process.env.MAGECTOR_PREWARM_PHP === '1' || (process.env.MAGECTOR_PREWARM_PHP !== '0' && config.autoIndex);
-  if (config.magentoRoot && !prewarmPhp) {
-    logToFile('INFO', `PHP prewarm skipped (${process.env.MAGECTOR_PREWARM_PHP === '0' ? 'MAGECTOR_PREWARM_PHP=0' : 'MAGECTOR_AUTO_INDEX=0; MAGECTOR_PREWARM_PHP=1 turns it on'})`);
-  }
-  if (config.magentoRoot && prewarmPhp) {
-    setTimeout(() => {
-      const t0 = Date.now();
-      prewarmDispatchSites(config.magentoRoot)
-        .then(() => logToFile('INFO', `PHP scan and dispatch sites prewarmed (${Date.now() - t0}ms)`))
-        .catch(e => logToFile('WARN', `PHP prewarm failed: ${e.message}`));
-    }, 1500).unref?.();
-  }
-
-  // The configuration notice of the DI / event answers reads every di.xml / events.xml and merges each
-  // area (0.2–0.6 s on 300–600 modules): done once in the background after 1.5 s without a tool call,
-  // so neither the first DI answer nor an answer asked meanwhile waits for it.
-  // MAGECTOR_PREWARM_CONFIG=1 always, =0 never; unset, only when the server may index on its own: a CI
-  // or agent job sets MAGECTOR_AUTO_INDEX=0 to keep background CPU off, and the first DI answer
-  // prepares the notice then. Never outside a Magento install (no app/etc/config.php): the module
-  // discovery would walk the whole tree (31 CPU-s on a 516k-file directory).
-  const prewarmConfig = process.env.MAGECTOR_PREWARM_CONFIG === '1' || (process.env.MAGECTOR_PREWARM_CONFIG !== '0' && config.autoIndex);
-  const magentoInstall = existsSync(path.join(config.magentoRoot, 'app/etc/config.php'));
-  if (config.magentoRoot && !(prewarmConfig && magentoInstall)) {
-    logToFile('INFO', `Configuration check prewarm skipped (${!magentoInstall ? 'no app/etc/config.php under MAGENTO_ROOT'
-      : process.env.MAGECTOR_PREWARM_CONFIG === '0' ? 'MAGECTOR_PREWARM_CONFIG=0' : 'MAGECTOR_AUTO_INDEX=0; MAGECTOR_PREWARM_CONFIG=1 turns it on'})`);
-  }
-  if (config.magentoRoot && prewarmConfig && magentoInstall) {
-    const IDLE_MS = 1500;
-    const prewarm = () => {
-      const idleFor = Date.now() - lastToolCallAt;
-      if (toolCallsInFlight || idleFor < IDLE_MS) { setTimeout(prewarm, IDLE_MS - Math.min(idleFor, IDLE_MS) + 50).unref?.(); return; }
-      const t0 = Date.now();
-      configProblemsNotice(config.magentoRoot, '')
-        .then(() => logToFile('INFO', `Configuration check prewarmed (${Date.now() - t0}ms)`))
-        .catch(e => logToFile('WARN', `Configuration check prewarm failed: ${e.message}`));
-    };
-    lastToolCallAt = Date.now();
-    setTimeout(prewarm, IDLE_MS).unref?.();
+  // Background prewarms (see schedulePhpPrewarm / scheduleConfigPrewarm): =1 in every instance now,
+  // =0 or MAGECTOR_AUTO_INDEX=0 never, unset in the primary instance only (runAsPrimary starts them).
+  if (config.magentoRoot) {
+    const php = prewarmMode('MAGECTOR_PREWARM_PHP');
+    if (php === 'never') logToFile('INFO', `PHP prewarm skipped (${process.env.MAGECTOR_PREWARM_PHP === '0' ? 'MAGECTOR_PREWARM_PHP=0' : 'MAGECTOR_AUTO_INDEX=0; MAGECTOR_PREWARM_PHP=1 turns it on'})`);
+    if (php === 'always') schedulePhpPrewarm();
+    const cfg = prewarmMode('MAGECTOR_PREWARM_CONFIG');
+    if (!isMagentoInstall() || cfg === 'never') {
+      logToFile('INFO', `Configuration check prewarm skipped (${!isMagentoInstall() ? 'no app/etc/config.php under MAGENTO_ROOT'
+        : process.env.MAGECTOR_PREWARM_CONFIG === '0' ? 'MAGECTOR_PREWARM_CONFIG=0' : 'MAGECTOR_AUTO_INDEX=0; MAGECTOR_PREWARM_CONFIG=1 turns it on'})`);
+    }
+    if (cfg === 'always') scheduleConfigPrewarm();
   }
 
   // ── Singleton serve: one serve process per project ──────────────
@@ -9719,6 +9809,10 @@ async function main() {
         logToFile('INFO', 'Socket not available — tools will use cold-start fallback, retrying takeover in background');
         attemptTakeover(); // keep trying to reconnect/become primary instead of parking on cold fallback forever
       }
+    }
+
+    if (role === 'secondary' && config.magentoRoot && !isPrimary && prewarmMode('MAGECTOR_PREWARM_PHP') === 'primary') {
+      logToFile('INFO', 'PHP prewarm left to the primary instance (secondary; MAGECTOR_PREWARM_PHP=1 runs it here too)');
     }
 
     // Mark tools as available ASAP — filesystem fallbacks work without serve process

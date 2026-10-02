@@ -6,6 +6,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions corresp
 
 ## [Unreleased]
 
+### Changed
+- **One PHP scan for all MCP instances of a Magento root.** Every session started its own MCP server, and each one read the whole tree for the class hierarchy and the dispatch sites (`find_implementors`, `find_event_dispatchers`) right after start — and prepared the configuration notice — even when another instance already had: five sessions started within minutes on a ~100k-file install kept 12+ cores busy (the serve process loading the index, plus one ~30 s scan per instance). Now the background prewarms (`MAGECTOR_PREWARM_PHP`, `MAGECTOR_PREWARM_CONFIG` unset) run in the primary instance only, also after a secondary takes over; `=1` still runs them in every instance. The instance that reads the tree writes the result to `.magector/php-scan.json` (0600, atomic); the others load it when a tool first needs it and check it against the tree by the stamp (mtime + size) of every file read: a changed or deleted file with classes or traits makes it unusable (the tree is read again and the snapshot rewritten), other changed files are read again, added files and edited dispatching files are picked up as before. While one instance reads the tree (`.magector/php-scan.lock`), the others wait for its snapshot, up to `MAGECTOR_PHP_SCAN_WAIT_MS` (default 180 s), then read it themselves. On a 101,860-file Magento 2.4 install: snapshot 52 MB, written in 0.5 s, loaded and checked in 1.5 s instead of a 21 s scan; first `find_implementors` 1.9 s instead of 12.7 s, 2.8 CPU-s instead of 19, 0.4 GB instead of 1.1 GB, same answer. `MAGECTOR_PHP_SNAPSHOT=0` keeps every instance on its own scan.
+
 ## [2.19.0] - 2026-10-02
 
 ### Added

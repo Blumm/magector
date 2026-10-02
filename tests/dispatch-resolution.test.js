@@ -19,6 +19,7 @@
  */
 
 import { spawn } from 'child_process';
+import { existsSync, statSync } from 'fs';
 import { createInterface } from 'readline';
 import { readFileSync, writeFileSync, mkdtempSync, rmSync, cpSync, mkdirSync } from 'fs';
 import os from 'os';
@@ -358,6 +359,76 @@ async function main() {
   } finally {
     await lc.stop();
     rmSync(live, { recursive: true, force: true });
+  }
+
+  // ── 10. One PHP scan for all instances of a root (.magector/php-scan.json) ──
+  // Several sessions started together each read the whole tree (~100k files on a large install).
+  // The instance that reads it writes a snapshot; the next one loads it, checked by file stamps.
+  const sh = mkdtempSync(path.join(os.tmpdir(), 'magector-dr-snapshot-'));
+  cpSync(FIXTURE, sh, { recursive: true });
+  rmSync(path.join(sh, '.magector'), { recursive: true, force: true });
+  const shLog = () => { try { return readFileSync(path.join(sh, '.magector', 'magector.log'), 'utf-8'); } catch { return ''; } };
+  const SNAP = path.join(sh, '.magector', 'php-scan.json');
+  const LOCK = path.join(sh, '.magector', 'php-scan.lock');
+  const PLAIN = 'app/code/Acme/Disp/Model/Plain.php';
+  writeFileSync(path.join(sh, PLAIN), "<?php\nnamespace Acme\\Disp\\Model;\n\nclass Plain\n{\n}\n");
+  const session = async (env, fn) => {
+    const before = shLog().length;
+    const c = new McpClient(sh, env);
+    await c.start();
+    try { return { out: await fn(c), log: shLog().slice(before) }; } finally { await c.stop(); }
+  };
+  const ask = c => c.call('magento_find_event_dispatchers', { eventName: 'acme_product_save_after' });
+  try {
+    const first = await session({}, ask);
+    ok('snapshot: the first instance reads the tree and writes it', /PHP scan: /.test(first.log) && /PHP scan snapshot written/.test(first.log) && existsSync(SNAP), first.log.split('\n').filter(l => /PHP scan/.test(l)).join(' | '));
+    ok('snapshot: … readable by the owner only (0600)', existsSync(SNAP) && (statSync(SNAP).mode & 0o777) === 0o600);
+    ok('snapshot: … the lock is released', !existsSync(LOCK));
+    const second = await session({}, ask);
+    ok('snapshot: the next instance loads it instead of reading the tree (was: every instance read it)', /PHP scan loaded from snapshot/.test(second.log) && !/PHP scan: /.test(second.log));
+    ok('snapshot: … with the same answer', second.out === first.out && first.out.includes('for `Acme\\Disp\\Model\\Product`'), 'answers differ');
+
+    // a file without a parent class gets one: read again, the snapshot stays usable
+    writeFileSync(path.join(sh, PLAIN), "<?php\nnamespace Acme\\Disp\\Model;\n\nclass Plain extends Middle\n{\n    protected $_eventPrefix = 'acme_plain';\n}\n");
+    const plain = await session({}, c => c.call('magento_find_event_dispatchers', { eventName: 'acme_plain_save_after' }));
+    ok('snapshot: a file that got a parent class is read again — snapshot still used', /PHP scan loaded from snapshot.*1 changed/.test(plain.log) && !/PHP scan: /.test(plain.log));
+    check('snapshot: … and its class is resolved', plain.out, { has: ['for `Acme\\Disp\\Model\\Plain`'] });
+
+    // a file with classes changed: the snapshot is not used, the tree is read and the snapshot rewritten
+    const product = path.join(sh, 'app/code/Acme/Disp/Model/Product.php');
+    writeFileSync(product, readFileSync(product, 'utf-8').replace("'acme_product'", "'acme_goods'"));
+    const changed = await session({}, c => c.call('magento_find_event_dispatchers', { eventName: 'acme_goods_save_after' }));
+    ok('snapshot: a changed file with classes — not used, the tree read again', /PHP scan snapshot not used \(changed since the snapshot: app\/code\/Acme\/Disp\/Model\/Product\.php\)/.test(changed.log) && /PHP scan: /.test(changed.log));
+    check('snapshot: … the answer follows the edit', changed.out, { has: ['for `Acme\\Disp\\Model\\Product`'] });
+
+    // another live instance scans (holds the lock): wait for its snapshot, do not read the tree
+    const holder = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+    try {
+      writeFileSync(LOCK, String(holder.pid));
+      const saved = readFileSync(SNAP);
+      rmSync(SNAP);
+      setTimeout(() => { writeFileSync(SNAP, saved, { mode: 0o600 }); holder.kill(); }, 1500);
+      const waited = await session({}, ask);
+      ok('snapshot: another instance scanning — waits and loads its snapshot, no own read', /waiting for its snapshot/.test(waited.log) && /PHP scan loaded from snapshot/.test(waited.log) && !/PHP scan: /.test(waited.log), waited.log.split('\n').filter(l => /PHP scan/.test(l)).join(' | '));
+    } finally { try { holder.kill(); } catch {} }
+
+    // the holder never finishes: after MAGECTOR_PHP_SCAN_WAIT_MS the instance reads the tree itself
+    const stuck = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+    try {
+      writeFileSync(LOCK, String(stuck.pid));
+      rmSync(SNAP, { force: true });
+      const gaveUp = await session({ MAGECTOR_PHP_SCAN_WAIT_MS: '1000' }, ask);
+      ok('snapshot: a holder that never finishes — the instance reads the tree after the wait', /still locked by PID/.test(gaveUp.log) && /PHP scan: /.test(gaveUp.log));
+      ok("snapshot: … and leaves the other process's lock alone", readFileSync(LOCK, 'utf-8').trim() === String(stuck.pid));
+    } finally { try { stuck.kill(); } catch {} }
+
+    // MAGECTOR_PHP_SNAPSHOT=0: every instance on its own scan
+    rmSync(LOCK, { force: true });
+    rmSync(SNAP, { force: true });
+    const own = await session({ MAGECTOR_PHP_SNAPSHOT: '0' }, ask);
+    ok('snapshot: MAGECTOR_PHP_SNAPSHOT=0 — read here, no snapshot written', /PHP scan: /.test(own.log) && !existsSync(SNAP));
+  } finally {
+    rmSync(sh, { recursive: true, force: true });
   }
 
   console.log(`\n  ${passed} passed, ${failed} failed\n`);
