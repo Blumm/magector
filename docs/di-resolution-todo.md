@@ -75,16 +75,18 @@ Still slower than grep on a first call (everything reads all PHP files):
 
 | # | Tool | First call | Repeat |
 |---|---|---|---|
-| P1 | `find_implementors` (class hierarchy) | 8.0 s | 1 ms |
-| P2 | `find_event_flow` / `find_event_dispatchers` | 3.0 s | 0.45 s |
+| P1 | `find_implementors` / `find_event_dispatchers` (class hierarchy) | ~6 s, read in the background after start | 1–40 ms |
 | P3 | `impact_analysis` | 2.5 s | — |
 | P4 | `find_callers` | 1.7 s | — |
 | P5 | `find_di_wiring` | 1.2 s (after the DI model) | — |
 
 Fix: an index of PHP files by content (declared types, extends / implements, dispatch() names) stored
-beside the vector index and refreshed by mtime, so a session does not re-read 73k files. Until then the
-class hierarchy behind `find_implementors` is built once per session (a class added mid-session is not
-seen until restart).
+beside the vector index and refreshed by mtime, so a session does not re-read 49–73k files. Until then
+the hierarchy is read in the background after start; files added mid-session and edited dispatching
+files are picked up, a dispatch added to a file that had none and a removed class show next session.
+
+Dispatch names still unresolved (listed as possible, `*`): a part from a method call (EntityManager's
+`resolveEntityPrefix()`, `$this->getCode()`), a request value, a parameter of a wrapper.
 
 ## B. Decision needed
 

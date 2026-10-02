@@ -42,15 +42,15 @@ import { glob } from 'glob';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const [mode, rootArg, truthFile, areaArg] = process.argv.slice(2);
-if (!mode || !rootArg || !truthFile) {
-  console.error('usage: node compare.mjs php|xml|plugins|config|merge|webapi|graphql|cron|dbschema|modules|trace_api <magento-root> <truth.json> [area]');
+if (!mode || !rootArg || (!truthFile && mode !== 'dispatch-claims')) {
+  console.error('usage: node compare.mjs php|xml|plugins|config|merge|dispatch-claims|dispatch|webapi|graphql|cron|dbschema|modules|trace_api <magento-root> <truth.json> [area]');
   process.exit(2);
 }
 const root = path.resolve(rootArg);
 // config-truth.json is the raw output of validate-config.php: the JSON follows a marker line
-const truthText = readFileSync(truthFile, 'utf-8');
-const marker = truthText.lastIndexOf('@@MAGECTOR-VALIDATE-CONFIG@@');
-const truth = JSON.parse(marker < 0 ? truthText : truthText.slice(marker + '@@MAGECTOR-VALIDATE-CONFIG@@'.length));
+const truthText = mode === 'dispatch-claims' ? null : readFileSync(truthFile, 'utf-8');
+const marker = truthText === null ? -1 : truthText.lastIndexOf('@@MAGECTOR-VALIDATE-CONFIG@@');
+const truth = truthText === null ? null : JSON.parse(marker < 0 ? truthText : truthText.slice(marker + '@@MAGECTOR-VALIDATE-CONFIG@@'.length));
 const show = (title, list, n = 15) => {
   console.log(`${title}: ${list.length}`);
   for (const l of list.slice(0, n)) console.log(`  ${l}`);
@@ -183,6 +183,58 @@ if (mode === 'plugins') {
   process.exit(fn + fp ? 1 : 0);
 }
 
+
+if (mode === 'dispatch-claims') {
+  // Every site whose name depends on the class running it, resolved by find_event_dispatchers, as the
+  // claims PHP checks: the property / constant / di.xml argument the name was built from, per class.
+  // Usage: node compare.mjs dispatch-claims <magento-root> > dispatch-claims.json
+  const child = spawn(process.execPath, [path.join(__dirname, '..', '..', 'src', 'mcp-server.js')], {
+    cwd: root, env: { ...process.env, MAGENTO_ROOT: root, MAGECTOR_DISPATCH_JSON: '1', MAGECTOR_PREWARM_PHP: '0' }, stdio: ['pipe', 'pipe', 'ignore'],
+  });
+  const pending = new Map();
+  createInterface({ input: child.stdout }).on('line', line => { try { const m = JSON.parse(line); pending.get(m.id)?.(m); } catch { /* log */ } });
+  let id = 0;
+  const request = (method, params) => new Promise(resolve => { const n = ++id; pending.set(n, resolve); child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: n, method, params }) + '\n'); });
+  await request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'verify', version: '1' } });
+  const res = await request('tools/call', { name: 'magento_find_event_dispatchers', arguments: { eventName: '*', match: 'exact' } });
+  child.kill();
+  const data = JSON.parse(res.result.content[0].text);
+  const claims = [];
+  for (const site of [...data.exact, ...data.possible]) {
+    for (const r of site.classes.filter(c => c.perClass)) {
+      const where = `${site.file}:${site.line}`;
+      for (const n of r.notes) {
+        if (n.kind === 'prop' && n.values?.every(v => !v.includes('*'))) claims.push({ kind: 'prop', class: n.ofClass, name: n.name, magector: n.values, site: where, forClass: r.forClass });
+        if (n.kind === 'const' && n.values?.every(v => !v.includes('*'))) claims.push({ kind: 'const', class: n.lookedUpIn, name: `${n.declaredIn}::${n.constName}`, magector: n.values, site: where, forClass: r.forClass });
+        if (n.kind === 'di') for (const d of n.di) claims.push({ kind: 'di', class: r.forClass, argument: n.argument, area: d.area, magector: [d.value], site: where, forClass: r.forClass });
+      }
+    }
+  }
+  // one claim per (kind, class, name / argument, area): the same property is read by several sites
+  const seen = new Set();
+  const unique = claims.filter(c => { const k = JSON.stringify([c.kind, c.class, c.name, c.argument, c.area]); if (seen.has(k)) return false; seen.add(k); return true; });
+  console.log(JSON.stringify({ sites: data.exact.length + data.possible.length, claims: unique }));
+  process.exit(0);
+}
+
+if (mode === 'dispatch') {
+  // PHP's values (dispatch-truth.php) against what Magector resolved them to
+  const differ = [], unloadable = [];
+  let agree = 0;
+  const byKind = {};
+  for (const t of truth.truth) {
+    const c = truth.claims[t.i];
+    byKind[c.kind] = (byKind[c.kind] || 0) + 1;
+    if (t.error) { unloadable.push(`${c.kind} ${c.class} ${c.name || c.argument}: ${t.error}`); continue; }
+    const php = t.value === null ? 'null' : String(t.value);
+    if (c.magector.includes(php) || (t.value === null && !c.magector.length)) agree++;
+    else differ.push(`${c.kind} ${c.class}${c.name ? ` ${c.name}` : ''}${c.argument ? ` ${c.argument} [${c.area}]` : ''}: PHP ${JSON.stringify(t.value)}, Magector ${JSON.stringify(c.magector)} (site ${c.site})`);
+  }
+  console.log(`${truth.claims.length} claims (${Object.entries(byKind).map(([k, n]) => `${n} ${k}`).join(', ')}), PHP ${truth.php}: ${agree} agree`);
+  show('differ', differ);
+  show('PHP cannot load the class', unloadable, 5);
+  process.exit(differ.length ? 1 : 0);
+}
 
 if (mode === 'trace_api') {
   // magento_trace_api on every route: the route it picks, the service interface::method and the class

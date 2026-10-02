@@ -342,7 +342,7 @@ async function main() {
     has: ['Configuration check prewarm skipped (MAGECTOR_AUTO_INDEX=0; MAGECTOR_PREWARM_CONFIG=1 turns it on)'], hasNot: ['Configuration check prewarmed'],
   });
   pl = await prewarmLog({ MAGECTOR_PREWARM_CONFIG: '1' });
-  check('prewarm: MAGECTOR_PREWARM_CONFIG=1 runs it with MAGECTOR_AUTO_INDEX=0', pl, { has: ['Configuration check prewarmed ('], hasNot: ['prewarm skipped'] });
+  check('prewarm: MAGECTOR_PREWARM_CONFIG=1 runs it with MAGECTOR_AUTO_INDEX=0', pl, { has: ['Configuration check prewarmed ('], hasNot: ['Configuration check prewarm skipped'] });
   pl = await prewarmLog({ MAGECTOR_PREWARM_CONFIG: '0' });
   check('prewarm: MAGECTOR_PREWARM_CONFIG=0 never runs it', pl, { has: ['Configuration check prewarm skipped (MAGECTOR_PREWARM_CONFIG=0)'], hasNot: ['Configuration check prewarmed'] });
   pl = await prewarmLog({ MAGECTOR_PREWARM_CONFIG: '1' }, { withConfigPhp: false });

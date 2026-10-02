@@ -46,6 +46,7 @@ Three layers, each against Magento itself — never against Magector's own idea 
 | Declared tables | 507/507 with every column, key and index under Magento's name |
 | Modules | 598/598 directories, enabled state and load order |
 | `trace_api` vs Magento | 446/446 routes: same route, service class and method, and the class Magento creates in `webapi_rest` |
+| Event names built from the class running the code (`compare.mjs dispatch`) | 953/953 values (944 properties, 9 di.xml arguments per area) as PHP has them; 579 sites resolved. Of 348 events with observers, 247 have an exact site, 57 a possible one; the rest are entity events (`EntityManager`, name from a method) or observers of events nothing dispatches (`authorization_role_save_after` — the model's prefix is `authorization_roles`) |
 | Config check, built-in vs native (`mutate-xml.mjs`) | same first libxml error on 2,000 syntax-edited files (1,384 not well-formed), same converter verdict on 3,000 value-edited files (2,518 exceptions); seeds 7 and 11, 2 × 2,500 files: 0 differences |
 | Merged DI / events areas (`compare.mjs merge`) | 15/15 areas: the same files in the same order, the same merged document, the same verdict; 7,630 merges of mutated files with their originals (`merge-sets.mjs`, 5,298 that Magento fails): the same |
 | `validate_config` on the whole project | built-in and native agree on every file and area; native adds 16 files that violate the schema they declare (not checked by the built-in engine) |
@@ -65,6 +66,7 @@ A second, older installation, checked with the same scripts. Its plugin check fo
 | Cron jobs | 75/75; 3 differ only through `core_config_data` (noted) |
 | Declared tables | 379/379 |
 | Modules | 449/449 |
+| Event names built from the class running the code | 1,047/1,047 values (1,037 properties, 10 di.xml arguments) as PHP 8.1 has them |
 | `trace_api` vs Magento | 409/409 routes: route, service, the class created in `webapi_rest` |
 | Config check, built-in vs native | 0 differences on 2,500 mutated files (646 not well-formed, 1,271 converter exceptions) and on the 757 real ones |
 | Native check on PHP 8.4 (review of #31) | the same result as PHP 8.1 on all 757 + 2,500 files and 16 areas — no false failures |
@@ -136,6 +138,14 @@ non-public, `NoninterceptableInterface`), comments in XML read as data. Tests: `
 | Code that asks for X gets X's preference, and the preference class's own plugins run (`Import\Product` → a module's `Rewrite\Product`) | only plugins declared on X and its ancestors | `di-resolution`: Importer / BetterImporter |
 | An abstract class is never instantiated; its plugins run on its concrete subclasses | listed as running on the abstract class | `di-resolution`: AbstractSource / TableSource |
 | — (no index database: nothing to search) | each structural tool's semantic addition waited out the serve respawn delay, 5 s then 10 s per call | `config-models`: no index |
+
+### Event dispatch sites
+| Magento / PHP | Before | Test (`tests/dispatch-resolution.test.js`, expected names from PHP running the fixture) |
+|---|---|---|
+| `$this->_eventPrefix . '_save_after'` dispatches the prefix of the class that runs `afterSave()` — declared in it, an abstract middle layer, a (nested) trait, or set from a `di.xml` constructor argument | only literal names were found | E2–E5, E13, E14, E16 |
+| `self::` is the class that wrote the code (in a trait, the class using it), `static::` the class that runs it; interface constants are inherited | — | E6–E9 |
+| A subclass overriding the method without `parent::` does not dispatch | — | E15 (listed, marked) |
+| A runtime part (`$request->getFullActionName()`, a parameter) stays unknown; another dispatcher (Symfony) is not an event | — | E11, E12, E17, E18 |
 
 ## Not structural yet
 

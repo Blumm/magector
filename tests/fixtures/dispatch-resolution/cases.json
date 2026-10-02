@@ -1,0 +1,249 @@
+[
+  {
+    "id": "E1 literal",
+    "class": "Acme\\Disp\\Model\\Order",
+    "method": "afterSave",
+    "em": "_eventManager"
+  },
+  {
+    "id": "E2 four levels",
+    "class": "Acme\\Disp\\Model\\Product",
+    "method": "afterSave",
+    "em": "_eventManager"
+  },
+  {
+    "id": "E2 one level",
+    "class": "Acme\\Disp\\Model\\Order",
+    "method": "afterSave",
+    "em": "_eventManager"
+  },
+  {
+    "id": "E3 middle layer",
+    "class": "Acme\\Disp\\Model\\Leaf",
+    "method": "afterSave",
+    "em": "_eventManager"
+  },
+  {
+    "id": "E5 trait",
+    "class": "Acme\\Disp\\Emitter\\Traited",
+    "method": "emit",
+    "em": "eventManager"
+  },
+  {
+    "id": "E5 nested trait",
+    "class": "Acme\\Disp\\Emitter\\NestedTraited",
+    "method": "emit",
+    "em": "eventManager"
+  },
+  {
+    "id": "E14 default",
+    "class": "Acme\\Disp\\Model\\Switching",
+    "method": "afterSave",
+    "em": "_eventManager"
+  },
+  {
+    "id": "E14 assigned",
+    "class": "Acme\\Disp\\Model\\Switching",
+    "method": "afterSave",
+    "before": "useB",
+    "em": "_eventManager"
+  },
+  {
+    "id": "E15 override without parent",
+    "class": "Acme\\Disp\\Model\\Silent",
+    "method": "afterSave",
+    "em": "_eventManager"
+  },
+  {
+    "id": "E16 alias, same short name",
+    "class": "Acme\\Disp\\Other\\AbstractModel",
+    "method": "afterSave",
+    "em": "_eventManager"
+  },
+  {
+    "id": "E13 di.xml [adminhtml]",
+    "class": "Acme\\Disp\\Model\\ResourceModel\\Grid\\Collection",
+    "ctor": [
+      "acme_grid"
+    ],
+    "method": "_afterLoad",
+    "em": "_eventManager"
+  },
+  {
+    "id": "E13 virtual type",
+    "class": "Acme\\Disp\\Model\\ResourceModel\\Grid\\Collection",
+    "ctor": [
+      "acme_other_grid"
+    ],
+    "method": "_afterLoad",
+    "em": "_eventManager"
+  },
+  {
+    "id": "E6 self:: in trait",
+    "class": "Acme\\Disp\\Service\\TraitUser",
+    "method": "fire",
+    "em": "eventManager"
+  },
+  {
+    "id": "E7 base",
+    "class": "Acme\\Disp\\Service\\BaseNotifier",
+    "method": "notify",
+    "em": "eventManager"
+  },
+  {
+    "id": "E7 child",
+    "class": "Acme\\Disp\\Service\\ChildNotifier",
+    "method": "notify",
+    "em": "eventManager"
+  },
+  {
+    "id": "E8 interface constant",
+    "class": "Acme\\Disp\\Service\\Alert",
+    "method": "event",
+    "args": [
+      "Checkout"
+    ],
+    "em": "eventManager"
+  },
+  {
+    "id": "E9 constant chain",
+    "class": "Acme\\Disp\\Service\\ConstChain",
+    "method": "run",
+    "em": "eventManager"
+  },
+  {
+    "id": "E10 map a",
+    "class": "Acme\\Disp\\Service\\StatusMap",
+    "method": "run",
+    "args": [
+      "a"
+    ],
+    "em": "eventManager"
+  },
+  {
+    "id": "E10 map r",
+    "class": "Acme\\Disp\\Service\\StatusMap",
+    "method": "run",
+    "args": [
+      "r"
+    ],
+    "em": "eventManager"
+  },
+  {
+    "id": "E12 request",
+    "class": "Acme\\Disp\\Service\\FrontLike",
+    "method": "dispatchPre",
+    "args": [
+      "@request:checkout_cart_add"
+    ],
+    "em": "_eventManager"
+  },
+  {
+    "id": "E19 branch a",
+    "class": "Acme\\Disp\\Service\\Branchy",
+    "method": "run",
+    "args": [
+      true
+    ],
+    "em": "eventManager"
+  },
+  {
+    "id": "E19 branch b",
+    "class": "Acme\\Disp\\Service\\Branchy",
+    "method": "run",
+    "args": [
+      false
+    ],
+    "em": "eventManager"
+  },
+  {
+    "id": "E20 interpolation, sprintf",
+    "class": "Acme\\Disp\\Service\\Interp",
+    "method": "run",
+    "args": [
+      "convert"
+    ],
+    "em": "eventManager"
+  },
+  {
+    "id": "F3 one line",
+    "class": "Acme\\Disp\\Service\\OneLine",
+    "method": "run",
+    "em": "eventManager"
+  },
+  {
+    "id": "F4 trait override without parent",
+    "class": "Acme\\Disp\\Model\\TraitSilenced",
+    "method": "afterSave",
+    "em": "_eventManager"
+  },
+  {
+    "id": "F4 nested trait override without parent",
+    "class": "Acme\\Disp\\Model\\NestedSilenced",
+    "method": "afterSave",
+    "em": "_eventManager"
+  },
+  {
+    "id": "F4 trait override with parent",
+    "class": "Acme\\Disp\\Model\\TraitLoud",
+    "method": "afterSave",
+    "em": "_eventManager"
+  },
+  {
+    "id": "F5 constructor assignment",
+    "class": "Acme\\Disp\\Model\\CtorAssigned",
+    "ctor": [],
+    "method": "afterSave",
+    "em": "_eventManager"
+  },
+  {
+    "id": "F6 append, branch taken",
+    "class": "Acme\\Disp\\Service\\Appended",
+    "method": "run",
+    "args": [
+      true
+    ],
+    "em": "eventManager"
+  },
+  {
+    "id": "F6 append, branch not taken",
+    "class": "Acme\\Disp\\Service\\Appended",
+    "method": "run",
+    "args": [
+      false
+    ],
+    "em": "eventManager"
+  },
+  {
+    "id": "F7 constructor default",
+    "class": "Acme\\Disp\\Service\\CtorDefault",
+    "ctor": [],
+    "method": "run",
+    "em": "eventManager"
+  },
+  {
+    "id": "F7 constructor default, another area",
+    "class": "Acme\\Disp\\Service\\CtorDefaultAdmin",
+    "ctor": [],
+    "method": "run",
+    "em": "eventManager"
+  },
+  {
+    "id": "F7 di.xml [adminhtml]",
+    "class": "Acme\\Disp\\Service\\CtorDefaultAdmin",
+    "ctor": [
+      "acme_ctoradmin"
+    ],
+    "method": "run",
+    "em": "eventManager"
+  },
+  {
+    "id": "F11 required constructor argument",
+    "class": "Acme\\Disp\\Service\\Wired",
+    "ctor": [
+      "acme_dyn"
+    ],
+    "method": "run",
+    "em": "eventManager"
+  }
+]

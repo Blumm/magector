@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="urn:magento:framework:ObjectManager/etc/config.xsd">
+    <!-- E13: the prefix exists in adminhtml only -->
+    <type name="Acme\Disp\Model\ResourceModel\Grid\Collection">
+        <arguments>
+            <argument name="eventPrefix" xsi:type="string">acme_grid</argument>
+        </arguments>
+    </type>
+    <!-- F7: a constructor argument in adminhtml only; the parameter's default elsewhere -->
+    <type name="Acme\Disp\Service\CtorDefaultAdmin">
+        <arguments>
+            <argument name="eventPrefix" xsi:type="string">acme_ctoradmin</argument>
+        </arguments>
+    </type>
+</config>

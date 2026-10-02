@@ -8,6 +8,7 @@ changing the DI / event / PHP readers, or to see how Magector does on a given pr
 | `php` | PHP's tokenizer (`php-truth.php`): classes / interfaces / enums per file, methods with visibility, static, final | `src/di-config.js` (`parsePhpTypes`, `parsePhpMembers`) |
 | `xml` | DOMDocument / libxml (`xml-truth.php`): plugins, preferences, object arguments, observers per file; files Magento rejects, with its message | `src/di-config.js` (`parseDiXml`, `parseEventsXml`) |
 | `plugins` | the running installation (`runtime-plugins.php`): plugins Magento runs per class and area (`PluginListInterface::getNext()`) | `magento_find_plugin` over MCP (structural part, no index needed) |
+| `dispatch` | PHP (`dispatch-truth.php`): for every class running a site whose event name depends on it, the property (Reflection default), constant or `di.xml` argument (ObjectManager config per area) the name is built from | `magento_find_event_dispatchers` over MCP (`dispatch-claims`) |
 | `webapi` `graphql` `cron` `dbschema` `modules` | the installation (`config-truth.php`): Web API routes, GraphQL types → fields → resolver (apart from the fields EAV readers add), cron jobs (+ `core_config_data`), declared tables with columns / keys / indexes, module directories and load order | `src/magento-config.js` (the models behind `find_api`, `find_graphql`, `find_cron`, `find_db_schema`, `module_structure`) |
 | `trace_api` | the installation (`config-truth.php trace_api`): every route, its service, and the class Magento creates for the service in `webapi_rest` | `magento_trace_api` over MCP, route by route |
 | `merge` | Magento's DI / events readers (`merge-truth.php`): each area's files in order, merged by the reader's own merger and converted, under Magento's ErrorHandler | `mergeConfigFiles` / `checkMergedConfig` (`src/di-config.js`) — file list, merged document, verdict |
@@ -33,6 +34,17 @@ node scripts/verify-magento/compare.mjs php     /path/to/magento php-truth.json
 node scripts/verify-magento/compare.mjs xml     /path/to/magento xml-truth.json
 node scripts/verify-magento/compare.mjs plugins /path/to/magento runtime-plugins.json graphql
 ```
+
+Event names built from the class that runs the code:
+
+```bash
+node scripts/verify-magento/compare.mjs dispatch-claims /path/to/magento > dispatch-claims.json
+php /path/to/magector/scripts/verify-magento/dispatch-truth.php < dispatch-claims.json > dispatch-truth.json   # in the PHP container
+node scripts/verify-magento/compare.mjs dispatch /path/to/magento dispatch-truth.json
+```
+
+`dispatch-fixture-truth.php` (any PHP, no Magento) runs the cases of `tests/fixtures/dispatch-resolution`
+and records what PHP dispatches — the expected names of `tests/dispatch-resolution.test.js`.
 
 Structural config answers:
 
