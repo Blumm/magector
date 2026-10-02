@@ -1,0 +1,84 @@
+{
+    "php": "8.3.30",
+    "cases": {
+        "E1 literal": [
+            "acme_model_save_after",
+            "acme_order_save_after"
+        ],
+        "E2 four levels": [
+            "acme_model_save_after",
+            "acme_product_save_after"
+        ],
+        "E2 one level": [
+            "acme_model_save_after",
+            "acme_order_save_after"
+        ],
+        "E3 middle layer": [
+            "acme_model_save_after",
+            "acme_middle_save_after"
+        ],
+        "E5 trait": [
+            "acme_trait_emitted"
+        ],
+        "E5 nested trait": [
+            "acme_nested_emitted"
+        ],
+        "E14 default": [
+            "acme_model_save_after",
+            "acme_switch_a_save_after"
+        ],
+        "E14 assigned": [
+            "acme_model_save_after",
+            "acme_switch_b_save_after"
+        ],
+        "E15 override without parent": [],
+        "E16 alias, same short name": [
+            "acme_model_save_after",
+            "acme_other_save_after"
+        ],
+        "E13 di.xml [adminhtml]": [
+            "acme_grid_load_after"
+        ],
+        "E13 virtual type": [
+            "acme_other_grid_load_after"
+        ],
+        "E6 self:: in trait": [
+            "acme_trait_user_fired"
+        ],
+        "E7 base": [
+            "acme_base_static",
+            "acme_base_self"
+        ],
+        "E7 child": [
+            "acme_child_static",
+            "acme_base_self"
+        ],
+        "E8 interface constant": [
+            "acme_alert_event",
+            "acme_alert_event_checkout",
+            "acme_root_reached"
+        ],
+        "E9 constant chain": [
+            "acme_chain_end"
+        ],
+        "E10 map a": [
+            "acme_status_approved"
+        ],
+        "E10 map r": [
+            "acme_status_rejected"
+        ],
+        "E12 request": [
+            "acme_predispatch_checkout_cart_add"
+        ],
+        "E19 branch a": [
+            "acme_branch_a"
+        ],
+        "E19 branch b": [
+            "acme_branch_b"
+        ],
+        "E20 interpolation, sprintf": [
+            "acme_interp_done",
+            "acme_copy_fieldset_convert"
+        ]
+    }
+}

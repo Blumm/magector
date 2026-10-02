@@ -39,7 +39,7 @@ import {
   virtualTypesResolvingTo, argumentInjectionsOf, effectivePluginDeclarations, resolvePluginType,
   parseEventsXml, parseXml, areaFromPath, createAncestorResolver,
   buildModuleIndex, preferenceCascade, mergeNamedDeclarations, pluginDeclarationsOn,
-  createMemberResolver, interceptionStatus, buildClassHierarchy, instancesOf, applyModuleOrder, parsePhpFile, qualifyPhpName,
+  createMemberResolver, interceptionStatus, buildClassHierarchy, addToClassHierarchy, phpTypeDecls, instancesOf, applyModuleOrder, parsePhpFile, qualifyPhpName,
   checkXmlWellFormed,
 } from './di-config.js';
 import {
@@ -47,6 +47,7 @@ import {
   discoverModules, listModuleEtcFiles, etcPatternRegExp, MODULE_XML_IGNORE,
 } from './magento-config.js';
 import { defaultDbPath, manifestPath, tempDbPathFor, swapInIndex } from './paths.js';
+import { extractPhpFacts, createDispatchResolver, parseNameExpr, dependsOnCalledClass, nameMatches, shownName, isInformative, sharesKnownParts, WILD } from './php-dispatch.js';
 import { createRequire } from 'module';
 const __pkg = createRequire(import.meta.url)('../package.json');
 
@@ -3985,25 +3986,120 @@ async function findTests(className, methodName) {
 // ─── Find Implementors ──────────────────────────────────────────
 // Find all classes implementing a given interface: PHP `implements` + DI preferences
 
-const classHierarchyCache = { root: null, hierarchy: null };
+const classHierarchyCache = {
+  root: null, hierarchy: null, dispatchSites: null, traitUsers: null, building: null,
+  files: null, dispatchFiles: null, checkedAt: 0,   // freshness: the files scanned, the files with dispatch sites (rel → stamp)
+};
 
-/** Reverse class hierarchy of all PHP classes / interfaces under root (tests excluded). */
+/**
+ * Reverse class hierarchy of all PHP classes / interfaces under root (tests excluded) — and, from the
+ * same read of every file, the `->dispatch(` sites and the classes that use each trait.
+ */
 async function getClassHierarchy(root) {
   if (classHierarchyCache.root === root && classHierarchyCache.hierarchy) return classHierarchyCache.hierarchy;
-  const files = await glob('**/*.php', {
-    cwd: root, nodir: true,
-    ignore: ['**/test/**', '**/tests/**', '**/Test/**', '**/Tests/**', '**/node_modules/**', 'generated/**', 'var/**', 'pub/**', 'setup/**', 'dev/**']
-  });
-  const entries = [];
+  if (classHierarchyCache.building && classHierarchyCache.building.root === root) return classHierarchyCache.building.promise;
+  const promise = buildPhpScan(root).finally(() => { classHierarchyCache.building = null; });
+  classHierarchyCache.building = { root, promise };
+  return promise;
+}
+
+const SCAN_SKIP_TOP = new Set(['generated', 'var', 'pub', 'setup', 'dev']);
+const SCAN_SKIP_DIRS = new Set(['test', 'tests', 'Test', 'Tests', 'node_modules']);
+
+/** PHP files below root (relative), tests and Magento's generated / var / pub / setup / dev left out; symlinked directories not followed — as glob did, ~15× faster. */
+function walkPhpFiles(root) {
+  const out = [];
+  const walk = (dir, rel) => {
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.name.startsWith('.')) continue;
+      if (e.isDirectory()) {
+        if (SCAN_SKIP_DIRS.has(e.name) || (!rel && SCAN_SKIP_TOP.has(e.name))) continue;
+        walk(path.join(dir, e.name), rel ? `${rel}/${e.name}` : e.name);
+      } else if (e.name.endsWith('.php') && (e.isFile() || e.isSymbolicLink())) {
+        out.push(rel ? `${rel}/${e.name}` : e.name);
+      }
+    }
+  };
+  walk(root, '');
+  return out;
+}
+
+async function buildPhpScan(root) {
+  const t0 = Date.now();
+  const files = walkPhpFiles(root);
+  const scan = { hierarchy: { types: new Map(), children: new Map() }, dispatchSites: [], traitUsers: new Map(), dispatchFiles: new Map() };
+  let n = 0;
   for (const rel of files) {
-    let source;
-    try { source = readFileSync(path.join(root, rel), 'utf-8'); } catch { continue; }
-    if (!/\b(?:extends|implements)\b/i.test(source)) continue;
-    entries.push({ relPath: rel, source });
+    // ~50k files: give pending requests a turn every few hundred files
+    if (++n % 300 === 0) await new Promise(r => setImmediate(r));
+    scanPhpFile(root, rel, scan);
   }
-  classHierarchyCache.root = root;
-  classHierarchyCache.hierarchy = buildClassHierarchy(entries);
+  Object.assign(classHierarchyCache, {
+    root, hierarchy: scan.hierarchy, dispatchSites: scan.dispatchSites, traitUsers: scan.traitUsers,
+    dispatchFiles: scan.dispatchFiles, files: new Set(files), checkedAt: Date.now(),
+  });
+  logToFile('INFO', `PHP scan: ${files.length} files, ${scan.hierarchy.types.size} types with parents, ${scan.dispatchSites.length} dispatch sites (${Date.now() - t0}ms)`);
   return classHierarchyCache.hierarchy;
+}
+
+/** One PHP file into the scan: its dispatch sites, the traits its classes use, its types with parents. */
+function scanPhpFile(root, rel, scan) {
+  const abs = path.join(root, rel);
+  let source;
+  try { source = readFileSync(abs, 'utf-8'); } catch { return; }
+  if (/->\s*dispatch\s*\(/.test(source)) {
+    try {
+      const facts = extractPhpFacts(source);
+      for (const d of facts.dispatches) scan.dispatchSites.push({ ...d, file: rel });
+      cachePhpFacts(abs, facts);
+      const st = statSync(abs);
+      scan.dispatchFiles.set(rel, `${st.mtimeMs}:${st.size}`);
+    } catch { /* a file the scanner cannot read: its dispatches are not resolved */ }
+  }
+  const hasParents = /\b(?:extends|implements)\b/i.test(source);
+  const usesTraits = /^\s+use\s+[\\\w]+(\s*,\s*[\\\w]+)*\s*[;{]/m.test(source);
+  if (!hasParents && !usesTraits) return;
+  let types;
+  try { types = parsePhpFile(source).types; } catch { return; }       // parsed once per file
+  for (const t of types) {
+    for (const tr of t.traits) {
+      const k = tr.toLowerCase();
+      if (!scan.traitUsers.has(k)) scan.traitUsers.set(k, []);
+      scan.traitUsers.get(k).push(t.fqcn);
+    }
+  }
+  if (hasParents) addToClassHierarchy(scan.hierarchy, rel, phpTypeDecls(types));
+}
+
+/**
+ * Files added mid-session, and files with dispatch sites edited or deleted, are picked up — checked
+ * at most every MAGECTOR_PHP_LIST_TTL_MS (a walk of the tree, ~0.2 s; a stat per dispatching file).
+ * A dispatch added to a file that had none, and a class removed from the hierarchy, show next session.
+ */
+function refreshPhpScan(root) {
+  const c = classHierarchyCache;
+  if (c.root !== root || !c.hierarchy || Date.now() - c.checkedAt < PHP_LIST_TTL_MS) return;
+  c.checkedAt = Date.now();
+  let changed = false;
+  for (const [rel, stamp] of [...c.dispatchFiles]) {
+    let now = null;
+    try { const st = statSync(path.join(root, rel)); now = `${st.mtimeMs}:${st.size}`; } catch { /* gone */ }
+    if (now === stamp) continue;
+    c.dispatchSites = c.dispatchSites.filter(d => d.file !== rel);
+    c.dispatchFiles.delete(rel);
+    if (now) scanPhpFile(root, rel, { hierarchy: c.hierarchy, dispatchSites: c.dispatchSites, traitUsers: c.traitUsers, dispatchFiles: c.dispatchFiles });
+    changed = true;
+  }
+  const files = walkPhpFiles(root);
+  for (const rel of files) {
+    if (c.files.has(rel)) continue;
+    scanPhpFile(root, rel, { hierarchy: c.hierarchy, dispatchSites: c.dispatchSites, traitUsers: c.traitUsers, dispatchFiles: c.dispatchFiles });
+    changed = true;
+  }
+  c.files = new Set(files);
+  if (changed) dispatchResolutionCache.bySite.clear();
 }
 
 async function findImplementors(interfaceName) {
@@ -4481,73 +4577,290 @@ async function getPhpFileList(root) {
   return phpFileListCache.files;
 }
 
-async function findEventDispatchers(eventName) {
-  const root = config.magentoRoot;
+// ─── Event dispatch sites ───────────────────────────────────────
+// A dispatch site and the classes it runs for: literal names, and names built from a property or a
+// class constant of the class that runs the code, resolved down the inheritance (src/php-dispatch.js).
 
-  const result = {
-    eventName,
-    dispatchers: [],
-    observerCount: 0
+const phpFactsCache = new Map();             // absPath → { mtimeMs, size, facts }
+
+function cachePhpFacts(absPath, facts) {
+  try {
+    const st = statSync(absPath);
+    phpFactsCache.set(absPath, { mtimeMs: st.mtimeMs, size: st.size, facts });
+  } catch { /* gone */ }
+}
+
+/** The facts of a PHP file, re-read when it changed. */
+function phpFactsOf(absPath) {
+  let st;
+  try { st = statSync(absPath); } catch { return null; }
+  const hit = phpFactsCache.get(absPath);
+  if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.facts;
+  let facts;
+  try { facts = extractPhpFacts(readFileSync(absPath, 'utf-8')); } catch { return null; }
+  phpFactsCache.set(absPath, { mtimeMs: st.mtimeMs, size: st.size, facts });
+  return facts;
+}
+
+/** typeOf for the resolver: a class / interface / trait by FQCN through composer's maps; memoized per query. */
+function createTypeLookup(root, touched = null) {
+  const memo = new Map();
+  return fqcn => {
+    const k = String(fqcn || '').toLowerCase();
+    if (memo.has(k)) { const hit = memo.get(k); if (touched && hit?.absFile) touched.add(hit.absFile); return hit; }
+    const file = findClassFileFast(root, fqcn);
+    if (touched && file) touched.add(file);
+    const facts = file ? phpFactsOf(file) : null;
+    const rec = facts ? facts.types.find(t => t.fqcn.toLowerCase() === k) || null : null;
+    if (rec && !rec.file) { rec.file = path.relative(root, file); rec.absFile = file; }
+    memo.set(k, rec);
+    return rec;
   };
+}
 
-  const escaped = eventName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  // Match eventManager->dispatch('event_name' and similar patterns
-  // Magento lower-cases event names on dispatch — match case-insensitively
-  const dispatchRegex = new RegExp(
-    `dispatch\\s*\\(\\s*['"]${escaped}['"]`, 'i'
-  );
-
-  // 1. Grep PHP files for exact dispatch calls (the file list is reused for PHP_LIST_TTL_MS)
-  const phpFiles = await getPhpFileList(root);
-
-  for (const phpFile of phpFiles) {
-    let content;
-    try { content = readFileSync(phpFile, 'utf-8'); } catch { continue; }
-    if (!content.toLowerCase().includes(eventName.toLowerCase())) continue;
-
-    const relativePath = phpFile.replace(root + '/', '');
-    const lines = content.split('\n');
-    const classMatch = content.match(/(?:class|abstract\s+class|trait)\s+(\w+)/);
-    const nsMatch = content.match(/namespace\s+([\w\\]+)/);
-    const className = classMatch ? classMatch[1] : path.basename(phpFile, '.php');
-    const fqcn = nsMatch ? `${nsMatch[1]}\\${className}` : className;
-
-    for (let i = 0; i < lines.length; i++) {
-      if (dispatchRegex.test(lines[i])) {
-        // Find enclosing method
-        let methodName = null;
-        for (let j = i; j >= Math.max(0, i - 30); j--) {
-          const mMatch = lines[j].match(/(?:public|protected|private|static)\s+function\s+(\w+)/);
-          if (mMatch) { methodName = mMatch[1]; break; }
-        }
-
-        // Get surrounding context (2 lines before and after)
-        const ctxStart = Math.max(0, i - 2);
-        const ctxEnd = Math.min(lines.length - 1, i + 2);
-        const context = lines.slice(ctxStart, ctxEnd + 1).map(l => l.trimEnd()).join('\n');
-
-        result.dispatchers.push({
-          path: relativePath,
-          class: fqcn,
-          method: methodName,
-          line: i + 1,
-          snippet: lines[i].trim().slice(0, 200),
-          context: context.slice(0, 500)
-        });
+/**
+ * String constructor arguments from di.xml as ObjectManager\Config merges them: a virtual type over
+ * its type, a class over its parent and interfaces (Relations::getParents), area over global; the
+ * last declaration in module order wins. → (owner, argument) → [{ value, area, file }].
+ */
+function createDiStringArgs(model, typeOf) {
+  const areas = ['global', ...new Set([...model.types, ...model.virtualTypes].map(t => t.area).filter(a => a !== 'global'))];
+  const memo = new Map();
+  const argsOf = (owner, area, seen = new Set()) => {
+    const key = `${owner.toLowerCase()}|${area}`;
+    if (memo.has(key)) return memo.get(key);
+    if (seen.has(key)) return new Map();
+    seen.add(key);
+    let merged = new Map();
+    const scoped = list => [...list.filter(x => x.area === 'global'), ...list.filter(x => x.area === area && area !== 'global')];
+    const vts = scoped(model.virtualByName.get(owner) || []);
+    const decls = vts.length ? vts : scoped(model.types.filter(t => t.name === owner));
+    if (vts.length) {
+      merged = new Map(argsOf(vts[vts.length - 1].type, area, seen));
+    } else {
+      const rec = typeOf(owner);
+      for (const p of [rec?.parent, ...(rec?.interfaces || [])].filter(Boolean)) {
+        for (const [k, v] of argsOf(normalizeClassName(p), area, seen)) merged.set(k, v);
       }
     }
+    for (const d of decls) {
+      for (const a of d.args || []) merged.set(a.name, a.xsiType === 'string' ? { value: a.value, file: d.file, area: d.area } : null);
+    }
+    memo.set(key, merged);
+    return merged;
+  };
+  return (owner, argument) => {
+    const byArea = areas.map(area => ({ area, hit: argsOf(normalizeClassName(owner), area).get(argument) })).filter(x => x.hit);
+    const global = byArea.find(x => x.area === 'global');
+    const out = [];
+    if (global) out.push({ value: global.hit.value, area: 'global', file: global.hit.file });
+    for (const x of byArea) {
+      if (x.area !== 'global' && (!global || x.hit.value !== global.hit.value)) out.push({ value: x.hit.value, area: x.area, file: x.hit.file });
+    }
+    return out;
+  };
+}
+
+/** The concrete classes running a site (subclasses; for a trait, the classes using it) and the virtual types over a class. */
+function dispatchDeps(root, model, hierarchy, traitUsers) {
+  const concrete = (L, typeOf) => {
+    const out = new Map();
+    const add = (fqcn, p) => {
+      if (out.has(fqcn.toLowerCase())) return;
+      const rec = typeOf(fqcn);
+      if (rec && rec.kind === 'class' && !rec.isAbstract) out.set(fqcn.toLowerCase(), { fqcn: rec.fqcn, path: p });
+    };
+    const below = (fqcn, prefix) => {
+      for (const d of instancesOf(hierarchy, fqcn)) if (d.relation === 'extends' && d.kind === 'class') add(d.fqcn, [...prefix, ...d.path.slice(1)]);
+    };
+    if (L.kind === 'trait') {
+      for (const user of traitUsers.get(L.fqcn.toLowerCase()) || []) { add(user, [L.fqcn, user]); below(user, [L.fqcn, user]); }
+    } else {
+      add(L.fqcn, [L.fqcn]);
+      below(L.fqcn, [L.fqcn]);
+    }
+    return [...out.values()];
+  };
+  const virtualTypesOf = fqcn => virtualTypesResolvingTo(model, fqcn).map(vt => ({ name: vt.name }));
+  return { model, concrete, virtualTypesOf };
+}
+
+const dispatchResolutionCache = { root: null, bySite: new Map() };   // site key → { results, files, stamp, checkedAt }
+
+const filesStamp = files => [...files].sort().map(f => { try { const st = statSync(f); return `${f}:${st.mtimeMs}:${st.size}`; } catch { return `${f}:-`; } }).join('|');
+
+/**
+ * Dispatch sites of an event: { exact: [{ site, classes: [result] }], possible: [...], observerCount }.
+ * `query` may contain `*`. match: exact (default) — sites that dispatch the name, plus sites whose name
+ * is partly known only at runtime and could be it (possible); strict — only the first; wildcard — only
+ * the second.
+ */
+async function findEventDispatchers(query, { match = 'exact' } = {}) {
+  const root = config.magentoRoot;
+  await getClassHierarchy(root);
+  refreshPhpScan(root);
+  const hierarchy = classHierarchyCache.hierarchy;
+  const sites = classHierarchyCache.dispatchSites || [];
+  const traitUsers = classHierarchyCache.traitUsers || new Map();
+  const model = await getDiModel(root);
+  const typeOf = createTypeLookup(root);
+  const diStringArgs = createDiStringArgs(model, typeOf);
+  const resolver = createDispatchResolver({ typeOf, diStringArgs });
+  const deps = dispatchDeps(root, model, hierarchy, traitUsers);
+
+  const exact = [];
+  const possible = [];
+  for (const site of sites) {
+    // a name built at runtime is an event only on Magento's event manager (not Symfony, not a front controller)
+    const ast = parseNameExpr(site.arg);
+    if (ast.t !== 'lit' && !site.eventManager) continue;
+    if (!resolver.shapeOf(site).some(v => nameMatches(query, v))) continue;
+    const results = resolveSiteCached(root, site, deps);
+    const hitExact = [], hitPossible = [];
+    for (const r of results) {
+      const values = r.values.filter(v => nameMatches(query, v));
+      if (!values.length) continue;
+      if (values.some(v => !v.includes(WILD))) hitExact.push({ ...r, values: values.filter(v => !v.includes(WILD)) });
+      else hitPossible.push({ ...r, values });
+    }
+    if (hitExact.length) exact.push({ site, classes: hitExact });
+    if (hitPossible.length) possible.push({ site, classes: hitPossible });
   }
 
-  // 2. Count registered observers for context
-  const eventsFiles = await moduleEtcGlob(root, '**/etc/**/events.xml', { absolute: true });
-  for (const file of eventsFiles) {
-    let content;
-    try { content = readFileSync(file, 'utf-8'); } catch { continue; }
-    if (!content.toLowerCase().includes(eventName.toLowerCase())) continue;
-    result.observerCount += parseEventsXml(content, file.replace(root + '/', ''), eventName).length;
+  let observerCount = 0;
+  if (!query.includes('*')) {
+    const eventsFiles = await moduleEtcGlob(root, '**/etc/**/events.xml', { absolute: true });
+    for (const file of eventsFiles) {
+      let content;
+      try { content = readFileSync(file, 'utf-8'); } catch { continue; }
+      if (!content.toLowerCase().includes(query.toLowerCase())) continue;
+      observerCount += parseEventsXml(content, file.replace(root + '/', ''), query).length;
+    }
   }
+  return {
+    eventName: query,
+    match,
+    exact: match === 'wildcard' ? [] : exact,
+    possible: match === 'strict' ? [] : possible,
+    observerCount,
+    // flat list for find_event_flow
+    dispatchers: exact.map(({ site }) => ({ path: site.file, class: site.type, method: site.method, line: site.line, snippet: site.arg })),
+  };
+}
 
-  return result;
+/**
+ * A site resolved for the classes that run it, cached: kept while the files its resolution read are
+ * unchanged (checked at most every MAGECTOR_PHP_LIST_TTL_MS). A new subclass appears once the class
+ * hierarchy is rebuilt (next session).
+ */
+function resolveSiteCached(root, site, { model, concrete, virtualTypesOf }) {
+  if (dispatchResolutionCache.root !== root) {
+    dispatchResolutionCache.root = root;
+    dispatchResolutionCache.bySite = new Map();
+  }
+  const key = `${site.file}:${site.line}`;
+  const hit = dispatchResolutionCache.bySite.get(key);
+  if (hit) {
+    if (Date.now() - hit.checkedAt < PHP_LIST_TTL_MS) return hit.results;
+    if (filesStamp(hit.files) === hit.stamp) { hit.checkedAt = Date.now(); return hit.results; }
+  }
+  const touched = new Set([path.join(root, site.file)]);
+  const typeOf = createTypeLookup(root, touched);
+  const resolver = createDispatchResolver({ typeOf, diStringArgs: createDiStringArgs(model, typeOf) });
+  let results;
+  try { results = resolver.resolveSite(site, { concrete: L => concrete(L, typeOf), virtualTypesOf }); } catch (e) { results = []; logToFile('WARN', `dispatch ${key}: ${e.message}`); }
+  dispatchResolutionCache.bySite.set(key, { results, files: touched, stamp: filesStamp(touched), checkedAt: Date.now() });
+  return results;
+}
+
+/** Prepared in the background: the class hierarchy, then every site whose name depends on the class. */
+async function prewarmDispatchSites(root) {
+  await getClassHierarchy(root);
+  const model = await getDiModel(root);
+  await moduleEtcGlob(root, '**/etc/**/events.xml', { absolute: true });   // the observer count of an answer
+  const deps = dispatchDeps(root, model, classHierarchyCache.hierarchy, classHierarchyCache.traitUsers || new Map());
+  for (const site of classHierarchyCache.dispatchSites || []) {
+    if (!site.eventManager || !dependsOnCalledClass(parseNameExpr(site.arg))) continue;
+    await new Promise(r => setImmediate(r));
+    resolveSiteCached(root, site, deps);
+  }
+}
+
+/** The resolution as data: per site and class, the values and where each came from (for verification). */
+function dispatchClaims(res) {
+  const one = ({ site, classes }) => ({
+    file: site.file, line: site.line, type: site.type, method: site.method, arg: site.arg,
+    classes: classes.map(r => ({
+      forClass: r.forClass, virtualTypeOf: r.virtualTypeOf || null, perClass: Boolean(r.perClass), mayNotRun: r.mayNotRun,
+      values: r.values.map(shownName),
+      notes: r.notes.map(n => ({
+        kind: n.kind, name: n.name || null, what: n.what || null, declaredIn: n.rec?.fqcn || null, line: n.line || null,
+        argument: n.argument || null, di: n.di ? n.di.map(d => ({ value: d.value, area: d.area, file: d.file })) : null,
+        values: n.values ? n.values.map(shownName) : null, ofClass: n.ofClass || null, lookedUpIn: n.lookedUpIn || null, constName: n.constName || null,
+      })),
+    })),
+  });
+  return { query: res.eventName, exact: res.exact.map(one), possible: res.possible.map(one) };
+}
+
+const shortRel = (root, rec) => rec?.file || '';
+
+/** One line per class: where its value comes from, and the classes between the site's class and it. */
+function dispatchClassLine(root, site, r) {
+  const parts = [];
+  const di = r.notes.find(n => n.kind === 'di');
+  const prop = r.notes.find(n => n.kind === 'prop');
+  const assigned = r.notes.find(n => n.kind === 'assigned');
+  if (di) {
+    const where = di.di.map(d => `${d.area === 'global' ? '' : `[${d.area}] `}${d.file}`).join(', ');
+    parts.push(`$${di.name} from di.xml argument \`${di.argument}\` — ${where}`);
+  } else if (prop) {
+    parts.push(`$${prop.name} = ${prop.rec.props.get(prop.name)?.expr ?? '?'} (${shortRel(root, prop.rec)}:${prop.line})`);
+  } else if (assigned) {
+    parts.push(`$${assigned.name} assigned in ${assigned.rec.fqcn}::${assigned.method}() (${shortRel(root, assigned.rec)}:${assigned.line})`);
+  }
+  const between = r.path.slice(1, -1);
+  if (between.length) parts.push(`via ${between.map(c => `\`${c}\``).join(' → ')}`);
+  if (r.virtualTypeOf) parts.push(`virtual type of \`${r.virtualTypeOf}\``);
+  let line = `  for \`${r.forClass}\`${parts.length ? ' — ' + parts.join('; ') : ''}`;
+  if (r.mayNotRun) line += `\n  ⚠ \`${r.mayNotRun}::${site.method}()\` overrides it without parent:: — may not dispatch for this class`;
+  return line;
+}
+
+function formatEventDispatchers(root, res) {
+  const site = s => `\`${s.type ? `${s.type}::` : ''}${s.method ? `${s.method}()` : '(file scope)'}\` — ${s.file}:${s.line}`;
+  const wildcardQuery = res.eventName.includes('*');
+  let text = `## Event Dispatchers: \`${res.eventName}\``;
+  const total = res.exact.length;
+  text += total ? ` (${total} site${total > 1 ? 's' : ''})\n\n` : '\n\n';
+  for (const e of res.exact) {
+    const dependent = e.classes.some(r => r.perClass);
+    const names = [...new Set(e.classes.flatMap(r => r.values))];
+    text += `- ${site(e.site)}${wildcardQuery || names.length > 1 ? ` — ${names.slice(0, 8).map(v => `\`${shownName(v)}\``).join(', ')}${names.length > 8 ? `, … ${names.length - 8} more` : ''}` : ''}\n`;
+    if (dependent) {
+      for (const r of e.classes.slice(0, 8)) text += dispatchClassLine(root, e.site, r) + '\n';
+      if (e.classes.length > 8) text += `  … ${e.classes.length - 8} more classes\n`;
+    }
+  }
+  if (!res.exact.length) text += `_No dispatch site with this exact name${res.observerCount ? ' — observers registered for it run only if a name built at runtime matches' : ''}._\n`;
+  // sites whose name is all unknown (a wrapper forwarding its caller's name) only as a count
+  let informative = res.possible.filter(p => res.match === 'wildcard' ||
+    p.classes.some(r => r.values.some(v => isInformative(v) && sharesKnownParts(res.eventName, v))));
+  // nothing else matches: the wrappers are the only lead (EntityManager's entity events)
+  if (!res.exact.length && !informative.length && !res.eventName.includes('*')) informative = res.possible;
+  const opaque = res.possible.length - informative.length;
+  if (informative.length) {
+    text += `\nPossible — the name is partly known only at runtime (${informative.length}):\n`;
+    for (const p of informative.slice(0, 10)) {
+      const names = [...new Set(p.classes.flatMap(r => r.values))].map(v => `\`${shownName(v)}\``);
+      const why = [...new Set(p.classes.flatMap(r => r.notes.filter(n => n.kind === 'runtime').map(n => n.what)))].slice(0, 2).join(', ');
+      text += `- ${site(p.site)} — ${names.slice(0, 3).join(', ')}${why ? ` (${why})` : ''}\n`;
+    }
+    if (informative.length > 10) text += `- … ${informative.length - 10} more (match=wildcard)\n`;
+  }
+  if (opaque) text += `\n${opaque} more site(s) dispatch a name chosen entirely at runtime (a wrapper forwarding its caller's name) — match=wildcard lists them.\n`;
+  if (res.observerCount) text += `\nObservers: ${res.observerCount} — magento_find_observer\n`;
+  return text;
 }
 
 // ─── Trace Call Chain ───────────────────────────────────────────
@@ -5758,7 +6071,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           eventName: {
             type: 'string',
-            description: 'Magento event name to find dispatchers for. Examples: "sales_order_place_after", "custom_discount_rule_validation_before", "checkout_cart_add_product_complete"'
+            description: 'Magento event name to find dispatchers for; `*` matches any part. Examples: "sales_order_place_after", "catalog_product_save_after", "*_save_after"'
+          },
+          match: {
+            type: 'string',
+            enum: ['exact', 'strict', 'wildcard'],
+            description: 'exact (default): sites that dispatch the name — including names built from a property or constant of the class that runs the code ($this->_eventPrefix . "_save_after"), resolved per class — plus, marked, sites whose name is only partly known at runtime and could match. strict: only the first. wildcard: only the second.'
           }
         },
         required: ['eventName']
@@ -7643,34 +7961,11 @@ const _callToolHandler = async (request) => {
       }
 
       case 'magento_find_event_dispatchers': {
-        const dispResult = await findEventDispatchers(args.eventName);
-
-        let text = `## Event Dispatchers: \`${dispResult.eventName}\`\n\n`;
-
-        if (dispResult.dispatchers.length > 0) {
-          text += `Found ${dispResult.dispatchers.length} dispatch location(s)`;
-          if (dispResult.observerCount > 0) {
-            text += ` (${dispResult.observerCount} observer(s) registered)`;
-          }
-          text += '.\n\n';
-
-          for (const d of dispResult.dispatchers) {
-            const methodTag = d.method ? `::${d.method}` : '';
-            text += `### \`${d.class}${methodTag}\`\n`;
-            text += `**File:** ${d.path}:${d.line}\n`;
-            if (d.context) {
-              text += '```php\n' + d.context + '\n```\n';
-            }
-            text += '\n';
-          }
-        } else {
-          text += '_No dispatch() calls found for this event._\n';
-          if (dispResult.observerCount > 0) {
-            text += `\nNote: ${dispResult.observerCount} observer(s) are registered for this event — it may be dispatched by Magento core or a module not in the scanned path.\n`;
-          }
-        }
-
-        return { content: [{ type: 'text', text }] };
+        const match = ['exact', 'strict', 'wildcard'].includes(args.match) ? args.match : 'exact';
+        const res = await findEventDispatchers(String(args.eventName || '').trim(), { match });
+        // scripts/verify-magento (compare.mjs dispatch-claims): the resolution as data, to check against PHP
+        if (process.env.MAGECTOR_DISPATCH_JSON === '1') return { content: [{ type: 'text', text: JSON.stringify(dispatchClaims(res)) }] };
+        return { content: [{ type: 'text', text: formatEventDispatchers(config.magentoRoot, res) }] };
       }
 
       case 'magento_batch': {
@@ -8734,7 +9029,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (warning) result.content[0].text = warning + result.content[0].text;
   }
   for (const c of result?.content || []) {
-    if (c.type === 'text' && typeof c.text === 'string') c.text = capOutput(c.text);
+    // the verification data of MAGECTOR_DISPATCH_JSON is a whole JSON document, not an answer to cap
+    if (c.type === 'text' && typeof c.text === 'string' && process.env.MAGECTOR_DISPATCH_JSON !== '1') c.text = capOutput(c.text);
   }
   return result;
 });
@@ -8835,6 +9131,17 @@ async function main() {
   await server.connect(transport);
   logToFile('INFO', 'Magector MCP server connected (warming up...)');
   console.error('Magector MCP server connected (warming up...)');
+
+  // The class hierarchy and the dispatch sites (find_event_dispatchers, find_implementors) take seconds
+  // to read on a large tree: prepared in the background, in slices, so requests in the meantime run
+  if (config.magentoRoot && process.env.MAGECTOR_PREWARM_PHP !== '0') {
+    setTimeout(() => {
+      const t0 = Date.now();
+      prewarmDispatchSites(config.magentoRoot)
+        .then(() => logToFile('INFO', `PHP scan and dispatch sites prewarmed (${Date.now() - t0}ms)`))
+        .catch(e => logToFile('WARN', `PHP prewarm failed: ${e.message}`));
+    }, 1500).unref?.();
+  }
 
   // ── Singleton serve: one serve process per project ──────────────
   // 1. Try socket → secondary (instant, no CPU)

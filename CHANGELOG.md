@@ -6,6 +6,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions corresp
 
 ## [Unreleased]
 
+### Fixed
+- **`find_event_dispatchers` missed every event whose name is built at runtime** — `catalog_product_save_after` ("No dispatch() calls found", 10 observers): Magento dispatches it in `Model\AbstractModel::afterSave()` as `$this->_eventPrefix . '_save_after'`, with the prefix declared in `Catalog\Model\Product` four levels below. A name built from a property or a class constant is now resolved for every concrete class that runs the code (`src/php-dispatch.js`): the class, its traits (nested), its parents, level by level — a level whose file is not found is named, never skipped; `self::` / `static::` / `parent::`, interface constants, constants built from constants, a constant map, local variables (every assignment), interpolation, `sprintf` / `strtolower`; a constructor argument from `di.xml` (area, virtual type, Magento's argument inheritance); a subclass overriding the method without `parent::` is marked. A name partly known only at runtime (`'controller_action_predispatch_' . $request->getFullActionName()`) is listed as possible, with its known parts; only Magento's event manager counts for those. One line per site and class. Checked against PHP: 953/953 resolved values on a Mage-OS 2.4.9 project, 1,047/1,047 on a Magento 2.4.5 project (Reflection, di.xml through ObjectManager config per area); fixture cases run by PHP itself.
+
+### Changed
+- **The class hierarchy (`find_implementors`, `find_event_dispatchers`) is read once in the background after start** and kept current: files added mid-session and edited dispatching files are picked up (at most every `MAGECTOR_PHP_LIST_TTL_MS`). One read and one parse per file, and a directory walk instead of glob: ~6 s instead of ~8–12 s on 49k PHP files; afterwards `find_event_dispatchers` 15–40 ms, `find_implementors` a few ms. `MAGECTOR_PREWARM_PHP=0` turns the background read off.
+
+### Added
+- **`scripts/verify-magento`: modes `dispatch-claims` / `dispatch`** (`dispatch-truth.php`) — every value a dispatch name was built from, per class, against PHP; `dispatch-fixture-truth.php` runs the fixture's cases in PHP and records what it dispatches.
+
 ## [2.18.0] - 2026-10-01
 
 ### Added

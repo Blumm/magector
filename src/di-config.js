@@ -1004,7 +1004,12 @@ export function interceptionStatus(className, methodName, ancestorsOf, membersOf
 
 /** All class / interface / enum declarations in a PHP file with their resolved parents and interfaces. */
 export function parsePhpTypes(source) {
-  return parsePhpFile(source).types
+  return phpTypeDecls(parsePhpFile(source).types);
+}
+
+/** parsePhpFile types as class-hierarchy declarations (traits left out). */
+export function phpTypeDecls(types) {
+  return types
     .filter(t => t.kind !== 'trait')
     .map(t => ({
       fqcn: t.fqcn,
@@ -1019,25 +1024,29 @@ export function parsePhpTypes(source) {
  * Keys are lower-cased because PHP class names are case-insensitive.
  */
 export function buildClassHierarchy(entries) {
-  const types = new Map();
-  const children = new Map();
+  const hierarchy = { types: new Map(), children: new Map() };
+  for (const { relPath, source, decls: given } of entries) {
+    let decls = given;
+    if (!decls) { try { decls = parsePhpTypes(source); } catch { continue; } }
+    addToClassHierarchy(hierarchy, relPath, decls);
+  }
+  return hierarchy;
+}
+
+/** Add one file's declarations to a class hierarchy (a type already known keeps its first file). */
+export function addToClassHierarchy(hierarchy, relPath, decls) {
   const add = (parent, child, relation) => {
     const k = parent.toLowerCase();
-    if (!children.has(k)) children.set(k, []);
-    children.get(k).push({ child, relation });
+    if (!hierarchy.children.has(k)) hierarchy.children.set(k, []);
+    hierarchy.children.get(k).push({ child, relation });
   };
-  for (const { relPath, source } of entries) {
-    let decls;
-    try { decls = parsePhpTypes(source); } catch { continue; }
-    for (const t of decls) {
-      const k = t.fqcn.toLowerCase();
-      if (types.has(k)) continue;
-      types.set(k, { ...t, file: relPath });
-      for (const p of t.parents) add(p, t.fqcn, 'extends');
-      for (const i of t.interfaces) add(i, t.fqcn, t.kind === 'interface' ? 'extends' : 'implements');
-    }
+  for (const t of decls) {
+    const k = t.fqcn.toLowerCase();
+    if (hierarchy.types.has(k)) continue;
+    hierarchy.types.set(k, { ...t, file: relPath });
+    for (const p of t.parents) add(p, t.fqcn, 'extends');
+    for (const i of t.interfaces) add(i, t.fqcn, t.kind === 'interface' ? 'extends' : 'implements');
   }
-  return { types, children };
 }
 
 /**

@@ -40,6 +40,7 @@ Two layers, each against Magento itself — never against Magector's own idea of
 | Declared tables | 507/507 with every column, key and index under Magento's name |
 | Modules | 598/598 directories, enabled state and load order |
 | `trace_api` vs Magento | 446/446 routes: same route, service class and method |
+| Event names built from the class running the code (`compare.mjs dispatch`) | 953/953 values (944 properties, 9 di.xml arguments per area) as PHP has them; 579 sites resolved. Of 348 events with observers, 247 have an exact site, 57 a possible one; the rest are entity events (`EntityManager`, name from a method) or observers of events nothing dispatches (`authorization_role_save_after` — the model's prefix is `authorization_roles`) |
 
 ## Results (Magento Open Source 2.4.5-p14 project, ~110 custom modules, PHP 8.1, libxml 2.9.14)
 
@@ -56,6 +57,7 @@ A second, older installation, checked with the same scripts. Its plugin check fo
 | Cron jobs | 75/75; 3 differ only through `core_config_data` (noted) |
 | Declared tables | 379/379 |
 | Modules | 449/449 |
+| Event names built from the class running the code | 1,047/1,047 values (1,037 properties, 10 di.xml arguments) as PHP 8.1 has them |
 
 Use cases on it (as below): every answer complete; cold 0.15–0.44 s, warm 3–82 ms;
 `find_plugin` 4 of 4 where grep finds 2 of 4; columns of sales_order 4.1k tokens instead of 46.3k.
@@ -111,6 +113,14 @@ non-public, `NoninterceptableInterface`), comments in XML read as data. Tests: `
 | Code that asks for X gets X's preference, and the preference class's own plugins run (`Import\Product` → a module's `Rewrite\Product`) | only plugins declared on X and its ancestors | `di-resolution`: Importer / BetterImporter |
 | An abstract class is never instantiated; its plugins run on its concrete subclasses | listed as running on the abstract class | `di-resolution`: AbstractSource / TableSource |
 | — (no index database: nothing to search) | each structural tool's semantic addition waited out the serve respawn delay, 5 s then 10 s per call | `config-models`: no index |
+
+### Event dispatch sites
+| Magento / PHP | Before | Test (`tests/dispatch-resolution.test.js`, expected names from PHP running the fixture) |
+|---|---|---|
+| `$this->_eventPrefix . '_save_after'` dispatches the prefix of the class that runs `afterSave()` — declared in it, an abstract middle layer, a (nested) trait, or set from a `di.xml` constructor argument | only literal names were found | E2–E5, E13, E14, E16 |
+| `self::` is the class that wrote the code (in a trait, the class using it), `static::` the class that runs it; interface constants are inherited | — | E6–E9 |
+| A subclass overriding the method without `parent::` does not dispatch | — | E15 (listed, marked) |
+| A runtime part (`$request->getFullActionName()`, a parameter) stays unknown; another dispatcher (Symfony) is not an event | — | E11, E12, E17, E18 |
 
 ## Not structural yet
 
