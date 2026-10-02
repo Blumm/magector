@@ -4860,7 +4860,7 @@ function dispatchClaims(res) {
   const one = ({ site, classes }) => ({
     file: site.file, line: site.line, type: site.type, method: site.method, arg: site.arg,
     classes: classes.map(r => ({
-      forClass: r.forClass, virtualTypeOf: r.virtualTypeOf || null, perClass: Boolean(r.perClass), mayNotRun: r.mayNotRun,
+      forClass: r.forClass, virtualTypeOf: r.virtualTypeOf || null, perClass: Boolean(r.perClass), mayNotRun: r.mayNotRun, mayNotRunVia: r.mayNotRunVia || null,
       values: r.values.map(shownName),
       notes: r.notes.map(n => ({
         kind: n.kind, name: n.name || null, what: n.what || null, declaredIn: n.rec?.fqcn || null, line: n.line || null,
@@ -4892,7 +4892,7 @@ function dispatchClassLine(root, site, r) {
   if (between.length) parts.push(`via ${between.map(c => `\`${c}\``).join(' → ')}`);
   if (r.virtualTypeOf) parts.push(`virtual type of \`${r.virtualTypeOf}\``);
   let line = `  for \`${r.forClass}\`${parts.length ? ' — ' + parts.join('; ') : ''}`;
-  if (r.mayNotRun) line += `\n  ⚠ \`${r.mayNotRun}::${site.method}()\` overrides it without parent:: — may not dispatch for this class`;
+  if (r.mayNotRun) line += `\n  ⚠ \`${r.mayNotRun}::${site.method}()\`${r.mayNotRunVia ? ` from trait \`${r.mayNotRunVia}\`` : ''} overrides it without parent:: — may not dispatch for this class`;
   return line;
 }
 

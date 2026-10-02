@@ -170,5 +170,23 @@
     "class": "Acme\\Disp\\Service\\OneLine",
     "method": "run",
     "em": "eventManager"
+  },
+  {
+    "id": "F4 trait override without parent",
+    "class": "Acme\\Disp\\Model\\TraitSilenced",
+    "method": "afterSave",
+    "em": "_eventManager"
+  },
+  {
+    "id": "F4 nested trait override without parent",
+    "class": "Acme\\Disp\\Model\\NestedSilenced",
+    "method": "afterSave",
+    "em": "_eventManager"
+  },
+  {
+    "id": "F4 trait override with parent",
+    "class": "Acme\\Disp\\Model\\TraitLoud",
+    "method": "afterSave",
+    "em": "_eventManager"
   }
 ]

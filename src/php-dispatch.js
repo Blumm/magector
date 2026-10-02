@@ -220,7 +220,8 @@ export function extractPhpFacts(source) {
       const params = [...text.slice(paramsOpen, paramsClose).matchAll(/\$(\w+)/g)].map(p => p[1]);
       let k = paramsClose + 1;
       while (k < close && code[k] !== '{' && code[k] !== ';') k++;
-      const method = { name: f[2], params, bodyStart: k, bodyEnd: code[k] === '{' ? closeOf(k) : k, line: lineAt(at(f.index)) };
+      const hasBody = code[k] === '{';       // an abstract or interface method has none
+      const method = { name: f[2], params, hasBody, bodyStart: k, bodyEnd: hasBody ? closeOf(k) : k, line: lineAt(at(f.index)) };
       if (!rec.methods.has(f[2].toLowerCase())) rec.methods.set(f[2].toLowerCase(), method);
     }
     const methodAt = off => [...rec.methods.values()].find(mt => off > mt.bodyStart && off < mt.bodyEnd) || null;
@@ -551,24 +552,52 @@ export function createDispatchResolver({ typeOf, diStringArgs = () => [] }) {
       const K = type(fqcn);
       if (!K) continue;
       const selfCls = L.kind === 'trait' ? type(path[1] || fqcn) || K : L;
-      const mayNotRun = site.method ? overriddenWithoutParent(path, site.method) : null;
+      const override = site.method ? overriddenWithoutParent(path, site.method, L) : null;
       for (const owner of [null, ...virtualTypesOf(fqcn)]) {
         const notes = [];
         const values = evaluate(ast, { ...base, self: selfCls, called: K, diOwner: owner?.name || null, notes });
-        out.push({ forClass: owner ? owner.name : fqcn, virtualTypeOf: owner ? fqcn : null, path, values, notes, mayNotRun, runtime: hasRuntimePart(ast), perClass: true });
+        out.push({
+          forClass: owner ? owner.name : fqcn, virtualTypeOf: owner ? fqcn : null, path, values, notes,
+          mayNotRun: override?.cls || null, mayNotRunVia: override?.via || null, runtime: hasRuntimePart(ast), perClass: true,
+        });
       }
     }
     return out;
   }
 
-  /** The first class below the site's class (path[1..]) that overrides the method without parent::. */
-  function overriddenWithoutParent(path, methodName) {
+  /**
+   * The first class below the site's class (path[1..]) whose method — its own, or one a trait (nested
+   * traits too) brings in — overrides the site's method without parent:: → { cls, via: trait or null }.
+   * `site` is the type that holds the dispatch: a trait using the site's own trait does not override it.
+   */
+  function overriddenWithoutParent(path, methodName, site) {
     for (const name of path.slice(1)) {
       const rec = type(name);
-      const mt = rec?.methods.get(methodName.toLowerCase());
-      if (mt && !callsParent(rec, mt, methodName)) return rec.fqcn;
+      const hit = rec && methodOf(rec, methodName.toLowerCase(), site);
+      if (hit && !callsParent(hit.rec, hit.method, methodName)) return { cls: rec.fqcn, via: hit.rec === rec ? null : hit.rec.fqcn };
     }
     return null;
+  }
+
+  /** A class's method as PHP picks it: its own, else the first trait (in use order, nested) that has one with a body. */
+  function methodOf(rec, lower, site) {
+    const own = rec.methods.get(lower);
+    if (own?.hasBody) return { rec, method: own };
+    const seen = new Set();
+    const visit = r => {
+      for (const tn of r.traits || []) {
+        const tr = type(tn);
+        if (!tr || seen.has(tr.fqcn.toLowerCase())) continue;
+        seen.add(tr.fqcn.toLowerCase());
+        if (tr === site) continue;            // the dispatching method itself
+        const mt = tr.methods.get(lower);
+        if (mt?.hasBody) return { rec: tr, method: mt };
+        const nested = visit(tr);
+        if (nested) return nested;
+      }
+      return null;
+    };
+    return visit(rec);
   }
 
   /**

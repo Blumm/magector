@@ -115,6 +115,7 @@ const expected = {
   // F3: two sites on one line — the second was answered from the first one's cache entry (keyed file:line)
   acme_line_first: [at('app/code/Acme/Disp/Service/OneLine.php', 'acme_line_first'), null],
   acme_line_second: [at('app/code/Acme/Disp/Service/OneLine.php', 'acme_line_second'), null],
+  acme_traitloud_save_after: [SAVE_AFTER, 'Acme\\Disp\\Model\\TraitLoud'],
 };
 // Names with a part known only at runtime: the site is listed under "Possible", with the pattern
 const expectedPossible = {
@@ -172,6 +173,21 @@ async function main() {
       has: ['for `Acme\\Disp\\Model\\Silent`', '`Acme\\Disp\\Model\\Silent::afterSave()` overrides it without parent:: — may not dispatch'],
     });
     ok('E15: … and PHP indeed dispatched nothing', (truth['E15 override without parent'] || []).length === 0);
+    t = await c.call('magento_find_event_dispatchers', { eventName: 'acme_traitsilenced_save_after' });
+    check('F4: a trait method overriding afterSave() without parent:: — listed, marked (was: exact, unmarked)', t, {
+      has: ['for `Acme\\Disp\\Model\\TraitSilenced`', '`Acme\\Disp\\Model\\TraitSilenced::afterSave()` from trait `Acme\\Disp\\Model\\SilentTrait` overrides it without parent:: — may not dispatch'],
+    });
+    t = await c.call('magento_find_event_dispatchers', { eventName: 'acme_nestedsilenced_save_after' });
+    check('F4: … through a nested trait', t, {
+      has: ['`Acme\\Disp\\Model\\NestedSilenced::afterSave()` from trait `Acme\\Disp\\Model\\SilentTrait` overrides it without parent::'],
+    });
+    ok('F4: … and PHP indeed dispatched nothing for either', truth['F4 trait override without parent']?.length === 0 && truth['F4 nested trait override without parent']?.length === 0);
+    check('F4: a trait override that calls parent:: is not marked', await c.call('magento_find_event_dispatchers', { eventName: 'acme_traitloud_save_after' }), {
+      has: ['for `Acme\\Disp\\Model\\TraitLoud`'], hasNot: ['may not dispatch'],
+    });
+    check('F4: the trait that holds the dispatch does not override itself', await c.call('magento_find_event_dispatchers', { eventName: 'acme_trait_user_fired' }), {
+      has: ['for `Acme\\Disp\\Service\\TraitUser`'], hasNot: ['may not dispatch'],
+    });
     t = await c.call('magento_find_event_dispatchers', { eventName: 'acme_base_self' });
     check('E7: self:: names the class that wrote the code — the same name for the base and the child', t, { has: [at('app/code/Acme/Disp/Service/BaseNotifier.php', 'self::KIND')] });
     check('E7: static:: gives the base its own name', await c.call('magento_find_event_dispatchers', { eventName: 'acme_base_static' }), { has: ['for `Acme\\Disp\\Service\\BaseNotifier`'], hasNot: ['for `Acme\\Disp\\Service\\ChildNotifier`'] });
@@ -189,7 +205,8 @@ async function main() {
     });
 
     // ── 5. Modes and wildcards ────────────────────────────────────
-    t = await c.call('magento_find_event_dispatchers', { eventName: '*_save_after' });
+    // narrow enough that a line's cap (8 names, 8 classes) does not decide it as the fixture grows
+    t = await c.call('magento_find_event_dispatchers', { eventName: 'acme_prod*_save_after' });
     check('`*` in the query: the resolved names of the site, with the classes', t, { has: [SAVE_AFTER, '`acme_product_save_after`', 'for `Acme\\Disp\\Model\\Product`'] });
     t = await c.call('magento_find_event_dispatchers', { eventName: 'acme_predispatch_checkout_cart_add', match: 'strict' });
     check('match=strict: no possible (runtime) sites', t, { hasNot: ['Possible'] });

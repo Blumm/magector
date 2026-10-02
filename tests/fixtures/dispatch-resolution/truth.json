@@ -83,6 +83,12 @@
         "F3 one line": [
             "acme_line_first",
             "acme_line_second"
+        ],
+        "F4 trait override without parent": [],
+        "F4 nested trait override without parent": [],
+        "F4 trait override with parent": [
+            "acme_model_save_after",
+            "acme_traitloud_save_after"
         ]
     }
 }
