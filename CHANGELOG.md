@@ -6,6 +6,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions corresp
 
 ## [Unreleased]
 
+### Fixed
+- **`find_event_dispatchers` failed with "Maximum call stack size exceeded" on a real Magento install** — for every event, also `catalog_product_save_after`, and the background prewarm logged it for the collection `_load_before` / `_load_after` sites. Magento_Staging's `Upcoming\SearchResult` assigns `$this->_eventPrefix = $eventPrefix ?? $this->_eventPrefix;` in its constructor: the resolver evaluated the property again inside its own assignment, without end. A property read while one of its assignments is evaluated now gives its declared default (a constant expression in PHP), so two properties assigned from each other end too. A local variable assigned from itself (`$name = $name . '_x'`) or from another one assigned from it read every assignment in the method again, also the one being evaluated; the right side of an assignment now sees only the code before it, as PHP runs it.
+
 ## [2.20.0] - 2026-10-02
 
 ### Changed

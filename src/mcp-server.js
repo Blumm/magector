@@ -9739,7 +9739,8 @@ async function runAsPrimary() {
 
 async function main() {
   // Don't kill existing serve processes — other MCP instances may be using them.
-  // Each instance starts its own serve process; cleanup happens on exit.
+  // One serve process per project: the primary instance starts it, the others join it over the
+  // socket (below); the primary kills it on exit.
 
   // Connect MCP transport FIRST so tools can return "warming up" messages
   // instead of the client hanging during index load.
