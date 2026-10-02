@@ -284,6 +284,7 @@ export function extractPhpFacts(source) {
       type: type ? type.fqcn : null,
       method: method ? method.name : null,
       line: lineAt(m.index),
+      offset: m.index,                       // identifies the site: one line can hold two
       receiver: recv.replace(/\s+/g, ''),
       eventManager: EVENT_MANAGER_RECEIVER.test(recv),
       arg,

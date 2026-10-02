@@ -112,6 +112,9 @@ const expected = {
   acme_branch_a: [at('app/code/Acme/Disp/Service/Branchy.php', 'dispatch('), null],
   acme_branch_b: [at('app/code/Acme/Disp/Service/Branchy.php', 'dispatch('), null],
   acme_interp_done: [at('app/code/Acme/Disp/Service/Interp.php', '_done'), 'Acme\\Disp\\Service\\Interp'],
+  // F3: two sites on one line — the second was answered from the first one's cache entry (keyed file:line)
+  acme_line_first: [at('app/code/Acme/Disp/Service/OneLine.php', 'acme_line_first'), null],
+  acme_line_second: [at('app/code/Acme/Disp/Service/OneLine.php', 'acme_line_second'), null],
 };
 // Names with a part known only at runtime: the site is listed under "Possible", with the pattern
 const expectedPossible = {

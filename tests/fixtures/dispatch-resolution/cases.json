@@ -164,5 +164,11 @@
       "convert"
     ],
     "em": "eventManager"
+  },
+  {
+    "id": "F3 one line",
+    "class": "Acme\\Disp\\Service\\OneLine",
+    "method": "run",
+    "em": "eventManager"
   }
 ]

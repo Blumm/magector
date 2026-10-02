@@ -4827,7 +4827,7 @@ function resolveSiteCached(root, site, { model, concrete, virtualTypesOf }) {
     dispatchResolutionCache.root = root;
     dispatchResolutionCache.bySite = new Map();
   }
-  const key = `${site.file}:${site.line}`;
+  const key = `${site.file}@${site.offset ?? site.line}`;   // offset: two sites can share a line
   const hit = dispatchResolutionCache.bySite.get(key);
   if (hit) {
     if (Date.now() - hit.checkedAt < PHP_LIST_TTL_MS) return hit.results;

@@ -1,5 +1,5 @@
 {
-    "php": "8.3.30",
+    "php": "8.4.18",
     "cases": {
         "E1 literal": [
             "acme_model_save_after",
@@ -79,6 +79,10 @@
         "E20 interpolation, sprintf": [
             "acme_interp_done",
             "acme_copy_fieldset_convert"
+        ],
+        "F3 one line": [
+            "acme_line_first",
+            "acme_line_second"
         ]
     }
 }
