@@ -445,7 +445,9 @@ export function createDispatchResolver({ typeOf, diStringArgs = () => [] }) {
     while ((m = re.exec(ctx.before || '')) !== null) {
       const start = m.index + m[0].length;
       const end = expressionEnd(ctx.before, start, ';');
-      const assigned = evaluate(parseNameExpr(ctx.before.slice(start, end)), ctx);
+      // the right side sees the method only up to this assignment — as PHP runs it: `$x = $x . 'y'`
+      // or `$a = $b; $b = $a;` read the earlier value, not this one (was: endless recursion)
+      const assigned = evaluate(parseNameExpr(ctx.before.slice(start, end)), { ...ctx, before: ctx.before.slice(0, m.index) });
       if (m[1] === '.') {
         const base = values || unset();
         values = [...new Set([...base, ...product([base, assigned])])];
@@ -502,7 +504,13 @@ export function createDispatchResolver({ typeOf, diStringArgs = () => [] }) {
     const declIdx = lv.findIndex(l => l.rec.props.has(name));
     const values = [];
     let fromConstructor = false;
-    for (const l of lv) {
+    // read while its own assignment is evaluated (`$this->p = $this->p ?: 'x'`, or two properties
+    // assigned from each other): the declared default, which is a constant expression — not the
+    // assignments again (was: endless recursion, the whole tool call failed)
+    const key = `prop:${K.fqcn.toLowerCase()}::${name}`;
+    const reentered = ctx.visiting.has(key);
+    ctx.visiting.add(key);
+    for (const l of reentered ? [] : lv) {
       for (const a of l.rec.assigns.get(name) || []) {
         const method = l.rec.methods.get(a.method.toLowerCase());
         const param = /^\$(\w+)$/.exec(a.expr);
@@ -546,6 +554,7 @@ export function createDispatchResolver({ typeOf, diStringArgs = () => [] }) {
         values.push(...unknown(ctx, `$this->${name}${broken ? ` (inheritance broken at ${broken})` : ' (not declared)'}`));
       }
     }
+    if (!reentered) ctx.visiting.delete(key);
     return [...new Set(values)];
   }
 

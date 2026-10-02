@@ -157,6 +157,26 @@ async function main() {
   const cycleValues = cyc.resolveSite(cycle.dispatches[0], { concrete: () => [] })[0].values;
   ok('constants referring to each other (PHP: fatal) end as a wildcard, not a hang', cycleValues.length === 1 && shownName(cycleValues[0]) === '*_cycle', JSON.stringify(cycleValues.map(shownName)));
 
+  // a local variable assigned from itself or from another one assigned from it: PHP reads the earlier
+  // value; the resolver recursed until the stack overflowed and the whole tool call failed
+  const selfRef = extractPhpFacts("<?php\nnamespace A;\nclass S { public $em; function f($flag) { $name = 'acme_self'; if ($flag) { $name = $name . '_ref'; } $a = $b; $b = $a; $x = $x . '_tail'; $this->em->dispatch($name); $this->em->dispatch($a); $this->em->dispatch($x); } }\n");
+  const selfRes = createDispatchResolver({ typeOf: f => selfRef.types.find(t => t.fqcn === f) || null });
+  let selfValues = null;
+  try { selfValues = selfRef.dispatches.map(d => selfRes.resolveSite(d, { concrete: () => [] })[0].values.map(shownName)); } catch (e) { selfValues = e.message; }
+  ok('a local assigned from itself — the earlier value, then the appended one (was: Maximum call stack size exceeded)', Array.isArray(selfValues) && selfValues[0].includes('acme_self') && selfValues[0].includes('acme_self_ref'), JSON.stringify(selfValues));
+  ok('two locals assigned from each other — unknown, not a hang', Array.isArray(selfValues) && selfValues[1].length === 1 && selfValues[1][0] === '*', JSON.stringify(selfValues?.[1]));
+  ok('a local assigned from itself before any value — unknown with the suffix', Array.isArray(selfValues) && selfValues[2].length === 1 && selfValues[2][0] === '*_tail', JSON.stringify(selfValues?.[2]));
+
+  // a property assigned from itself in the constructor (Magento_Staging's Upcoming\SearchResult:
+  // `$this->_eventPrefix = $eventPrefix ?? $this->_eventPrefix;`), and two properties assigned from each
+  // other: the right side reads the declared default; the resolver recursed until the stack overflowed
+  const propSelf = extractPhpFacts("<?php\nnamespace A;\nclass P { protected $_eventPrefix = 'acme_declared'; protected $a = 'acme_a'; protected $b = 'acme_b'; public $em;\n  public function __construct($eventPrefix = null) { $this->_eventPrefix = $eventPrefix ?? $this->_eventPrefix; $this->a = $this->b; $this->b = $this->a; }\n  public function f() { $this->em->dispatch($this->_eventPrefix . '_load'); $this->em->dispatch($this->a); }\n}\n");
+  const propRes = createDispatchResolver({ typeOf: f => propSelf.types.find(t => t.fqcn.toLowerCase() === f.toLowerCase()) || null });
+  let propValues = null;
+  try { propValues = propSelf.dispatches.map(d => propRes.resolveSite(d, { concrete: () => [{ fqcn: 'A\\P', path: ['A\\P'] }] })[0].values.map(shownName)); } catch (e) { propValues = e.message; }
+  ok('a property assigned from itself — the declared default and the argument (was: Maximum call stack size exceeded)', Array.isArray(propValues) && propValues[0].includes('acme_declared_load') && propValues[0].includes('*_load'), JSON.stringify(propValues));
+  ok('two properties assigned from each other — the declared defaults, not a hang', Array.isArray(propValues) && propValues[1].includes('acme_b') && propValues[1].includes('acme_a'), JSON.stringify(propValues?.[1]));
+
   // ── 2. Every name PHP dispatched is found — at the site PHP ran, for the class that ran it ──
   const c = new McpClient(FIXTURE);
   await c.start();
