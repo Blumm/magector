@@ -4050,6 +4050,8 @@ function walkPhpFiles(root) {
   const walk = (dir, rel) => {
     let entries;
     try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    // in name order: which of two files declaring one class is read first must not depend on the filesystem
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     for (const e of entries) {
       if (e.name.startsWith('.')) continue;
       if (e.isDirectory()) {
@@ -4171,9 +4173,11 @@ async function findImplementors(interfaceName) {
   if (wanted.includes('\\')) {
     const hierarchy = await getClassHierarchy(root);
     result.exact = true;
+    // sorted (depth, then name): the hierarchy keeps the order files were read in, which a walk and a
+    // glob, or two filesystems, do not share — and only the first IMPLEMENTORS_PER_GROUP are shown
     result.implementors = instancesOf(hierarchy, wanted).map(e => ({
       class: e.fqcn, file: e.file, kind: e.kind, relation: e.relation, via: e.via, depth: e.depth
-    }));
+    })).sort((a, b) => a.depth - b.depth || byClassName(a, b));
     return result;
   }
 
@@ -4210,7 +4214,14 @@ async function findImplementors(interfaceName) {
     }
   }
 
+  result.implementors.sort(byClassName);
   return result;
+}
+
+/** Case-insensitive, locale-independent order of { class } entries. */
+function byClassName(a, b) {
+  const x = a.class.toLowerCase(), y = b.class.toLowerCase();
+  return x < y ? -1 : x > y ? 1 : 0;
 }
 
 // ─── Find Callers ───────────────────────────────────────────────

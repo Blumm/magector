@@ -255,6 +255,12 @@ async function main() {
     const description = tools.find(x => x.name === 'magento_find_event_dispatchers')?.description || '';
     ok('F8: the description agents read says what the tool does now (was: "exact grep matching, method context, and surrounding code")',
       !description.includes('grep') && description.includes('`*`') && description.includes('resolved for every concrete subclass'), description.slice(0, 120));
+    // F9: find_implementors shares the class hierarchy; its order must not be the order files were read in
+    const impl = await c.call('magento_find_implementors', { interfaceName: 'Acme\\Disp\\Impl\\Marker' });
+    const listed = [...impl.matchAll(/^- `(Acme\\[^`]+)`/gm)].map(x => x[1]);
+    const sorted = [...listed].sort((a, b) => (a.toLowerCase() < b.toLowerCase() ? -1 : a.toLowerCase() > b.toLowerCase() ? 1 : 0));
+    ok('F9: find_implementors lists the implementors sorted, not in the order the files were read (walk or glob)',
+      listed.length === 3 && listed.join() === sorted.join(), listed.join(', '));
     const empty = await c.request('tools/call', { name: 'magento_find_event_dispatchers', arguments: { eventName: '  ' } });
     ok('F8: an empty eventName is an error saying what to pass (was: an answer for the name ``)',
       empty.result?.isError === true && /eventName is required/.test(empty.result?.content?.[0]?.text || ''), JSON.stringify(empty.result).slice(0, 160));
