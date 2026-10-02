@@ -283,6 +283,37 @@ async function main() {
     rmSync(live, { recursive: true, force: true });
   }
 
+  // ── Config prewarm: off with MAGECTOR_AUTO_INDEX=0 unless asked for (review of #33) ──
+  // CI and agent jobs set MAGECTOR_AUTO_INDEX=0 to keep background CPU off; the prewarm ran anyway,
+  // and on a root that is no Magento install it walked the whole tree (31 CPU-s on 516k files)
+  const prewarmLog = async (env, { withConfigPhp = true } = {}) => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'magector-vc-prewarm-'));
+    cpSync(FIXTURE_ROOT, root, { recursive: true });
+    rmSync(path.join(root, '.magector'), { recursive: true, force: true });   // the fixture's own runs log there
+    if (!withConfigPhp) rmSync(path.join(root, 'app/etc/config.php'));
+    const c = new McpClient(env, root);
+    await c.start();
+    const log = () => { try { return readFileSync(path.join(root, '.magector', 'magector.log'), 'utf-8'); } catch { return ''; } };
+    // the prewarm runs 1.5 s after the start without a tool call; wait for it, or 3 s
+    for (let i = 0; i < 30 && !/Configuration check prewarmed/.test(log()); i++) await new Promise(r => setTimeout(r, 100));
+    const text = log();
+    await c.stop();
+    rmSync(root, { recursive: true, force: true });
+    return text;
+  };
+  let pl = await prewarmLog({});
+  check('prewarm: off with MAGECTOR_AUTO_INDEX=0 — logged, not run', pl, {
+    has: ['Configuration check prewarm skipped (MAGECTOR_AUTO_INDEX=0; MAGECTOR_PREWARM_CONFIG=1 turns it on)'], hasNot: ['Configuration check prewarmed'],
+  });
+  pl = await prewarmLog({ MAGECTOR_PREWARM_CONFIG: '1' });
+  check('prewarm: MAGECTOR_PREWARM_CONFIG=1 runs it with MAGECTOR_AUTO_INDEX=0', pl, { has: ['Configuration check prewarmed ('], hasNot: ['prewarm skipped'] });
+  pl = await prewarmLog({ MAGECTOR_PREWARM_CONFIG: '0' });
+  check('prewarm: MAGECTOR_PREWARM_CONFIG=0 never runs it', pl, { has: ['Configuration check prewarm skipped (MAGECTOR_PREWARM_CONFIG=0)'], hasNot: ['Configuration check prewarmed'] });
+  pl = await prewarmLog({ MAGECTOR_PREWARM_CONFIG: '1' }, { withConfigPhp: false });
+  check('prewarm: never outside a Magento install (no app/etc/config.php)', pl, {
+    has: ['Configuration check prewarm skipped (no app/etc/config.php under MAGENTO_ROOT)'], hasNot: ['Configuration check prewarmed'],
+  });
+
   // ── Entity amplification (review of #33) ───────────────────────
   // A 1 KB di.xml with 8 levels of nested entities: libxml rejects it ("Detected an entity reference
   // loop"); the expanding parser took 170 s and 2.4 GB for a find_plugin, 29 s for validate_config

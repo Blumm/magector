@@ -9214,8 +9214,18 @@ async function main() {
 
   // The configuration notice of the DI / event answers reads every di.xml / events.xml and merges each
   // area (0.2–0.6 s on 300–600 modules): done once in the background after 1.5 s without a tool call,
-  // so neither the first DI answer nor an answer asked meanwhile waits for it
-  if (config.magentoRoot && process.env.MAGECTOR_PREWARM_CONFIG !== '0') {
+  // so neither the first DI answer nor an answer asked meanwhile waits for it.
+  // MAGECTOR_PREWARM_CONFIG=1 always, =0 never; unset, only when the server may index on its own: a CI
+  // or agent job sets MAGECTOR_AUTO_INDEX=0 to keep background CPU off, and the first DI answer
+  // prepares the notice then. Never outside a Magento install (no app/etc/config.php): the module
+  // discovery would walk the whole tree (31 CPU-s on a 516k-file directory).
+  const prewarmConfig = process.env.MAGECTOR_PREWARM_CONFIG === '1' || (process.env.MAGECTOR_PREWARM_CONFIG !== '0' && config.autoIndex);
+  const magentoInstall = existsSync(path.join(config.magentoRoot, 'app/etc/config.php'));
+  if (config.magentoRoot && !(prewarmConfig && magentoInstall)) {
+    logToFile('INFO', `Configuration check prewarm skipped (${!magentoInstall ? 'no app/etc/config.php under MAGENTO_ROOT'
+      : process.env.MAGECTOR_PREWARM_CONFIG === '0' ? 'MAGECTOR_PREWARM_CONFIG=0' : 'MAGECTOR_AUTO_INDEX=0; MAGECTOR_PREWARM_CONFIG=1 turns it on'})`);
+  }
+  if (config.magentoRoot && prewarmConfig && magentoInstall) {
     const IDLE_MS = 1500;
     const prewarm = () => {
       const idleFor = Date.now() - lastToolCallAt;
