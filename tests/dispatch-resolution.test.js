@@ -22,6 +22,8 @@ import { extractPhpFacts, createDispatchResolver, nameMatches, shownName, WILD }
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = path.join(__dirname, '..', 'src', 'mcp-server.js');
 const FIXTURE = path.join(__dirname, 'fixtures', 'dispatch-resolution');
+// composer's PSR-4 map, the live package, a stale copy of it and a package composer does not map
+const COMPOSER_FIXTURE = path.join(__dirname, 'fixtures', 'dispatch-composer');
 const truth = JSON.parse(readFileSync(path.join(FIXTURE, 'truth.json'), 'utf-8')).cases;
 const cases = JSON.parse(readFileSync(path.join(FIXTURE, 'cases.json'), 'utf-8'));
 
@@ -40,6 +42,8 @@ const at = (rel, needle) => {
   const lines = readFileSync(path.join(FIXTURE, rel), 'utf-8').split('\n');
   return `${rel}:${lines.findIndex(l => l.includes(needle)) + 1}`;
 };
+/** The line number of the first line containing `needle`, in a file of another fixture. */
+const at2 = (root, rel, needle) => readFileSync(path.join(root, rel), 'utf-8').split('\n').findIndex(l => l.includes(needle)) + 1;
 
 class McpClient {
   constructor(root, env = {}) { this.root = root; this.env = env; this.nextId = 1; this.pending = new Map(); }
@@ -192,7 +196,23 @@ async function main() {
     await c.stop();
   }
 
-  // ── 6. Mid-session changes ──────────────────────────────────────
+  // ── 6. The file composer loads ──────────────────────────────────
+  const cc = new McpClient(COMPOSER_FIXTURE);
+  await cc.start();
+  try {
+    let t = await cc.call('magento_find_event_dispatchers', { eventName: 'acme_live_ping' });
+    check('F2: a stale copy of a class — a file composer does not load for it — is not a dispatch site (was: listed beside the live one)', t, {
+      has: [`vendor/acme/live/src/Model.php:${at2(COMPOSER_FIXTURE, 'vendor/acme/live/src/Model.php', "'acme_live_ping'")}`], hasNot: ['vendor/acme/live-copy/'],
+    });
+    t = await cc.call('magento_find_event_dispatchers', { eventName: 'acme_child_saved' });
+    check('F2: … nor for a subclass resolved through it', t, { has: ['for `Acme\\Live\\Child`', 'vendor/acme/live/src/Model.php:'], hasNot: ['vendor/acme/live-copy/'] });
+    t = await cc.call('magento_find_event_dispatchers', { eventName: 'acme_unmapped_ping' });
+    check('F2: a class no autoloader resolves keeps its site — nothing says another file is the live one', t, { has: ['vendor/acme/unmapped/Thing.php:'] });
+  } finally {
+    await cc.stop();
+  }
+
+  // ── 7. Mid-session changes ──────────────────────────────────────
   const live = mkdtempSync(path.join(os.tmpdir(), 'magector-dr-live-'));
   cpSync(FIXTURE, live, { recursive: true });
   const lc = new McpClient(live, { MAGECTOR_PHP_LIST_TTL_MS: '0', MAGECTOR_FILE_LIST_TTL_MS: '0' });

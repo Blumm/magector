@@ -4730,6 +4730,29 @@ function dispatchDeps(root, model, hierarchy, traitUsers) {
   return { model, concrete, virtualTypesOf };
 }
 
+/**
+ * A site in a file that is not the one composer loads for its class — a stale vendor/magento copy
+ * beside vendor/mage-os (236 sites on a 92k-file project: every core event listed twice, the copy
+ * resolved with the live file's facts): that code never runs. Only when the live file is known; a
+ * site whose class no autoloader resolves stays.
+ */
+function isShadowedSite(root, site) {
+  if (!site.type) return false;
+  const live = classFileOf(root, site.type);
+  return Boolean(live) && !sameFile(live, path.join(root, site.file));
+}
+
+/** Two paths name the same file: the same path, or the same inode (a symlink or a letter case apart). */
+function sameFile(a, b) {
+  if (path.resolve(a) === path.resolve(b)) return true;
+  try {
+    const x = statSync(a), y = statSync(b);
+    return x.ino ? x.ino === y.ino && x.dev === y.dev : true;   // no inode numbers: cannot tell, keep the site
+  } catch {
+    return false;
+  }
+}
+
 const dispatchResolutionCache = { root: null, bySite: new Map() };   // site key → { results, files, stamp, checkedAt }
 
 const filesStamp = files => [...files].sort().map(f => { try { const st = statSync(f); return `${f}:${st.mtimeMs}:${st.size}`; } catch { return `${f}:-`; } }).join('|');
@@ -4756,6 +4779,7 @@ async function findEventDispatchers(query, { match = 'exact' } = {}) {
   const exact = [];
   const possible = [];
   for (const site of sites) {
+    if (isShadowedSite(root, site)) continue;
     // a name built at runtime is an event only on Magento's event manager (not Symfony, not a front controller)
     const ast = parseNameExpr(site.arg);
     if (ast.t !== 'lit' && !site.eventManager) continue;
@@ -4825,7 +4849,7 @@ async function prewarmDispatchSites(root) {
   await moduleEtcGlob(root, '**/etc/**/events.xml', { absolute: true });   // the observer count of an answer
   const deps = dispatchDeps(root, model, classHierarchyCache.hierarchy, classHierarchyCache.traitUsers || new Map());
   for (const site of classHierarchyCache.dispatchSites || []) {
-    if (!site.eventManager || !dependsOnCalledClass(parseNameExpr(site.arg))) continue;
+    if (!site.eventManager || !dependsOnCalledClass(parseNameExpr(site.arg)) || isShadowedSite(root, site)) continue;
     await new Promise(r => setImmediate(r));
     resolveSiteCached(root, site, deps);
   }
