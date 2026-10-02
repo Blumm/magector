@@ -244,11 +244,38 @@ async function main() {
     check('match=strict: no possible (runtime) sites', t, { hasNot: ['Possible'] });
     t = await c.call('magento_find_event_dispatchers', { eventName: 'acme_product_save_after', match: 'wildcard' });
     check('match=wildcard: only sites with a runtime part', t, { hasNot: [`for \`Acme\\Disp\\Model\\Product\``] });
+    check('F8: … and it does not speak of an "exact name" (was: "No dispatch site with this exact name")', t, { hasNot: ['exact name'] });
+    t = await c.call('magento_find_event_dispatchers', { eventName: '*_load_after', match: 'wildcard' });
+    check('F8: match=wildcard keeps the known-parts filter — a runtime name that shares nothing with the query is no lead (was: every runtime site listed)', t, {
+      hasNot: ['acme_predispatch_', 'acme_alert_event_', 'acme_copy_fieldset_'],
+    });
+    t = await c.call('magento_find_event_dispatchers', { eventName: 'acme_nothing_*' });
+    check('F8: a `*` query without a match does not speak of an "exact name"', t, { has: ['No dispatch site with a known name matches `acme_nothing_*`'], hasNot: ['exact name'] });
+    const tools = (await c.request('tools/list', {})).result?.tools || [];
+    const description = tools.find(x => x.name === 'magento_find_event_dispatchers')?.description || '';
+    ok('F8: the description agents read says what the tool does now (was: "exact grep matching, method context, and surrounding code")',
+      !description.includes('grep') && description.includes('`*`') && description.includes('resolved for every concrete subclass'), description.slice(0, 120));
+    const empty = await c.request('tools/call', { name: 'magento_find_event_dispatchers', arguments: { eventName: '  ' } });
+    ok('F8: an empty eventName is an error saying what to pass (was: an answer for the name ``)',
+      empty.result?.isError === true && /eventName is required/.test(empty.result?.content?.[0]?.text || ''), JSON.stringify(empty.result).slice(0, 160));
   } finally {
     await c.stop();
   }
 
-  // ── 6. The file composer loads ──────────────────────────────────
+  // ── 6. The verification JSON is uncapped for this tool only ─────
+  const jc = new McpClient(FIXTURE, { MAGECTOR_DISPATCH_JSON: '1', MAGECTOR_MAX_OUTPUT_CHARS: '200' });
+  await jc.start();
+  try {
+    const other = await jc.call('magento_module_structure', { moduleName: 'Acme_Disp' });
+    ok('F8: MAGECTOR_DISPATCH_JSON lifts the output cap only for find_event_dispatchers (was: for every tool)', other.includes('Output truncated'), other.slice(0, 120));
+    let claims = null;
+    try { claims = JSON.parse(await jc.call('magento_find_event_dispatchers', { eventName: '*' })); } catch { /* cut */ }
+    ok('F8: … whose verification JSON stays whole', Boolean(claims?.exact?.length));
+  } finally {
+    await jc.stop();
+  }
+
+  // ── 7. The file composer loads ──────────────────────────────────
   const cc = new McpClient(COMPOSER_FIXTURE);
   await cc.start();
   try {
@@ -264,7 +291,7 @@ async function main() {
     await cc.stop();
   }
 
-  // ── 7. Mid-session changes ──────────────────────────────────────
+  // ── 8. Mid-session changes ──────────────────────────────────────
   const live = mkdtempSync(path.join(os.tmpdir(), 'magector-dr-live-'));
   cpSync(FIXTURE, live, { recursive: true });
   const lc = new McpClient(live, { MAGECTOR_PHP_LIST_TTL_MS: '0', MAGECTOR_FILE_LIST_TTL_MS: '0' });

@@ -4917,7 +4917,8 @@ function dispatchClassLine(root, site, r) {
 function formatEventDispatchers(root, res) {
   const site = s => `\`${s.type ? `${s.type}::` : ''}${s.method ? `${s.method}()` : '(file scope)'}\` — ${s.file}:${s.line}`;
   const wildcardQuery = res.eventName.includes('*');
-  let text = `## Event Dispatchers: \`${res.eventName}\``;
+  const wildcardMode = res.match === 'wildcard';
+  let text = `## Event Dispatchers: \`${res.eventName}\`${wildcardMode ? ' — match=wildcard: sites whose name is partly known only at runtime' : ''}`;
   const total = res.exact.length;
   text += total ? ` (${total} site${total > 1 ? 's' : ''})\n\n` : '\n\n';
   for (const e of res.exact) {
@@ -4929,30 +4930,44 @@ function formatEventDispatchers(root, res) {
       if (e.classes.length > 8) text += `  … ${e.classes.length - 8} more classes\n`;
     }
   }
-  if (!res.exact.length) text += `_No dispatch site with this exact name${res.observerCount ? ' — observers registered for it run only if a name built at runtime matches' : ''}._\n`;
-  // sites whose name is all unknown (a wrapper forwarding its caller's name) only as a count
-  let informative = res.possible.filter(p => res.match === 'wildcard' ||
-    p.classes.some(r => r.values.some(v => isInformative(v) && sharesKnownParts(res.eventName, v))));
+  if (!res.exact.length && !wildcardMode) {
+    text += wildcardQuery
+      ? `_No dispatch site with a known name matches \`${res.eventName}\`._\n`
+      : `_No dispatch site with this exact name${res.observerCount ? ' — observers registered for it run only if a name built at runtime matches' : ''}._\n`;
+  }
+  // In every mode, a runtime name is a lead only when its known parts share the query's
+  // (`controller_action_predispatch_*` is no lead for `*_load_after`); a name chosen entirely at
+  // runtime (a wrapper forwarding its caller's name) is listed only in wildcard mode.
+  const opaque = p => p.classes.every(r => r.values.every(v => !isInformative(v)));
+  let informative = res.possible.filter(p => p.classes.some(r => r.values.some(v => isInformative(v) && sharesKnownParts(res.eventName, v))));
   // nothing else matches: the wrappers are the only lead (EntityManager's entity events)
-  if (!res.exact.length && !informative.length && !res.eventName.includes('*')) informative = res.possible;
-  const opaque = res.possible.length - informative.length;
+  if (!res.exact.length && !informative.length && !wildcardQuery && !wildcardMode) informative = res.possible;
+  const wrappers = res.possible.filter(p => !informative.includes(p) && opaque(p));
+  const line = p => {
+    const names = [...new Set(p.classes.flatMap(r => r.values.map(shownName)))].map(v => `\`${v}\``);
+    const why = [...new Set(p.classes.flatMap(r => [
+      ...r.notes.filter(n => n.kind === 'runtime').map(n => n.what),
+      // a value assigned in an ordinary method: the class, the value and the method that must run first
+      ...(r.values.some(v => v.includes(COND)) ? r.notes.filter(n => n.kind === 'assigned' && n.conditional).map(n =>
+        `for \`${r.forClass}\`, $${n.name} = ${(n.values || []).map(v => `'${shownName(v)}'`).join(' | ')} once ${n.rec.fqcn}::${n.method}() ran (${shortRel(root, n.rec)}:${n.line})`) : []),
+    ]))].slice(0, 2).join(', ');
+    return `- ${site(p.site)} — ${names.slice(0, 3).join(', ')}${why ? ` (${why})` : ''}\n`;
+  };
   if (informative.length) {
     text += `\nPossible — the name is partly known only at runtime, or holds only after a method ran (${informative.length}):\n`;
-    for (const p of informative.slice(0, 10)) {
-      const names = [...new Set(p.classes.flatMap(r => r.values.map(shownName)))].map(v => `\`${v}\``);
-      const why = [...new Set(p.classes.flatMap(r => [
-        ...r.notes.filter(n => n.kind === 'runtime').map(n => n.what),
-        // a value assigned in an ordinary method: the class, the value and the method that must run first
-        ...(r.values.some(v => v.includes(COND)) ? r.notes.filter(n => n.kind === 'assigned' && n.conditional).map(n =>
-          `for \`${r.forClass}\`, $${n.name} = ${(n.values || []).map(v => `'${shownName(v)}'`).join(' | ')} once ${n.rec.fqcn}::${n.method}() ran (${shortRel(root, n.rec)}:${n.line})`) : []),
-      ]))].slice(0, 2).join(', ');
-      text += `- ${site(p.site)} — ${names.slice(0, 3).join(', ')}${why ? ` (${why})` : ''}\n`;
-    }
-    if (informative.length > 10) text += `- … ${informative.length - 10} more (match=wildcard)\n`;
+    for (const p of informative.slice(0, 10)) text += line(p);
+    if (informative.length > 10) text += `- … ${informative.length - 10} more${wildcardMode ? '' : ' (match=wildcard)'}\n`;
   }
-  if (opaque) text += `\n${opaque} more site(s) dispatch a name chosen entirely at runtime (a wrapper forwarding its caller's name) — match=wildcard lists them.\n`;
+  if (wrappers.length && wildcardMode) {
+    text += `\nNames chosen entirely at runtime — a wrapper forwarding its caller's name (${wrappers.length}):\n`;
+    for (const p of wrappers.slice(0, 10)) text += line(p);
+    if (wrappers.length > 10) text += `- … ${wrappers.length - 10} more\n`;
+  } else if (wrappers.length) {
+    text += `\n${wrappers.length} more site(s) dispatch a name chosen entirely at runtime (a wrapper forwarding its caller's name) — match=wildcard lists them.\n`;
+  }
+  if (wildcardMode && !informative.length && !wrappers.length) text += `_No dispatch site with a runtime part matches \`${res.eventName}\`._\n`;
   if (res.observerCount) text += `\nObservers: ${res.observerCount} — magento_find_observer\n`;
-  return text;
+  return text.replace(/\n{3,}/g, '\n\n');
 }
 
 // ─── Trace Call Chain ───────────────────────────────────────────
@@ -6157,7 +6172,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'magento_find_event_dispatchers',
-      description: 'Find all PHP locations where a specific Magento event is dispatched via eventManager->dispatch(). Unlike magento_find_event_flow (which shows the full chain: dispatchers+observers+handlers), this tool focuses exclusively on finding WHERE an event is triggered — with exact grep matching, method context, and surrounding code. Use this to answer "does class X dispatch event Y?" or "who triggers this event?".',
+      description: 'Find where a Magento event is dispatched: literal dispatch(\'name\') calls, and names built from a property or constant of the class that runs the code ($this->_eventPrefix . \'_save_after\' in AbstractModel::afterSave()), resolved for every concrete subclass — through its traits and parents and a di.xml constructor argument (per area, virtual types) — with the class and where its value comes from. A name partly known only at runtime (\'controller_action_predispatch_\' . $request->getFullActionName()), or only after another method ran, is listed as possible. `*` in eventName matches any part. Reads the PHP files, no index needed. Unlike magento_find_event_flow (dispatchers + observers + handlers), this answers only WHERE an event is triggered: "does class X dispatch event Y?", "who triggers this event?".',
       inputSchema: {
         type: 'object',
         properties: {
@@ -8054,7 +8069,11 @@ const _callToolHandler = async (request) => {
 
       case 'magento_find_event_dispatchers': {
         const match = ['exact', 'strict', 'wildcard'].includes(args.match) ? args.match : 'exact';
-        const res = await findEventDispatchers(String(args.eventName || '').trim(), { match });
+        const eventName = String(args.eventName ?? '').trim();
+        if (!eventName) {
+          return { content: [{ type: 'text', text: 'eventName is required: an event name ("sales_order_place_after") or a pattern with `*` ("*_save_after").' }], isError: true };
+        }
+        const res = await findEventDispatchers(eventName, { match });
         // scripts/verify-magento (compare.mjs dispatch-claims): the resolution as data, to check against PHP
         if (process.env.MAGECTOR_DISPATCH_JSON === '1') return { content: [{ type: 'text', text: JSON.stringify(dispatchClaims(res)) }] };
         return { content: [{ type: 'text', text: formatEventDispatchers(config.magentoRoot, res) }] };
@@ -9120,9 +9139,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const warning = getReindexWarning();
     if (warning) result.content[0].text = warning + result.content[0].text;
   }
+  // the verification data of MAGECTOR_DISPATCH_JSON (find_event_dispatchers only) is a whole JSON document, not an answer to cap
+  const uncapped = process.env.MAGECTOR_DISPATCH_JSON === '1' && request.params?.name === 'magento_find_event_dispatchers';
   for (const c of result?.content || []) {
-    // the verification data of MAGECTOR_DISPATCH_JSON is a whole JSON document, not an answer to cap
-    if (c.type === 'text' && typeof c.text === 'string' && process.env.MAGECTOR_DISPATCH_JSON !== '1') c.text = capOutput(c.text);
+    if (c.type === 'text' && typeof c.text === 'string' && !uncapped) c.text = capOutput(c.text);
   }
   return result;
 });
