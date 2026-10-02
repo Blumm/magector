@@ -6,7 +6,7 @@ work: the missing plugin, route or column is the one nobody checks.
 
 ## Method
 
-Two layers, each against Magento itself — never against Magector's own idea of Magento:
+Three layers, each against Magento itself — never against Magector's own idea of Magento:
 
 1. **A real installation** (`scripts/verify-magento`). PHP scripts ask the running Magento what it
    loaded, `compare.mjs` checks Magector against it and prints *missing* (must be 0), *different* and
@@ -17,6 +17,8 @@ Two layers, each against Magento itself — never against Magector's own idea of
    | `php` | PHP's tokenizer | class / method reading |
    | `xml` | DOMDocument | di.xml / events.xml reading, files Magento rejects |
    | `plugins` | `PluginListInterface::getNext()` per area | `magento_find_plugin` |
+   | `config` | Magento's `Config\Dom`, converters, interpreters (`src/php/validate-config.php`) | built-in config check |
+   | `merge` | the DI / events readers' file list and merger (`merge-truth.php`), merged and converted under Magento's ErrorHandler | `mergeConfigFiles` / `checkMergedConfig` |
    | `webapi` `graphql` `cron` `dbschema` `modules` | `config-truth.php`: `Webapi\Model\Config`, `GraphQlSchemaStitching\Reader`, `Cron\Model\ConfigInterface` (+ `core_config_data`), `SchemaConfig::getDeclarationConfig()`, `ComponentRegistrar` / `ModuleList` | `src/magento-config.js` models |
 
 2. **Synthetic fixtures with Magento's answer pinned.** Every fixture case is an unusual but valid (or
@@ -26,6 +28,10 @@ Two layers, each against Magento itself — never against Magector's own idea of
    `compare.mjs` used on real projects, then check the MCP answers. Each test name says the Magento
    behaviour and what the tool did before (`was: …`); every new test is run on the previous code and
    must fail there.
+
+3. **Mutations of real files against Magento** (`mutate-xml.mjs` → `validate-config.php` →
+   `compare.mjs config`): thousands of syntax and value edits of the project's own config files, so
+   the ported rules meet shapes nobody thought of. This found most of the non-obvious behaviour below.
 
 ## Results (Mage-OS 2.4.9 project, ~190 custom modules, PHP 8.3, libxml 2.9.14)
 
@@ -39,7 +45,10 @@ Two layers, each against Magento itself — never against Magector's own idea of
 | Cron jobs | 81/81; 3 differ only through `core_config_data` (noted in the answer) |
 | Declared tables | 507/507 with every column, key and index under Magento's name |
 | Modules | 598/598 directories, enabled state and load order |
-| `trace_api` vs Magento | 446/446 routes: same route, service class and method |
+| `trace_api` vs Magento | 446/446 routes: same route, service class and method, and the class Magento creates in `webapi_rest` |
+| Config check, built-in vs native (`mutate-xml.mjs`) | same first libxml error on 2,000 syntax-edited files (1,384 not well-formed), same converter verdict on 3,000 value-edited files (2,518 exceptions); seeds 7 and 11, 2 × 2,500 files: 0 differences |
+| Merged DI / events areas (`compare.mjs merge`) | 15/15 areas: the same files in the same order, the same merged document, the same verdict; 7,630 merges of mutated files with their originals (`merge-sets.mjs`, 5,298 that Magento fails): the same |
+| `validate_config` on the whole project | built-in and native agree on every file and area; native adds 16 files that violate the schema they declare (not checked by the built-in engine) |
 
 ## Results (Magento Open Source 2.4.5-p14 project, ~110 custom modules, PHP 8.1, libxml 2.9.14)
 
@@ -56,6 +65,11 @@ A second, older installation, checked with the same scripts. Its plugin check fo
 | Cron jobs | 75/75; 3 differ only through `core_config_data` (noted) |
 | Declared tables | 379/379 |
 | Modules | 449/449 |
+| `trace_api` vs Magento | 409/409 routes: route, service, the class created in `webapi_rest` |
+| Config check, built-in vs native | 0 differences on 2,500 mutated files (646 not well-formed, 1,271 converter exceptions) and on the 757 real ones |
+| Native check on PHP 8.4 (review of #31) | the same result as PHP 8.1 on all 757 + 2,500 files and 16 areas — no false failures |
+| Merged DI / events areas | 15/15; 7,378 merges of mutated files (5,155 failing): the same |
+| `validate_config` on the whole project | built-in and native agree; before the merge the built-in engine reported a file a Mirakl module completes as failing in every mode — and the notice of every DI answer named it |
 
 Use cases on it (as below): every answer complete; cold 0.15–0.44 s, warm 3–82 ms;
 `find_plugin` 4 of 4 where grep finds 2 of 4; columns of sales_order 4.1k tokens instead of 46.3k.
@@ -92,6 +106,17 @@ non-public, `NoninterceptableInterface`), comments in XML read as data. Tests: `
 | Magento | Before | Test |
 |---|---|---|
 | A class is the file its FQCN autoloads (composer PSR-4) | looked up by file name: with two `Stock` observers the other module's file | `di-resolution`: find_method / trace_call_chain / batch by FQCN |
+
+### Configuration Magento rejects
+| Magento | Before | Test |
+|---|---|---|
+| Not well-formed XML fails in every mode, with `Config\Dom`'s message | read as far as possible, shown as if it applied | `validate-config`, `di-parsing` (libxml-pinned cases) |
+| Converters run under Magento's ErrorHandler: missing name, unknown node, bad argument value fail in every mode | silently ignored | `validate-config`, `di-parsing` |
+| Developer-mode schema validation of di.xml is on the merged document; outcome depends on file order | — (a per-file check gave 26 false alarms, so the native check asks Magento's readers) | `validate-config` (native path) |
+| Text next to `<item>`s makes the argument that text — the items are dropped | not visible | `di-parsing` |
+| Magento converts an area's merged configuration (`Config\Dom`: id attributes, another `xsi:type` replaces the node, attributes accumulate, text / CDATA override) | the built-in engine judged each file alone: an argument without `xsi:type` that another module completes was reported as failing in every mode (a real Mirakl module on Magento 2.4.5), and failures of the merge only were missed | `validate-config` (Acme_Merge), `di-parsing` (merge cases), `compare.mjs merge` |
+| Configuration is read under Magento's ErrorHandler: a warning while merging fails the area (an id with an apostrophe breaks the XPath; a value with a bare `&` set as `nodeValue`) | the native engine read the areas without the handler and called them loaded | `di-parsing`, `compare.mjs merge` |
+| libxml normalizes line ends and attribute whitespace and expands the internal DTD's entities | `parseXml` kept `\r\n`, tabs / newlines in attributes and `&name;` (MFTF's `di.xml`) | `di-parsing`, `compare.mjs merge` |
 
 ### Structural answers for API, GraphQL, cron, schema, modules
 | Magento | Before | Test (`tests/config-models.test.js`) |

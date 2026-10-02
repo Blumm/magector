@@ -16,7 +16,8 @@ import {
   interceptionStatus, buildClassHierarchy, instancesOf, parseXml, parseDiXml, buildDiModel,
   applyModuleOrder, resolveInstance, resolveVirtualType, argumentInjectionsOf, parseEventsXml,
   parseConfigPhpModules, buildModuleIndex, effectivePluginDeclarations,
-  checkXmlWellFormed,
+  checkXmlWellFormed, checkConfigValues, magentoInvalidXmlMessage, phpIntCast,
+  mergeConfigFiles, checkMergedConfig, mergedConfigErrors, CONFIG_MERGE, ConfigMergeError,
 } from '../src/di-config.js';
 
 let passed = 0;
@@ -185,6 +186,8 @@ return Array(
 // Expected first fatal error = libxml 2.9.14 / PHP 8.3 (DOMDocument::loadXML, as Config\Dom does);
 // for comment / CDATA errors libxml appends the start of the section, the check reports the prefix.
 const WELL_FORMED_CASES = [
+  ["lone_lt_after_root", "<?xml version=\"1.0\"?>\n<config/>\n<", [3, "Extra content at the end of the document"]],
+  ["bad_name_after_root", "<?xml version=\"1.0\"?>\n<config/>\n<1", [3, "Extra content at the end of the document"]],
   ["amp_attr", "<?xml version=\"1.0\"?>\n<config>\n  <type name=\"A&B\"/>\n</config>\n", [3, "EntityRef: expecting ';'"]],
   ["amp_text", "<?xml version=\"1.0\"?>\n<config>\n  <x>a & b</x>\n</config>\n", [3, "xmlParseEntityRef: no name"]],
   ["badname", "<?xml version=\"1.0\"?>\n<config>\n  <1x/>\n</config>\n", [3, "StartTag: invalid element name"]],
@@ -225,7 +228,205 @@ for (const [name, src, expected] of WELL_FORMED_CASES) {
   const got = checkXmlWellFormed(src)[0] || null;
   eq(`well-formedness as libxml: ${name}`, got && [got.line, got.message], expected);
 }
+// Expected = DOMDocument::loadXML (PHP 8.3, libxml 2.9.14), first fatal error. Found by mutate-xml.mjs:
+// an attribute value left open with a '&' in it was reported at the next '<' instead of at the '&'
+eq('well-formedness as libxml: an entity reference in an attribute value is read before a later \'<\' or the end', [
+  '<config>\n<a b="x&>\n<c/></config>',
+  '<config>\n<a b="x&y>\n<c/></config>',
+  '<config>\n<a b="x&zz;>\n<c/></config>',
+  '<config>\n<a b="x&amp; ok\n<c/></config>',
+  '<config>\n<a b="x&',
+].map(x => checkXmlWellFormed(x)[0]).map(e => e && `${e.line}:${e.message}`), [
+  '2:xmlParseEntityRef: no name',
+  "2:EntityRef: expecting ';'",
+  "2:Entity 'zz' not defined",
+  "3:Unescaped '<' not allowed in attributes values",
+  '2:xmlParseEntityRef: no name',
+]);
+// ── Config\Dom merge (mergeConfigFiles) ──────────────────────────
+// Expected = Magento's readers (merge-truth.php sets: _createConfigMerger + merge(), Magento 2.4.5-p14 /
+// PHP 8.1): the merged document, or the exception Config\Dom throws.
+const MERGE_FILES = {
+  "a1.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"string\">old</argument></arguments></type></config>",
+  "a2.xml": "<config><type name=\"T\"><arguments><argument name=\"v\"><![CDATA[new]]></argument></arguments></type></config>",
+  "b1.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"string\"><!--c-->old</argument></arguments></type></config>",
+  "b2.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"string\">new</argument></arguments></type></config>",
+  "c1.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"array\"><item name=\"a\" xsi:type=\"string\">x</item></argument></arguments></type></config>",
+  "c2.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"string\" extra=\"1\">s</argument></arguments></type></config>",
+  "d1.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"array\"><item name=\"0\" xsi:type=\"string\">zero</item><item name=\"1\" xsi:type=\"string\">one</item></argument></arguments></type></config>",
+  "d2.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"array\"><item name=\"0\" xsi:type=\"string\">ZERO</item></argument></arguments></type></config>",
+  "e1.xml": "<?xml version=\"1.0\"?>\r\n<!DOCTYPE config [<!ENTITY list \"a|b\">]>\r\n<config>\r\n  <type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"string\" note=\"&list;\">x\r\n</argument></arguments></type>\r\n</config>\r\n",
+  "f1.xml": "<config><event name=\"e\"><observer name=\"o\" instance=\"A\"/></event></config>",
+  "f2.xml": "<config><event name=\"e\"><observer name=\"o\" disabled=\"true\"/><observer name=\"p\" instance=\"B\"/></event></config>",
+  "g1.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"array\"><item name=\"it's\" xsi:type=\"string\">a</item></argument></arguments></type></config>",
+  "g2.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"array\"><item name=\"it's\" xsi:type=\"string\">b</item></argument></arguments></type></config>",
+  "h1.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"string\">old</argument></arguments></type></config>",
+  "h2.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"string\">cron 2&gt;&amp;1</argument></arguments></type></config>",
+  "h3.xml": "<config><type name=\"T\"><arguments><argument name=\"v\" xsi:type=\"string\">a &amp;amp; b &amp;x; c</argument></arguments></type></config>"
+};
+const mergeCanon = n => ['e', n.name, Object.fromEntries(Object.entries(n.attrs).sort(([a], [b]) => (a < b ? -1 : 1))),
+  n.seq.map(e => (e.node ? mergeCanon(e.node) : e.text !== undefined ? ['t', e.text] : e.cdata !== undefined ? ['c', e.cdata] : e.comment ? ['#'] : e.entref ? ['x', 'DOMEntityReference'] : ['?']))];
+const merged = (kind, names) => {
+  try { return mergeCanon(mergeConfigFiles(names.map(f => ({ file: f, content: MERGE_FILES[f] })), CONFIG_MERGE[kind])); }
+  catch (e) { if (e instanceof ConfigMergeError) return { error: e.message }; throw e; }
+};
+eq('merge as Config\\Dom: a CDATA value replaces the text; the attributes stay', merged('di', ["a1.xml", "a2.xml"]), ["e", "config", {}, [["e", "type", {"name": "T"}, [["e", "arguments", {}, [["e", "argument", {"name": "v", "xsi:type": "string"}, [["t", "new"]]]]]]]]]);
+eq('merge as Config\\Dom: a text value replaces the CDATA section', merged('di', ["a2.xml", "a1.xml"]), ["e", "config", {}, [["e", "type", {"name": "T"}, [["e", "arguments", {}, [["e", "argument", {"name": "v", "xsi:type": "string"}, [["t", "old"]]]]]]]]]);
+eq('merge as Config\\Dom: a node with a comment and text (no element) takes the new text', merged('di', ["b1.xml", "b2.xml"]), ["e", "config", {}, [["e", "type", {"name": "T"}, [["e", "arguments", {}, [["e", "argument", {"name": "v", "xsi:type": "string"}, [["t", "new"]]]]]]]]]);
+eq('merge as Config\\Dom: another xsi:type replaces the argument whole', merged('di', ["c1.xml", "c2.xml"]), ["e", "config", {}, [["e", "type", {"name": "T"}, [["e", "arguments", {}, [["e", "argument", {"extra": "1", "name": "v", "xsi:type": "string"}, [["t", "s"]]]]]]]]]);
+eq('merge as Config\\Dom: … in either order', merged('di', ["c2.xml", "c1.xml"]), ["e", "config", {}, [["e", "type", {"name": "T"}, [["e", "arguments", {}, [["e", "argument", {"name": "v", "xsi:type": "array"}, [["e", "item", {"name": "a", "xsi:type": "string"}, [["t", "x"]]]]]]]]]]]);
+eq('merge as Config\\Dom: item name="0" is no key (PHP: "0" is falsy) — two items match: Config\\Dom throws', merged('di', ["d1.xml", "d2.xml"]), {"error": "More than one node matching the query: /config/type[@name='T']/arguments/argument[@name='v']/item"});
+eq('merge as Config\\Dom: … with one item in the base it merges into it, the other item is appended', merged('di', ["d2.xml", "d1.xml"]), ["e", "config", {}, [["e", "type", {"name": "T"}, [["e", "arguments", {}, [["e", "argument", {"name": "v", "xsi:type": "array"}, [["e", "item", {"name": "0", "xsi:type": "string"}, [["t", "zero"]]], ["e", "item", {"name": "1", "xsi:type": "string"}, [["t", "one"]]]]]]]]]]]);
+eq('merge as Config\\Dom: CRLF line ends become LF, DTD entities expand in attribute values', merged('di', ["e1.xml"]), ["e", "config", {}, [["t", "\n  "], ["e", "type", {"name": "T"}, [["e", "arguments", {}, [["e", "argument", {"name": "v", "note": "a|b", "xsi:type": "string"}, [["t", "x\n"]]]]]]], ["t", "\n"]]]);
+eq('merge as Config\\Dom: events: observers merge by name, attributes accumulate', merged('events', ["f1.xml", "f2.xml"]), ["e", "config", {}, [["e", "event", {"name": "e"}, [["e", "observer", {"disabled": "true", "instance": "A", "name": "o"}, []], ["e", "observer", {"instance": "B", "name": "p"}, []]]]]]);
+
+// Under Magento's ErrorHandler (bin/magento, Bootstrap::run): Mage-OS 2.4.9 / PHP 8.3 / libxml 2.9.14
+eq('merge as Config\\Dom: an id with an apostrophe breaks the XPath literal — DOMXPath warns, Magento\'s ErrorHandler throws', merged('di', ['g1.xml', 'g2.xml']), { error: 'Warning: DOMXPath::query(): Invalid predicate' });
+eq('merge as Config\\Dom: a value with a bare & set as nodeValue — libxml "unterminated entity reference" (%15s)', merged('di', ['h1.xml', 'h2.xml']), { error: 'Warning: Magento\\Framework\\Config\\Dom::_mergeNode(): unterminated entity reference               1' });
+eq('merge as Config\\Dom: … &amp; becomes &, another reference an entity reference node', merged('di', ['h1.xml', 'h3.xml']), ["e", "config", {}, [["e", "type", {"name": "T"}, [["e", "arguments", {}, [["e", "argument", {"name": "v", "xsi:type": "string"}, [["t", "a & b "], ["x", "DOMEntityReference"], ["t", " c"]]]]]]]]]);
+// ── Entity amplification ("billion laughs") ──────────────────────
+// libxml 2.9 limits it without LIBXML_NOENT (DOMDocument::loadXML, as Config\Dom does): expected =
+// PHP 8.4 / libxml 2.9.13, first fatal error. The emulation in checkXmlWellFormed agrees with it on
+// 13,708 generated documents (levels, fan-out, positions, cycles, text and attribute values).
+const entityDoc = (levels, width, where, base = 'x') => {
+  let dtd = `<!ENTITY e0 "${base}">\n`;
+  for (let i = 1; i <= levels; i++) dtd += `<!ENTITY e${i} "${`&e${i - 1};`.repeat(width)}">\n`;
+  const ref = `&e${levels};`;
+  return `<?xml version="1.0"?>\n<!DOCTYPE config [\n${dtd}]>\n<config>\n  <type name="A">${where === 'attr' ? `<plugin name="${ref}"/>` : `<arguments><argument name="a">${ref}</argument></arguments>`}</type>\n</config>\n`;
+};
+eq('well-formedness as libxml: nested entities that amplify are an entity reference loop; flat ones are not', [
+  entityDoc(1, 30, 'text'), entityDoc(2, 5, 'text'), entityDoc(2, 10, 'text'), entityDoc(3, 3, 'text'), entityDoc(8, 10, 'text'),
+  entityDoc(3, 2, 'attr'), entityDoc(2, 10, 'attr'), entityDoc(3, 10, 'attr'), entityDoc(8, 10, 'attr'),
+  '<?xml version="1.0"?>\n<!DOCTYPE config [\n<!ENTITY a "x&a;">\n]>\n<config>&a;</config>\n',
+  '<?xml version="1.0"?>\n<!DOCTYPE config [\n<!ENTITY c0 "&c1;">\n<!ENTITY c1 "\n&c2;">\n<!ENTITY c2 "\n\n&c0;">\n]>\n<config>&c0;</config>\n',
+  '<?xml version="1.0"?>\n<!DOCTYPE config [\n<!ENTITY m "<b/>">\n]>\n<config>\n  <a v="&m;"/>\n</config>\n',
+  `<?xml version="1.0"?>\n<!DOCTYPE config [\n<!ENTITY big "${'y'.repeat(100000)}">\n]>\n<config>${'&big;'.repeat(1000)}<a v="&big;&big;"/></config>\n`,
+].map(x => checkXmlWellFormed(x)[0]).map(e => e && [e.line, e.message]), [
+  null, null,
+  [1, 'Detected an entity reference loop'],            // in content: measured against the entity's own input
+  [1, 'Detected an entity reference loop'],
+  [1, 'Detected an entity reference loop'],
+  null, null, null,                                     // in an attribute value: against the document position
+  [14, 'Detected an entity reference loop'],
+  [1, 'Detected an entity reference loop'],            // recursion: depth over 40
+  [2, 'Detected an entity reference loop'],            // ctxt->depth grows by 2 per level in content
+  [6, "'<' in entity 'm' is not allowed in attributes values"],
+  null,                                                 // 100 MB if expanded, but not nested
+]);
+{
+  // The tolerant parser expands entities within a per-document budget: a 1 KB file was 300M characters,
+  // 15 s and 775 MB (8 levels), a RangeError after 1.3 GB (9 levels)
+  const lol = entityDoc(8, 10, 'text', 'lol');
+  const t0 = performance.now();
+  const arg = parseXml(lol).children[0].children[0].children[0].children[0];
+  const ms = performance.now() - t0;
+  eq(`parseXml: a "billion laughs" di.xml stays small and fast (${ms.toFixed(0)} ms, ${arg.text.length} characters)`, ms < 1000 && arg.text.length < 2_000_000, true);
+  eq('parseXml: entities within the budget expand as libxml reads them', parseXml(entityDoc(2, 5, 'text')).children[0].children[0].children[0].children[0].text, 'x'.repeat(25));
+}
+// The exceptions of a merged area name every file the failing node holds data of: a file another file
+// completes loads even when the area fails for a third one (review of #33)
+{
+  const X = 'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"';
+  const area = mergedConfigErrors([
+    { file: 'good.xml', content: `<config ${X}><type name="L"><arguments><argument name="commands" xsi:type="array"><item name="a" xsi:type="string">A</item></argument></arguments></type><type name="N"><arguments><argument name="n" xsi:type="number">4</argument></arguments></type></config>` },
+    { file: 'completed.xml', content: `<config ${X}><type name="L"><arguments><argument name="commands"><item name="b" xsi:type="string">B</item></argument></arguments></type></config>` },
+    { file: 'value.xml', content: `<config ${X}><type name="N"><arguments><argument name="n">five</argument></arguments></type></config>` },
+    { file: 'other.xml', content: `<config ${X}><type name="U"><plugin name="p" type="P" disabled="yes"/></type></config>` },
+  ], 'di');
+  eq('merged area: each exception with the files of its node — the completed file is not among them', [area.merged, area.errors.map(e => [e.message.split(':')[0], e.files])], [true, [
+    ['<type name="N"> argument "n"', ['good.xml', 'value.xml']],          // the value comes from value.xml
+    ['<plugin name="p"> disabled="yes"', ['other.xml']],
+  ]]);
+}
 eq('well-formedness as libxml: a UTF-8 byte-order mark before the declaration is skipped',
   checkXmlWellFormed('\uFEFF<?xml version="1.0" encoding="UTF-8"?>\n<config/>\n'), []);
+eq('Magento\'s message for a file Config\\Dom rejects (Config\\Reader\\Filesystem, ERROR_FORMAT_DEFAULT)',
+  magentoInvalidXmlMessage('/m/etc/di.xml', [{ line: 5, message: 'Opening and ending tag mismatch: type line 3 and typ' }]),
+  'The XML in file "/m/etc/di.xml" is invalid:\nOpening and ending tag mismatch: type line 3 and typ\nLine: 5\n\nVerify the XML and try again.');
+eq('PHP (int) cast of sortOrder', ['10', '10abc', 'abc', ' 5', '1e2', '0x1A', '+5', '5.9', '-3', ''].map(phpIntCast), [10, 10, 0, 5, 100, 0, 5, 5, -3, 0]);
+
+const DI_HEAD = '<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><type name="A\\B">';
+const diValues = body => checkConfigValues(`${DI_HEAD}${body}</type></config>`, 'etc/di.xml')
+  .map(p => `${p.severity}:${p.message.slice(p.message.indexOf('": ') + 3).split('\n')[0]}`);
+// Expected = what Magento's DI argument interpreters throw (ObjectManagerFactory::createArgumentInterpreter),
+// checked in PHP 8.3 / Mage-OS 2.4.9
+eq('DI argument values as Magento\'s interpreters read them', [
+  '<arguments><argument name="x" xsi:type="boolean"> true </argument></arguments>',
+  '<arguments><argument name="x" xsi:type="boolean">yes</argument></arguments>',
+  '<arguments><argument name="x" xsi:type="boolean">   </argument></arguments>',
+  '<arguments><argument name="x" xsi:type="number"> 12 </argument></arguments>',
+  '<arguments><argument name="x" xsi:type="number">1e3</argument></arguments>',
+  '<arguments><argument name="x" xsi:type="number">0x1A</argument></arguments>',
+  '<arguments><argument name="x">v</argument></arguments>',
+  '<arguments><argument name="x" xsi:type="foo">v</argument></arguments>',
+  '<arguments><argument name="x" xsi:type="object" shared="nope">A\\B</argument></arguments>',
+  '<arguments><argument name="x" xsi:type="array"><item xsi:type="string">v</item></argument></arguments>',
+  '<arguments><argument name="x" xsi:type="array"><item name="a" xsi:type="array"><item name="b" xsi:type="number">n</item></item></argument></arguments>',
+  '<arguments><argument name="x" xsi:type="boolean">&#49;</argument></arguments>',
+  '<arguments><argument name="x" xsi:type="boolean"><![CDATA[]]></argument></arguments>',
+  '<arguments><argument name="x" xsi:type="boolean">a<!--c-->true</argument></arguments>',
+  '<arguments><argument name="x" xsi:type="object"></argument></arguments>',
+  '<arguments><argument name="x" xsi:type="init_parameter"></argument></arguments>',
+  '<arguments><argument name="x" xsi:type="array"><foo>1</foo><foo>2</foo></argument></arguments>',
+  '<arguments><argument name="x" xsi:type="array" item="z"/></arguments>',
+  '<arguments><argument name="x" xsi:type="bool"><item xsi:type="string">v</item></argument></arguments>',
+  '<arguments><argument name="x" xsi:type="array"><item name="a" xsi:type="number" sortOrder="20">n</item><item name="b" xsi:type="boolean" sortOrder="10">q</item></argument></arguments>',
+  '<arguments><argument name="x" xsi:type="array"><item name="a" xsi:type="bool">v</item>!</argument></arguments>',
+].map(diValues), [
+  [],
+  ["error:InvalidArgumentException 'Boolean value is expected, supported values: array ("],
+  ["error:InvalidArgumentException 'Boolean value is missing.'"],
+  [],
+  [],
+  ["error:InvalidArgumentException 'Numeric value is expected.'"],
+  ["error:InvalidArgumentException 'Value for key \"xsi:type\" is missing in the argument data.'"],
+  ["error:InvalidArgumentException 'Argument interpreter named 'foo' has not been defined.'"],
+  ["error:InvalidArgumentException 'Boolean value is expected, supported values: array ("],
+  ["error:UnexpectedValueException 'Array is expected to contain value for key 'name'.'"],
+  ["error:InvalidArgumentException 'Numeric value is expected.'"],
+  [],
+  ["error:InvalidArgumentException 'Boolean value is expected, supported values: array ("],
+  ["error:InvalidArgumentException 'Boolean value is expected, supported values: array ("],
+  ["error:Exception 'Warning: Undefined array key \"value\"'"],
+  ["error:InvalidArgumentException 'Constant name is expected.'"],
+  ["error:UnexpectedValueException 'Node path 'argument/foo' is not unique, but it has not been marked as array.'"],
+  ["error:InvalidArgumentException 'Array items are expected.'"],
+  ["error:UnexpectedValueException 'Array is expected to contain value for key 'name'.'"],
+  ["error:InvalidArgumentException 'Boolean value is expected, supported values: array ("],
+  ['warning:text "!" next to 1 child element(s) — Magento\'s Config\\Converter\\Dom\\Flat reads the text as the value and drops the elements'],
+]);
+const diMessages = body => checkConfigValues(`${DI_HEAD}${body}</type></config>`, 'etc/di.xml')
+  .map(p => `${p.severity}:${p.message.split('\n')[0]}`);
+eq('DI nodes and attributes as ObjectManager\\Config\\Mapper\\Dom reads them', [
+  '<plugin name="p" type="P" disabled="1"/>',
+  '<plugin name="p" type="P" disabled="yes"/>',
+  '<plugin type="P"/>',
+  '<plugin name="p" type="P" sortOrder="10abc"/>',
+  '<plugin name="p" type="P" sortOrder="-5"/>',
+  '<foo/>',
+].map(diMessages), [
+  [],
+  ['error:<plugin name="p"> disabled="yes": InvalidArgumentException \'Boolean value is expected, supported values: array ('],
+  ['error:<plugin> without name in <type name="A\\B">: Warning: Attempt to read property "nodeValue" on null in Magento\\Framework\\ObjectManager\\Config\\Mapper\\Dom (Magento\'s ErrorHandler throws it as an exception)'],
+  ['warning:<plugin name="p"> sortOrder="10abc" is read as (int) 10'],
+  [],
+  ["error:Exception 'Invalid application config. Unknown node: foo.'"],
+]);
+const eventValues = body => checkConfigValues(`<config>${body}</config>`, 'etc/events.xml')
+  .map(p => `${p.severity}:${p.message.split(' — ')[0]}`);
+eq('events as Event\\Config\\Converter reads them', [
+  '<event name="e"><observer name="o" instance="O" disabled="true"/></event>',
+  '<event name="e"><observer name="o" instance="O" disabled="1"/></event>',
+  '<event name="e"><observer instance="O"/></event>',
+  '<event><observer name="o" instance="O"/></event>',
+].map(eventValues), [
+  [],
+  ['warning:<observer name="o"> disabled="1" does not disable the observer'],
+  ["error:<observer> without name: InvalidArgumentException 'Attribute name is missed'"],
+  ['error:<event> without name: Warning: Attempt to read property "nodeValue" on null in Magento\\Framework\\Event\\Config\\Converter (Magento\'s ErrorHandler throws it as an exception)'],
+]);
+eq('problems carry the line of the element',
+  checkConfigValues('<config>\n  <type name="A">\n    <plugin name="p" disabled="x"/>\n  </type>\n</config>', 'etc/di.xml').map(p => p.line), [3]);
+
 console.log(`\n  ${passed} passed, ${failed} failed\n`);
 process.exit(failed ? 1 : 0);

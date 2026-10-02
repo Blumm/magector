@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="urn:magento:framework:ObjectManager/etc/config.xsd">
+    <!-- no xsi:type: Acme_Good declares it. The global area fails for Acme_Values (disabled="yes"),
+         which does not make this file fail -->
+    <type name="Acme\Good\Model\CommandList">
+        <arguments>
+            <argument name="commands">
+                <item name="merge_run" xsi:type="string">Acme\Merge\Console\Run</item>
+            </argument>
+        </arguments>
+    </type>
+</config>

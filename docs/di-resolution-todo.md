@@ -3,6 +3,50 @@
 Follow-ups to the structural DI / event resolution (`src/di-config.js`). Verification against a
 Magento installation: `scripts/verify-magento/`.
 
+## A. Invalid XML / values — done: `magento_validate_config` + notice in the DI / event tools
+
+Magento behaviour (Mage-OS 2.4.9 source, each point checked in PHP 8.3 / libxml 2.9.14):
+- Not well-formed XML → `Config\Dom::_initDom()` fails in **every mode** → `The XML in file "<file>" is
+  invalid:\n<errors>\nVerify the XML and try again.`, errors in `ERROR_FORMAT_DEFAULT` (`%message%\nLine: %line%\n`).
+  An empty file is a `ValueError` of `DOMDocument::loadXML()` (PHP 8), not wrapped.
+- The converters run on the **merged** configuration of an area, under Magento's `ErrorHandler` (a PHP
+  warning is an exception): plugin `disabled` / type `shared` → `BooleanUtils` strict; missing `name` /
+  `for` / `type` → `Warning: Attempt to read property "nodeValue" on null`; unknown node → `Invalid
+  application config. Unknown node`; DI arguments → `Config\Converter\Dom\Flat` + the interpreters of
+  `ObjectManagerFactory::createArgumentInterpreter()`. All of this fails in **every mode**, not only in
+  developer mode (the plan had A5 as developer-only — wrong).
+- Developer mode adds schema validation: per file where the reader has a per-file schema (`events.xml`),
+  of the **merged** document otherwise (`di.xml`: `getPerFileSchema()` is `null`). The outcome depends on
+  file order — duplicate `<argument name>` fails only when no earlier file declared that argument; a bad
+  value can be overridden by a later file. Only Magento's reader gives the answer, so the native check
+  reads every area with `ObjectManager\Config\Reader\Dom` / `Event\Config\Reader` in both modes. The
+  built-in check merges each area as `Config\Dom` does (`mergeConfigFiles`, verified with `compare.mjs
+  merge`) and converts the result; schema validation stays native.
+- Observer `disabled`: only `'true'` disables. `sortOrder` → PHP `(int)` (`"10abc"` → 10, `"1e2"` → 100).
+- Text (or CDATA) next to `<item>`s in an argument: `Flat` takes the first non-blank text as the value and
+  drops the items (an array argument becomes empty) — found by the value mutations.
+
+| # | Variant | Now |
+|---|---------|-----|
+| A1 | Not well-formed | error, Magento's message; built-in: libxml's first fatal error (message, line) |
+| A2 | Plugin `disabled` / type `shared` outside `true/false/1/0` | error, `BooleanUtils` message |
+| A3 | Observer `disabled="1"` etc. | warning ("does not disable") |
+| A4 | Non-integer `sortOrder` | warning with the `(int)` value |
+| A5 | Missing `name` / `for` / `type`, unknown node, invalid DI argument value | error in every mode, converter / interpreter message |
+| A6 | Schema (XSD) errors | native only: developer-mode failure per area from Magento's reader; other files against their declared schema, as its own section |
+| A6b | A file another file of its area completes (an argument without `xsi:type`), two files that fail only together | built-in: each DI / events area merged as `Config\Dom` merges it, then converted — the same verdict as Magento's readers (`compare.mjs merge`) |
+| A6c | PHP 8.4 with Magento ≤ 2.4.7 (review of #31) | native: run on PHP 8.4.26 with Magento 2.4.5-p14 — the same result as PHP 8.1 on 757 real and 2,500 mutated files and 16 areas |
+
+Still open:
+
+| # | Item |
+|---|------|
+| A7 | The DI / event tools warn about a rejected file (notice) but still list its declarations and use them for the effective state; they could mark them "file not loaded". |
+| A8 | Native developer-mode verdicts cover DI and events only; other readers (`crontab.xml`, `routes.xml`, `webapi.xml`, `system.xml`, …) get the declared-schema check, which Magento's reader may not apply (`module.xml` is read without a schema). The built-in area merge also covers DI and events only. |
+| A9 | Built-in: `const` / `init_parameter` arguments (needs PHP's `defined()`); nested-array `SortItems` order is approximated (single-level stable sort) — affects only which of several errors is first. |
+| A10 | Native run over a whole project: ~10 s (3,077 files, 15 areas), no cache between calls. |
+| A10b | Built-in, first DI / event answer right after the server starts: 0.5–0.7 s (the notice merges every area); prepared in the background after 1.5 s without a tool call, so later first answers take 17–270 ms. |
+
 ## A2. Structural answers — done: `find_api`, `find_graphql`, `find_cron`, `find_db_schema`, `module_structure`
 
 Verified against the installation and against Magento's readers on a synthetic fixture
@@ -10,12 +54,13 @@ Verified against the installation and against Magento's readers on a synthetic f
 
 | # | Item |
 |---|------|
-| A13 | Cron: jobs / schedules from `core_config_data` are only noted (they are not in any file). |
-| A15 | **Class lookup reads only composer's PSR-4 map** — `autoload_classmap.php` and PSR-0 (`autoload_namespaces.php`) are not read. On the project 1,475 classes load only through the classmap (mostly dev tools, also `Cm_Cache_Backend_Redis`, `Credis_Client`); 67 of them have no namespace and a file named differently from the class, so the file-name fallback does not find them either → a class hierarchy through them is cut (inherited plugins can be missed). Fix: read both maps; verify against `Composer\Autoload\ClassLoader::findFile()` for every class. |
+| A11 | `validate_config`: Magento-specific GraphQL breakage — a `{` / `}` inside a type body (object default value, description) cuts the type and fails the whole schema; text like `type Foo {` in a comment or description creates or breaks a type. Report it. |
+| A12 | `validate_config`: `xsi:type` without `xmlns:xsi` on the root loads (namespace error, level 2) but the type is lost — a db_schema column then fails `setup:upgrade`. Report it. |
+| A13 | Cron: jobs / schedules from `core_config_data` are only noted; the native path (MAGECTOR_PHP) could read them. |
+| A15 | **Class lookup: PSR-0 is not read.** The PSR-4 map, `autoload_classmap.php` and `generated/code` are (0f7a9d3); PSR-0 (`autoload_namespaces.php`) is not. The classmap covered 1,475 classes of a project that PSR-4 does not (mostly dev tools, also `Cm_Cache_Backend_Redis`, `Credis_Client`). Still to do: read PSR-0, and verify the lookup against `Composer\Autoload\ClassLoader::findFile()` for every class. |
 | A16 | Cron (adversarial review): the `system/default/crontab` of app/etc/config.php and env.php is not read (only config.xml); several `<default>` / `<crontab>` nodes in one config.xml — only the first is read; a later `<schedule>` holding a comment does not replace the earlier one in Magento (Magector replaces it). |
 | A17 | webapi (review): two routes whose url differs only by surrounding whitespace are separate DOM nodes in Magento, and the last wins whole; Magector merges them. |
 | A18 | GraphQL (review): a duplicate definition swallowed into another type's chunk replaces the earlier one in Magento, Magector merges them (more, not less); escapes inside a block string (triple quotes) in `@resolver(class: …)`. |
-| A19 | XML attribute values: libxml turns tabs / newlines into spaces, `parseXml` keeps them (e.g. db_schema comments). |
 | A20 | Returns more, harmless: `implements` forms Magento does not recognise (one-letter interface name, leading `&`); `<schedule>0</schedule>` (Magento drops it); two indexes with the same generated name (Magento keeps the last); a foreign key to a table on another shard (Magento skips it). |
 
 ## A3. Performance (measured on the project, see docs/verification.md)

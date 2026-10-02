@@ -13,26 +13,58 @@ import { readFileSync } from 'fs';
 
 const ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
 
-function decodeEntities(s) {
-  return s.replace(/&(#x[0-9a-f]+|#\d+|\w+);/gi, (m, e) => {
-    if (e[0] === '#') {
-      const code = e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
-      return Number.isFinite(code) ? String.fromCodePoint(code) : m;
-    }
-    return ENTITIES[e] ?? m;
+const charRef = (m, e) => {
+  const code = e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+  return Number.isFinite(code) ? String.fromCodePoint(code) : m;
+};
+
+/**
+ * Character and entity references, as libxml substitutes them: the predefined entities and the
+ * general entities the document's internal DTD subset declares (`declared`: { map: name → replacement
+ * text, left: expansion budget }). In an attribute value the replacement text is normalized too
+ * (literal tab / newline → space). The budget is per document (declaredEntities): nested entities
+ * expand exponentially (a 1 KB "billion laughs" di.xml is gigabytes), so once it is spent the
+ * references stay as written. libxml rejects such a document anyway ("Detected an entity reference
+ * loop", checkXmlWellFormed); its own nesting limit is 40.
+ */
+function decodeEntities(s, declared = null, inAttribute = false, depth = 0) {
+  return s.replace(/&(#x[0-9a-f]+|#\d+|[A-Za-z_:][\w.:-]*);/gi, (m, e) => {
+    if (e[0] === '#') return charRef(m, e);
+    if (ENTITIES[e] !== undefined) return ENTITIES[e];
+    const value = declared?.map.get(e);
+    if (value === undefined || depth >= 40 || declared.left <= 0) return m;
+    const out = decodeEntities(inAttribute ? value.replace(/[\t\n]/g, ' ') : value, declared, inAttribute, depth + 1);
+    declared.left -= out.length;
+    return declared.left < 0 ? m : out;
   });
 }
 
+/** Expansion budget of a document's declared entities: 10 × its size + 1 MB (in UTF-16 units). */
+const entityBudget = size => 10 * size + (1 << 20);
+
+/** <!ENTITY name "value"> of an internal DTD subset; character references are replaced when declared. */
+function declaredEntities(doctype, size) {
+  const map = new Map();
+  for (const m of doctype.matchAll(/<!ENTITY\s+([A-Za-z_:][\w.:-]*)\s+(?:"([^"]*)"|'([^']*)')\s*>/g)) {
+    if (!map.has(m[1])) map.set(m[1], (m[2] ?? m[3]).replace(/\r\n?/g, '\n').replace(/&(#x[0-9a-f]+|#\d+);/gi, charRef));
+  }
+  return { map, left: entityBudget(size) };
+}
+
 /**
- * Parse an XML document into { name, attrs, children, text, line } nodes.
+ * Parse an XML document into { name, attrs, children, text, seq, line } nodes. `seq` keeps the
+ * child nodes in document order ({ node } | { text } | { cdata } | { comment } | { pi }) — the
+ * converter checks of checkConfigValues read mixed content as Magento's converters do, and
+ * mergeConfigFiles merges as Config\Dom does.
  * Tolerant: unknown or unbalanced closing tags are ignored rather than thrown, so a broken file
  * yields what it can (checkXmlWellFormed says whether Magento loads it).
  */
 export function parseXml(content) {
-  const root = { name: '#document', attrs: {}, children: [], text: '' };
+  const root = { name: '#document', attrs: {}, children: [], text: '', seq: [] };
   if (!content) return root;
-  const src = content;
+  const src = content.replace(/\r\n?/g, '\n');     // end-of-line handling (XML 1.0 §2.11), as libxml
   const stack = [root];
+  let entities = null;                  // general entities of the internal DTD subset
   // Comments, processing instructions and DOCTYPE are tokens of the same scan as CDATA and tags, so
   // whichever starts first wins (a "<!--" inside CDATA is text, not the start of a comment).
   const tagRe = /<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<!DOCTYPE(?:[^[>]|\[[\s\S]*?\])*>|<!\[CDATA\[([\s\S]*?)\]\]>|<(\/?)([A-Za-z_][\w:.-]*)((?:\s+[\w:.-]+\s*=\s*(?:"[^"]*"|'[^']*'))*)\s*(\/?)>|([^<]+)|</g;
@@ -42,11 +74,19 @@ export function parseXml(content) {
   while ((m = tagRe.exec(src)) !== null) {
     const top = stack[stack.length - 1];
     if (m[3] === undefined && m[1] === undefined && m[6] === undefined) {
-      continue;                         // comment, PI, DOCTYPE, or a stray "<"
+      // comment, PI, DOCTYPE, or a stray "<". Comments and PIs inside an element are child nodes of it
+      // in the DOM, which Config\Dom's merge looks at (hasChildNodes, a single text node)
+      if (top !== root && m[0].startsWith('<!--')) top.seq.push({ comment: true });
+      else if (top !== root && m[0].startsWith('<?')) top.seq.push({ pi: true });
+      else if (m[0].startsWith('<!DOCTYPE')) entities = declaredEntities(m[0], src.length);
+      continue;
     } else if (m[1] !== undefined) {    // CDATA
       top.text += m[1];
+      top.seq.push({ cdata: m[1] });
     } else if (m[6] !== undefined) {    // text
-      top.text += decodeEntities(m[6]);
+      const text = decodeEntities(m[6], entities);
+      top.text += text;
+      top.seq.push({ text });
     } else if (m[2] === '/') {          // closing tag
       for (let i = stack.length - 1; i > 0; i--) {
         if (stack[i].name === m[3]) { stack.length = i; break; }
@@ -55,9 +95,11 @@ export function parseXml(content) {
       const attrs = {};
       const attrRe = /([\w:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
       let a;
-      while ((a = attrRe.exec(m[4])) !== null) attrs[a[1]] = decodeEntities(a[2] ?? a[3] ?? '');
-      const node = { name: m[3], attrs, children: [], text: '', line: lineAt(m.index) };
+      // attribute-value normalization (§3.3.3): literal tab / newline become a space, references stay
+      while ((a = attrRe.exec(m[4])) !== null) attrs[a[1]] = decodeEntities((a[2] ?? a[3] ?? '').replace(/[\t\n]/g, ' '), entities, true);
+      const node = { name: m[3], attrs, children: [], text: '', seq: [], line: lineAt(m.index) };
       top.children.push(node);
+      top.seq.push({ node });
       if (m[5] !== '/') stack.push(node);
     }
   }
@@ -1063,14 +1105,147 @@ export function instancesOf(hierarchy, fqcn) {
   return out;
 }
 
-// ─── Files Magento rejects ──────────────────────────────────────
+// ─── Configuration validation (what Magento rejects) ────────────
 //
 // Magento\Framework\Config\Dom::_initDom() loads each file with DOMDocument; a file that is not
-// well-formed fails in every mode with Config\Reader\Filesystem's message, and the reader of that
-// configuration (all its files) fails with it. The tolerant parseXml still reads such a file, so the
-// structural answers mark it instead of presenting its declarations as loaded.
+// well-formed fails in every mode with Config\Reader\Filesystem's message. Schema (XSD) errors fail
+// only when validation is required (developer mode). Values are then read by the converters:
+// ObjectManager\Config\Mapper\Dom → BooleanUtils::toBoolean() (strict) for plugin disabled / type
+// shared, (int) for sortOrder; Event\Config\Converter disables an observer only on disabled == 'true'.
+
+/** Config\Dom::ERROR_FORMAT_DEFAULT */
+export const MAGENTO_XML_ERROR_FORMAT = '%message%\nLine: %line%\n';
+
+/** The text Config\Reader\Filesystem::_readFiles() throws for a file DOMDocument cannot load. */
+export function magentoInvalidXmlMessage(file, errors) {
+  const body = errors.map(e => MAGENTO_XML_ERROR_FORMAT.replace('%message%', e.message).replace('%line%', String(e.line))).join('\n');
+  return `The XML in file "${file}" is invalid:\n${body}\nVerify the XML and try again.`;
+}
+
+/** var_export() of BooleanUtils' allowed values, as in its exception message. */
+export const BOOLEAN_UTILS_MESSAGE = "Boolean value is expected, supported values: array (\n  0 => true,\n  1 => 1,\n  2 => 'true',\n  3 => '1',\n  4 => false,\n  5 => 0,\n  6 => 'false',\n  7 => '0',\n)";
 
 const XML_NAME = /[A-Za-z_:][\w:.-]*/y;
+
+// libxml 2.9's guard against entity amplification, which DOMDocument::loadXML() applies without
+// LIBXML_NOENT (parser.c: xmlParseReference, xmlParseAttValueComplex, xmlStringDecodeEntities,
+// xmlParserEntityCheck). Each reference counts in nbentities; an entity's first reference measures it
+// (checked = 2 × the references its expansion parses) and fails with "Detected an entity reference
+// loop" when that count × 3 reaches 10 × the bytes consumed of the current input. In content the first
+// reference parses the entity as its own input (an error inside is on its line 1, the input is that
+// short); in an attribute value the entity is decoded as a string against the document's position.
+// Later references only add the count. Nesting deeper than 40 is a loop too. The first fatal error
+// agrees with PHP 8.4 / libxml 2.9.13 on 13,708 generated documents (levels, fan-out, lengths,
+// positions, cycles, text and attribute values, 8,000 of them random); libxml 2.10+ replaced this
+// guard with an amplification factor.
+const ENTITY_LOOP = 'Detected an entity reference loop';
+const ENTITY_REF = /&(#x[0-9a-fA-F]+|#\d+|[A-Za-z_:][\w.:-]*);/g;
+const ltInAttribute = name => `'<' in entity '${name}' is not allowed in attributes values`;
+
+function libxmlEntityLoops(entities) {
+  let nb = 0;                                   // ctxt->nbentities
+  let steps = 0;                                // work guard: libxml stops far earlier on real input
+  const utf8 = new TextEncoder();
+  const fail = (message = ENTITY_LOOP, line = null) => ({ message, line });
+  const refsOf = value => [...value.matchAll(ENTITY_REF)].filter(r => r[1][0] !== '#');
+  // An entity's content parsed as its own input (xmlParseBalancedChunkMemoryInternal): the positions
+  // and lines of the references in it are local to it
+  const parseContent = (ent, depth) => {
+    for (const r of refsOf(ent.value)) {
+      if (ENTITIES[r[1]] !== undefined) continue;
+      const at = r.index + r[0].length;
+      const innerLine = 1 + (ent.value.slice(0, at).match(/\n/g) || []).length;
+      const inner = entities.get(r[1]);
+      if (!inner) return fail(`Entity '${r[1]}' not defined`, innerLine);
+      if (inner.value === null) continue;
+      const e = contentReference(inner, utf8.encode(ent.value.slice(0, at)).length, innerLine, depth + 1);
+      if (e) return e;
+    }
+    return null;
+  };
+  const contentReference = (ent, consumed, line, depth) => {
+    nb++;                                       // xmlParseEntityRef
+    if (++steps > 1e6) return fail(ENTITY_LOOP, line);
+    // ctxt->depth grows by 2 per level (xmlParseReference, then the chunk's own context);
+    // xmlParseBalancedChunkMemoryInternal refuses a depth over 40
+    const tooDeep = 2 * depth - 1 > 40;
+    if (ent.checked === 0) {
+      const old = nb;
+      if (!tooDeep) {
+        const e = parseContent(ent, depth);
+        if (e) return e;
+      }
+      ent.checked = (nb - old + 1) * 2 + (ent.value.includes('<') ? 1 : 0);
+      if (tooDeep || Math.floor(ent.checked / 2) * 3 >= consumed * 10) return fail(ENTITY_LOOP, line);
+      return null;
+    }
+    if (ent.checked !== 1) nb += Math.floor(ent.checked / 2);
+    // An entity whose content gave no nodes (an empty one) is parsed again on every reference: past
+    // the depth limit that is a loop too
+    return ent.value === '' && tooDeep ? fail(ENTITY_LOOP, line) : null;
+  };
+  // xmlStringDecodeEntities(): returns { length } of the decoded string, or { error }
+  const decode = (value, depth, consumed) => {
+    if (depth > 40) return { error: fail() };
+    let length = 0, size = 300;                  // XML_PARSER_BIG_BUFFER_SIZE, grown by 2 × size + 100
+    const grow = () => { while (length + 100 > size) size = size * 2 + 100; };
+    let last = 0;
+    for (const r of value.matchAll(ENTITY_REF)) {
+      length += utf8.encode(value.slice(last, r.index)).length;
+      grow();
+      last = r.index + r[0].length;
+      if (r[1][0] === '#' || ENTITIES[r[1]] !== undefined) { length++; grow(); continue; }
+      const ent = entities.get(r[1]);
+      if (!ent) return { error: fail(`Entity '${r[1]}' not defined`) };
+      if (ent.value?.includes('<')) return { error: fail(ltInAttribute(r[1])) };   // [WFC: No < in Attribute Values]
+      nb++;                                      // xmlParseStringEntityRef
+      if (++steps > 1e6) return { error: fail() };
+      const e = check(ent, depth, consumed);
+      if (e) return { error: e };
+      nb += Math.floor(ent.checked / 2);
+      if (ent.value === null || ent.value === '') continue;
+      const inner = decode(ent.value, depth + 1, consumed);
+      if (inner.error) return inner;
+      // copied char by char; each time the buffer must grow (length + 100 > size) the size is checked
+      for (let left = inner.length; left > 0;) {
+        const toGrow = size - 99 - length;
+        if (toGrow > left) { length += left; break; }
+        length += toGrow;
+        left -= toGrow;
+        if (length >= 1000 && !(length < 10 * consumed && nb * 3 < 10 * consumed)) return { error: fail() };
+        size = size * 2 + 100;
+      }
+    }
+    length += utf8.encode(value.slice(last)).length;
+    return { length };
+  };
+  // xmlParserEntityCheck(ctxt, 0, ent, 0)
+  const check = (ent, depth, consumed) => {
+    if (ent.checked === 0 && ent.value !== null) {
+      ent.checked = 1;
+      const old = nb;
+      const r = decode(ent.value, depth + 1, consumed);
+      if (r.error) return r.error;
+      ent.checked = (nb - old + 1) * 2 + (ent.value.includes('<') ? 1 : 0);
+    }
+    return Math.floor(ent.checked / 2) * 3 >= consumed * 10 ? fail() : null;
+  };
+  return {
+    /** A reference in the document: content (xmlParseReference) or an attribute value. */
+    reference(name, ent, consumed, inAttribute) {
+      if (!inAttribute) return contentReference(ent, consumed, null, 1);
+      if (ent.value.includes('<')) return fail(ltInAttribute(name));               // [WFC: No < in Attribute Values]
+      nb++;                                      // xmlParseEntityRef
+      if (ent.checked === 0) {                   // "This may look absurd but is needed to detect entities problems"
+        const old = nb;
+        const r = decode(ent.value, 1, consumed);
+        if (r.error) return r.error;
+        ent.checked = (nb - old + 1) * 2 + (ent.value.includes('<') ? 1 : 0);
+      }
+      return null;
+    },
+  };
+}
 
 /**
  * Well-formedness check without PHP. Returns [] for a well-formed document, otherwise the first error
@@ -1080,6 +1255,7 @@ const XML_NAME = /[A-Za-z_:][\w:.-]*/y;
  */
 export function checkXmlWellFormed(content) {
   const src = String(content ?? '').replace(/^\uFEFF/, '');   // a UTF-8 BOM, which libxml skips
+  const bom = String(content ?? '').length - src.length ? 3 : 0;
   const lineAt = (() => {
     const starts = [0];
     for (let i = 0; i < src.length; i++) if (src[i] === '\n') starts.push(i + 1);
@@ -1135,10 +1311,20 @@ export function checkXmlWellFormed(content) {
     return { error: err(j, "parsing XML declaration: '?>' expected") };
   };
   const stack = [];
-  const declaredEntities = new Set();   // <!ENTITY name …> in the internal DTD subset
+  const declaredEntities = new Map();   // <!ENTITY name …> in the internal DTD subset → { value, checked }
+  const loops = libxmlEntityLoops(declaredEntities);
+  // libxml's "consumed" at a position: its UTF-8 offset (positions come in document order)
+  let utf8 = null, consumedOff = 0, consumedBytes = 0;
+  const consumedAt = off => {
+    utf8 ||= new TextEncoder();
+    if (off < consumedOff) { consumedOff = 0; consumedBytes = 0; }
+    consumedBytes += utf8.encode(src.slice(consumedOff, off)).length;
+    consumedOff = off;
+    return bom + consumedBytes;
+  };
   let rootClosed = false;
   let sawRoot = false;
-  const checkText = (from, to) => {
+  const checkText = (from, to, inAttribute = false) => {
     const t = src.slice(from, to);
     const amp = /&/g;
     let m;
@@ -1148,7 +1334,13 @@ export function checkXmlWellFormed(content) {
       const named = /^([A-Za-z_:][\w.:-]*)(;?)/.exec(rest);
       if (!named) return err(from + m.index, 'xmlParseEntityRef: no name');
       if (!named[2]) return err(from + m.index, "EntityRef: expecting ';'");
-      if (!['amp', 'lt', 'gt', 'quot', 'apos'].includes(named[1]) && !declaredEntities.has(named[1])) return err(from + m.index, `Entity '${named[1]}' not defined`);
+      if (['amp', 'lt', 'gt', 'quot', 'apos'].includes(named[1])) continue;
+      const ent = declaredEntities.get(named[1]);
+      if (!ent) return err(from + m.index, `Entity '${named[1]}' not defined`);
+      if (ent.value === null) continue;                          // external: not loaded
+      const after = from + m.index + 1 + named[0].length;
+      const loop = loops.reference(named[1], ent, consumedAt(after), inAttribute);
+      if (loop) return [{ line: loop.line ?? lineAt(after), message: loop.message }];
     }
     return null;
   };
@@ -1201,7 +1393,11 @@ export function checkXmlWellFormed(content) {
     if (src.startsWith('<!DOCTYPE', i)) {
       const m = /^<!DOCTYPE(?:[^[>]|\[[\s\S]*?\])*>/.exec(src.slice(i));
       if (!m) return err(i, 'DOCTYPE improperly terminated');
-      for (const d of m[0].matchAll(/<!ENTITY\s+([A-Za-z_][\w.-]*)\s/g)) declaredEntities.add(d[1]);
+      for (const d of m[0].matchAll(/<!ENTITY\s+([A-Za-z_][\w.-]*)\s+(?:"([^"]*)"|'([^']*)'|(SYSTEM|PUBLIC))/g)) {
+        if (declaredEntities.has(d[1])) continue;               // the first declaration binds
+        const value = d[4] ? null : (d[2] ?? d[3]).replace(/\r\n?/g, '\n').replace(/&(#x[0-9a-f]+|#\d+);/gi, charRef);
+        declaredEntities.set(d[1], { value, checked: 0 });
+      }
       i += m[0].length; continue;
     }
     if (src[i + 1] === '/') {                                   // closing tag
@@ -1220,10 +1416,11 @@ export function checkXmlWellFormed(content) {
       continue;
     }
     // start tag
+    // After the root element, any '<' (not a comment / PI) is extra content — libxml says so first
+    if (rootClosed) return err(i, 'Extra content at the end of the document');
     XML_NAME.lastIndex = i + 1;
     const nm = XML_NAME.exec(src);
     if (!nm) return err(i, 'StartTag: invalid element name');
-    if (rootClosed) return err(i, 'Extra content at the end of the document');
     const name = nm[0];
     const tagLine = lineAt(i);
     let j = XML_NAME.lastIndex;
@@ -1244,10 +1441,11 @@ export function checkXmlWellFormed(content) {
       if (q !== '"' && q !== "'") return err(j, 'AttValue: " or \' expected');
       let close = j + 1;
       while (close < src.length && src[close] !== q && src[close] !== '<') close++;
+      // libxml reads the value left to right: a bad entity reference comes before a '<' or the end
+      const e = checkText(j + 1, close, true);
+      if (e) return e;
       if (src[close] === '<') return err(close, "Unescaped '<' not allowed in attributes values");
       if (close >= src.length) return err(close, 'AttValue: \' expected');
-      const e = checkText(j + 1, close);
-      if (e) return e;
       if (seen.has(an[0])) return err(close, `Attribute ${an[0]} redefined`);
       seen.add(an[0]);
       j = close + 1;
@@ -1264,4 +1462,445 @@ export function checkXmlWellFormed(content) {
   }
   if (!sawRoot) return err(src.length, "Start tag expected, '<' not found");
   return [];
+}
+
+// ─── DI arguments, as Magento reads them ─────────────────────────
+// ObjectManager\Config\Mapper\ArgumentParser converts an <argument> with Config\Converter\Dom\Flat
+// (items keyed by name on paths argument(/item)+), then the interpreters of
+// ObjectManagerFactory::createArgumentInterpreter() evaluate it. Both are ported here with their
+// order and messages; `const` / `init_parameter` need PHP's defined() and stay with the native check.
+
+class MagentoException extends Error {
+  constructor(cls, message, node) { super(message); this.cls = cls; this.node = node; }
+}
+
+/**
+ * Config\Converter\Dom\Flat::convert(): element children first (depth-first), the first non-blank
+ * text or CDATA child ends the scan and becomes the value. Returns { data, dropped } — dropped:
+ * element children discarded because a text / CDATA child made the node a scalar.
+ */
+function flatConvert(node, basePath, onDropped) {
+  let value = {};
+  let isScalar = false;
+  let elements = 0;
+  for (const entry of node.seq || []) {
+    if (entry.node) {
+      const child = entry.node;
+      const nodePath = `${basePath}/${child.name}`;
+      const isArrayNode = /^argument(\/item)+$/.test(nodePath);
+      if (value[child.name] !== undefined && !isArrayNode) {
+        throw new MagentoException('UnexpectedValueException', `Node path '${nodePath}' is not unique, but it has not been marked as array.`, child);
+      }
+      const data = flatConvert(child, nodePath, onDropped);
+      elements++;
+      if (isArrayNode) {
+        if (!(data && typeof data === 'object' && data.name !== undefined)) {
+          throw new MagentoException('UnexpectedValueException', "Array is expected to contain value for key 'name'.", child);
+        }
+        (value[child.name] ||= new Map()).set(data.name, data);
+      } else {
+        value[child.name] = data;
+      }
+    } else if (entry.cdata !== undefined || (entry.text !== undefined && entry.text.trim() !== '')) {
+      if (elements) onDropped(node, elements, (entry.cdata ?? entry.text).trim());
+      value = entry.cdata ?? entry.text;
+      isScalar = true;
+      break;
+    }
+  }
+  const attrs = { ...node.attrs };
+  if (!isScalar) {
+    const result = { ...attrs, ...value };
+    return Object.keys(result).length ? result : '';
+  }
+  return Object.keys(attrs).length ? { ...attrs, value: value.trim() } : value.trim();
+}
+
+const BOOLEAN_VALUES = ['true', '1', 'false', '0'];
+const PHP_NUMERIC = /^[ \t\n\r\v\f]*[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?[ \t\n\r\v\f]*$/;
+
+/** Magento\Framework\ObjectManager\Helper\SortItems (single level): stable, by (int) sortOrder. */
+function sortArrayItems(items) {
+  const list = [...items.values()];
+  if (!list.some(i => i && typeof i === 'object' && i.sortOrder !== undefined)) return list;
+  return list.map((item, index) => ({ item, index, order: phpIntCast(item?.sortOrder ?? 0) }))
+    .sort((a, b) => a.order - b.order || a.index - b.index).map(x => x.item);
+}
+
+/** Data\Argument\Interpreter\Composite and the interpreters it dispatches to. */
+function evaluateArgument(data, node) {
+  if (!data || typeof data !== 'object' || data['xsi:type'] === undefined) {
+    throw new MagentoException('InvalidArgumentException', 'Value for key "xsi:type" is missing in the argument data.', node);
+  }
+  const type = data['xsi:type'];
+  const has = k => data[k] !== undefined && data[k] !== null;
+  switch (type) {
+    case 'boolean':
+      if (!has('value')) throw new MagentoException('InvalidArgumentException', 'Boolean value is missing.', node);
+      if (!BOOLEAN_VALUES.includes(data.value)) throw new MagentoException('InvalidArgumentException', BOOLEAN_UTILS_MESSAGE, node);
+      return;
+    case 'string':
+      if (has('value') && typeof data.value !== 'string') throw new MagentoException('InvalidArgumentException', 'String value is expected.', node);
+      return;
+    case 'number':
+      if (!has('value') || typeof data.value !== 'string' || !PHP_NUMERIC.test(data.value)) {
+        throw new MagentoException('InvalidArgumentException', 'Numeric value is expected.', node);
+      }
+      return;
+    case 'null':
+      return;
+    case 'object':
+      if (!has('value')) throw new MagentoException('Exception', 'Warning: Undefined array key "value"', node);
+      if (has('shared') && !BOOLEAN_VALUES.includes(data.shared)) throw new MagentoException('InvalidArgumentException', BOOLEAN_UTILS_MESSAGE, node);
+      return;
+    case 'const':
+    case 'init_parameter':
+      if (!has('value')) throw new MagentoException('InvalidArgumentException', 'Constant name is expected.', node);
+      return;                                                   // defined() — native check only
+    case 'array': {
+      const items = data.item ?? new Map();
+      if (!(items instanceof Map)) throw new MagentoException('InvalidArgumentException', 'Array items are expected.', node);
+      for (const item of sortArrayItems(items)) evaluateArgument(item, node);
+      return;
+    }
+    default:
+      throw new MagentoException('InvalidArgumentException', `Argument interpreter named '${type}' has not been defined.`, node);
+  }
+}
+
+/** PHP's (int) cast of a string: leading whitespace, numeric prefix (exponent included), truncated. */
+export function phpIntCast(value) {
+  const m = /^[ \t\n\r\v\f]*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)/.exec(String(value));
+  return m ? Math.trunc(Number(m[1])) : 0;
+}
+
+const nullAttributeMessage = (converter) =>
+  `Warning: Attempt to read property "nodeValue" on null in ${converter} (Magento's ErrorHandler throws it as an exception)`;
+
+/**
+ * Checks a well-formed di.xml / events.xml the way Magento's converters read it
+ * (ObjectManager\Config\Mapper\Dom, Event\Config\Converter). Returns [{ severity, line, message }]:
+ * 'error' — Magento throws in every mode; 'warning' — loads, but not as written. Schema (XSD)
+ * validation, which only runs in developer mode, is not reproduced here — the native check does it.
+ */
+export function checkConfigValues(content, relPath) {
+  const root = parseXml(String(content ?? '')).children[0];
+  return root ? checkConfigTree(root, /(^|\/)events\.xml$/.test(relPath || '')).map(({ node, ...p }) => p) : [];
+}
+
+/** checkConfigValues on a parsed root element — a file's, or an area's merged one (mergeConfigFiles). */
+function checkConfigTree(root, isEvents) {
+  const out = [];
+  const add = (severity, node, message) => out.push({ severity, line: node.line || 0, file: node.file, message, node });
+  const label = n => (n.attrs.name ? `<${n.name} name="${n.attrs.name}">` : `<${n.name}>`);
+  const BOOLEAN = ['true', '1', 'false', '0'];
+  if (isEvents) {
+    const CONVERTER = 'Magento\\Framework\\Event\\Config\\Converter';
+    for (const ev of walk(root)) {
+      if (ev.name !== 'event') continue;
+      if (ev.attrs.name === undefined) add('error', ev, `<event> without name: ${nullAttributeMessage(CONVERTER)}`);
+      for (const o of ev.children.filter(c => c.name === 'observer')) {
+        if (o.attrs.name === undefined) { add('error', o, "<observer> without name: InvalidArgumentException 'Attribute name is missed'"); continue; }
+        if (o.attrs.disabled !== undefined && o.attrs.disabled !== 'true' && o.attrs.disabled !== 'false') {
+          add('warning', o, `${label(o)} disabled="${o.attrs.disabled}" does not disable the observer — ${CONVERTER} disables only on disabled="true"`);
+        }
+        if (o.attrs.shared !== undefined && o.attrs.shared !== 'true' && o.attrs.shared !== 'false') {
+          add('warning', o, `${label(o)} shared="${o.attrs.shared}" is ignored — ${CONVERTER} reads only shared="false"`);
+        }
+      }
+    }
+    return out;
+  }
+  const MAPPER = 'Magento\\Framework\\ObjectManager\\Config\\Mapper\\Dom';
+  const thrown = (e, node, where) => {
+    if (!(e instanceof MagentoException)) throw e;
+    add('error', e.node || node, `${where}: ${e.cls} '${e.message}'`);
+  };
+  // Mapper\Dom::convert() order: direct children of <config>; per type shared, then its children in
+  // order, then its name; per plugin disabled, then its name; per argument its name, then Flat, then
+  // the interpreters.
+  for (const node of root.children) {
+    if (node.name === 'preference') {
+      if (node.attrs.for === undefined || node.attrs.type === undefined) {
+        add('error', node, `<preference> without ${node.attrs.for === undefined ? 'for' : 'type'}: ${nullAttributeMessage(MAPPER)}`);
+      }
+      continue;
+    }
+    if (node.name !== 'type' && node.name !== 'virtualType') {
+      add('error', node, `Exception 'Invalid application config. Unknown node: ${node.name}.'`);
+      continue;
+    }
+    if (node.attrs.shared !== undefined && !BOOLEAN.includes(node.attrs.shared)) {
+      add('error', node, `${label(node)} shared="${node.attrs.shared}": InvalidArgumentException '${BOOLEAN_UTILS_MESSAGE}'`);
+    }
+    for (const child of node.children) {
+      if (child.name === 'arguments') {
+        for (const arg of child.children) {
+          if (arg.attrs.name === undefined) {
+            add('error', arg, `<${arg.name}> without name in ${label(node)}: ${nullAttributeMessage(MAPPER)}`);
+            continue;
+          }
+          const where = `${label(node)} argument "${arg.attrs.name}"`;
+          try {
+            const dropped = [];
+            const data = flatConvert(arg, 'argument', (n, count, text) => dropped.push({ n, count, text }));
+            for (const d of dropped) {
+              add('warning', d.n, `${where}: text "${d.text.slice(0, 40)}" next to ${d.count} child element(s) — Magento's Config\\Converter\\Dom\\Flat reads the text as the value and drops the elements`);
+            }
+            evaluateArgument(data, arg);
+          } catch (e) {
+            thrown(e, arg, where);
+          }
+        }
+      } else if (child.name === 'plugin') {
+        const a = child.attrs;
+        if (a.sortOrder !== undefined && !/^[+-]?\d+$/.test(a.sortOrder)) {
+          add('warning', child, `${label(child)} sortOrder="${a.sortOrder}" is read as (int) ${phpIntCast(a.sortOrder)}`);
+        }
+        if (a.disabled !== undefined && !BOOLEAN.includes(a.disabled)) {
+          add('error', child, `${label(child)} disabled="${a.disabled}": InvalidArgumentException '${BOOLEAN_UTILS_MESSAGE}'`);
+        }
+        if (a.name === undefined) add('error', child, `<plugin> without name in ${label(node)}: ${nullAttributeMessage(MAPPER)}`);
+      } else {
+        add('error', child, `Exception 'Invalid application config. Unknown node: ${child.name}.'`);
+      }
+    }
+    if (node.attrs.name === undefined) add('error', node, `<${node.name}> without name: ${nullAttributeMessage(MAPPER)}`);
+  }
+  return out;
+}
+
+// ─── Config\Dom merge ───────────────────────────────────────────
+// Magento reads an area's di.xml / events.xml as one document: Config\Reader\Filesystem::_readFiles()
+// loads the first file into Config\Dom and merges the next ones into it, then converts the result. A
+// value one file leaves out can come from another (an argument's xsi:type, a plugin's type), so a file
+// that fails alone can load, and two files that load alone can fail together.
+
+/** idAttributes and typeAttributeName of ObjectManager\Config\Reader\Dom and Event\Config\Reader. */
+export const CONFIG_MERGE = {
+  di: {
+    idAttributes: [
+      ['/config/preference', 'for'],
+      ['/config/(type|virtualType)', 'name'],
+      ['/config/(type|virtualType)/plugin', 'name'],
+      ['/config/(type|virtualType)/arguments/argument', 'name'],
+      ['/config/(type|virtualType)/arguments/argument(/item)+', 'name'],
+    ],
+    typeAttribute: 'xsi:type',
+  },
+  events: {
+    idAttributes: [['/config/event', 'name'], ['/config/event/observer', 'name']],
+    typeAttribute: null,
+  },
+};
+
+/** An exception Config\Dom throws while merging; Magento fails the whole area with it. */
+export class ConfigMergeError extends Error {
+  constructor(message, file) { super(message); this.file = file; }
+}
+
+/**
+ * `$element->nodeValue = $value` in Config\Dom: libxml (xmlStringGetNodeList) reads the string as
+ * content — "&" starts a reference: a predefined entity or character reference becomes text, another
+ * name an entity reference node; without a ";" after it PHP warns "unterminated entity reference",
+ * which Magento's ErrorHandler throws. Returns the warning, or null.
+ */
+const setElementValue = (n, value) => {
+  const seq = [];
+  let buf = '';
+  for (let i = 0; i < value.length;) {
+    const amp = value.indexOf('&', i);
+    if (amp < 0) { buf += value.slice(i); break; }
+    buf += value.slice(i, amp);
+    if (value[amp + 1] === '#') {
+      const hex = value[amp + 2] === 'x';
+      let j = amp + (hex ? 3 : 2), code = 0;
+      for (; j < value.length && value[j] !== ';'; j++) {
+        const d = hex ? parseInt(value[j], 16) : (value[j] >= '0' && value[j] <= '9' ? Number(value[j]) : NaN);
+        if (Number.isNaN(d)) return `${hex ? 'invalid hexadecimal' : 'invalid decimal'} character value`;
+        code = code * (hex ? 16 : 10) + d;
+      }
+      if (j >= value.length) return `${hex ? 'invalid hexadecimal' : 'invalid decimal'} character value`;
+      if (code) buf += String.fromCodePoint(code);
+      i = j + 1;
+      continue;
+    }
+    const semi = value.indexOf(';', amp + 1);
+    if (semi < 0) return `unterminated entity reference ${value.slice(amp + 1).padStart(15)}`;   // libxml: "%15s"
+    const name = value.slice(amp + 1, semi);
+    if (ENTITIES[name] !== undefined) buf += ENTITIES[name];
+    else if (name) { if (buf) seq.push({ text: buf }); buf = ''; seq.push({ entref: name }); }
+    i = semi + 1;
+  }
+  if (buf) seq.push({ text: buf });
+  n.children = [];
+  n.seq = seq;
+  n.text = seq.map(e => e.text ?? '').join('');
+  return null;
+};
+const isTextNode = n => n.seq.length === 1 && (n.seq[0].text !== undefined || n.seq[0].cdata !== undefined);  // DOMCdataSection is a DOMText
+const isCdataNode = n => !n.seq.some(e => e.node);
+// NodePathMatcher::simplifyXpath(): predicates out, then "/prefix:" → "/"
+const simplifyXpath = p => (p.includes('[') || p.includes(':') ? p.replace(/\[@[^\]]+?\]/g, '').replace(/\/[^:]+?:/g, '/') : p);
+
+/**
+ * Config\Dom::merge() over files in Magento's order ({ file, content }, all well-formed), the first one
+ * the base. Returns the merged root element; nodes keep the file and line they came from. Throws
+ * ConfigMergeError where Config\Dom throws ("More than one node matching the query").
+ */
+export function mergeConfigFiles(files, { idAttributes, typeAttribute }) {
+  const patterns = idAttributes.map(([p, a]) => [new RegExp(`^${p}$`), a]);
+  const idCache = new Map();                 // simplified path → id attribute (or null)
+  const idAttributeOf = p => {
+    const simple = simplifyXpath(p);
+    if (!idCache.has(simple)) idCache.set(simple, (patterns.find(([re]) => re.test(simple)) || [])[1] || null);
+    return idCache.get(simple);
+  };
+  const doc = { name: '#document', attrs: {}, children: [], text: '', seq: [] };
+  let file = null;
+  // _getMatchedNode(): DOMXPath::query of the path _getNodePathByParent() builds. A node's children are
+  // reached only through a parent whose own path matched exactly one node (more throws), so the query
+  // is the parent's children with that name and id value. They are indexed per parent by (name, id
+  // attribute) → value → nodes in document order, and the index follows every append, replace and
+  // attribute merge (a scan per query was quadratic: ~270 ms for the global DI area of 300 modules).
+  const index = new WeakMap();               // parent → Map(`${name}\0${attr}`) → { name, attr, byValue }
+  const parentOf = new WeakMap();
+  const valueOf = (entry, c) => (entry.attr ? c.attrs[entry.attr] : '');
+  const indexAdd = (p, c) => {
+    parentOf.set(c, p);
+    for (const entry of (index.get(p) || new Map()).values()) {
+      if (c.name !== entry.name) continue;
+      const v = valueOf(entry, c);
+      if (v === undefined) continue;
+      if (!entry.byValue.has(v)) entry.byValue.set(v, []);
+      const list = entry.byValue.get(v);
+      if (p.children[p.children.length - 1] === c) { list.push(c); continue; }   // appended
+      const at = p.children.indexOf(c);       // a replaced node keeps its place
+      let k = list.length;
+      while (k > 0 && p.children.indexOf(list[k - 1]) > at) k--;
+      list.splice(k, 0, c);
+    }
+  };
+  const indexRemove = (p, c) => {
+    for (const entry of (index.get(p) || new Map()).values()) {
+      if (c.name !== entry.name) continue;
+      for (const [v, list] of entry.byValue) {
+        const k = list.indexOf(c);
+        if (k >= 0) { list.splice(k, 1); if (!list.length) entry.byValue.delete(v); }
+      }
+    }
+  };
+  const childrenMatching = (p, name, attr, value) => {
+    if (!index.has(p)) index.set(p, new Map());
+    const key = `${name}\0${attr || ''}`;
+    let entry = index.get(p).get(key);
+    if (!entry) {
+      entry = { name, attr, byValue: new Map() };
+      for (const c of p.children) {
+        parentOf.set(c, p);
+        if (c.name !== name) continue;
+        const v = valueOf(entry, c);
+        if (v === undefined) continue;
+        if (!entry.byValue.has(v)) entry.byValue.set(v, []);
+        entry.byValue.get(v).push(c);
+      }
+      index.get(p).set(key, entry);
+    }
+    return entry.byValue.get(attr ? value : '') || [];
+  };
+  // A node another file changed (an attribute, the value): `from` lists every file it holds data of,
+  // so an exception of the merged configuration names all of them (mergedConfigErrors)
+  const contributed = n => (n.from ||= new Set([n.file])).add(file.file);
+  // Nodes of a merged file are moved, not copied (importNode): each file is parsed for this merge only
+  const mergeNode = (node, parent, parentPath) => {
+    let xpath = `${parentPath}/${node.name}`;
+    const attr = idAttributeOf(xpath);
+    const value = attr ? node.attrs[attr] : undefined;
+    const keyed = value !== undefined && value !== '' && value !== '0';     // PHP: ($value = getAttribute()) is truthy
+    if (keyed) xpath += `[@${attr}='${value}']`;
+    // An apostrophe ends the XPath literal: DOMXPath::query() warns, and Magento's ErrorHandler throws
+    if (keyed && value.includes("'")) throw new ConfigMergeError('Warning: DOMXPath::query(): Invalid predicate', file.file);
+    const found = childrenMatching(parent, node.name, keyed ? attr : null, value);
+    if (found.length > 1) throw new ConfigMergeError(`More than one node matching the query: ${xpath}`, file.file);
+    const matched = found[0] || null;
+    if (!matched) {
+      if (parent === doc) throw new ConfigMergeError(`the root element <${node.name}> differs from the first file's`, file.file);
+      parent.children.push(node);
+      parent.seq.push({ node });
+      indexAdd(parent, node);
+      return;
+    }
+    if (typeAttribute && node.attrs[typeAttribute] !== undefined && matched.attrs[typeAttribute] !== undefined &&
+      node.attrs[typeAttribute] !== matched.attrs[typeAttribute]) {          // another type: the node replaces the old one
+      indexRemove(parent, matched);
+      parent.children[parent.children.indexOf(matched)] = node;
+      parent.seq[parent.seq.findIndex(e => e.node === matched)] = { node };
+      indexAdd(parent, node);
+      return;
+    }
+    // _mergeAttributes(); the parent's index follows only when an attribute it is keyed by changes
+    const keyedBy = index.get(parent);
+    const reindex = keyedBy && [...keyedBy.values()].some(e => e.attr && e.name === matched.name &&
+      node.attrs[e.attr] !== undefined && matched.attrs[e.attr] !== node.attrs[e.attr]);
+    if (reindex) indexRemove(parent, matched);
+    const changed = Object.entries(node.attrs).some(([k, v]) => matched.attrs[k] !== v);
+    Object.assign(matched.attrs, node.attrs);
+    if (changed) contributed(matched);
+    if (reindex) indexAdd(parent, matched);
+    if (!node.seq.length) return;
+    const setValue = v => {
+      const warning = setElementValue(matched, v);
+      index.delete(matched);
+      if (warning) throw new ConfigMergeError(`Warning: Magento\\Framework\\Config\\Dom::_mergeNode(): ${warning}`, file.file);
+      contributed(matched);
+    };
+    if (isTextNode(node)) {
+      if (!matched.seq.length || isTextNode(matched) || isCdataNode(matched)) setValue(node.seq[0].text ?? node.seq[0].cdata);
+    } else if (isCdataNode(node) && isTextNode(matched)) {
+      const cdata = node.seq.find(e => e.cdata !== undefined);
+      if (cdata) setValue(cdata.cdata);
+    } else if (isCdataNode(node) && isCdataNode(matched)) {
+      const from = node.seq.find(e => e.cdata !== undefined);
+      const to = matched.seq.find(e => e.cdata !== undefined);
+      if (from && to) { to.cdata = from.cdata; matched.text = matched.seq.map(e => e.text ?? e.cdata ?? '').join(''); contributed(matched); }
+    } else {
+      for (const e of node.seq) if (e.node) mergeNode(e.node, matched, xpath);
+    }
+  };
+  for (const f of files) {
+    const root = parseXml(f.content).children[0];
+    if (!root) continue;
+    for (const n of [root, ...walk(root)]) n.file = f.file;
+    file = f;
+    if (!doc.children.length) { doc.children.push(root); doc.seq.push({ node: root }); continue; }
+    mergeNode(root, doc, '');
+  }
+  return doc.children[0] || null;
+}
+
+/**
+ * An area's configuration as Magento loads it: the files merged (mergeConfigFiles), then converted
+ * (checkConfigTree, Mapper\Dom / Event\Config\Converter order). Returns { merged, errors }: every
+ * exception of the merged configuration, in that order — [] when the area loads; Magento stops at the
+ * first, the others show once it is fixed — each with the file of the node it comes from (`file`) and
+ * every file that holds data of that node or of the nodes under it (`files`). A merge
+ * exception (Config\Dom) stops the merge itself: merged false, errors [that one].
+ */
+export function mergedConfigErrors(files, kind) {
+  let root;
+  try {
+    root = mergeConfigFiles(files, CONFIG_MERGE[kind]);
+  } catch (e) {
+    if (e instanceof ConfigMergeError) return { merged: false, errors: [{ message: `LocalizedException '${e.message}'`, file: e.file, line: 0 }] };
+    throw e;
+  }
+  const errors = root ? checkConfigTree(root, kind === 'events').filter(p => p.severity === 'error') : [];
+  // the files of the failing node and of everything under it: what the converter read
+  const filesOf = n => [...new Set([n, ...walk(n)].flatMap(x => (x.from ? [...x.from] : [x.file])))];
+  return { merged: true, errors: errors.map(p => ({ message: p.message, file: p.file, line: p.line, files: filesOf(p.node) })) };
+}
+
+/** The exception Magento stops at when it loads the area — { message, file, line } — or null. */
+export function checkMergedConfig(files, kind) {
+  return mergedConfigErrors(files, kind).errors[0] || null;
 }
