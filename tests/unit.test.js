@@ -21,6 +21,9 @@ import { modelDownloadDir, downloadFile } from '../src/model.js';
 import { binaryVersion, acceptPathBinary } from '../src/binary.js';
 import { extractJson } from '../src/cli-json.js';
 import { mcpServerEnv } from '../src/init.js';
+import { serializeScan, deserializeScan, checkSnapshot, loadSnapshot, writeSnapshot, snapshotPathFor, scanLockPathFor, acquireScanLock, releaseScanLock, scanLockHolder, waitForScanLock, fileStampOf, SNAPSHOT_FORMAT } from '../src/php-scan-snapshot.js';
+import { spawn as spawnChild } from 'child_process';
+import { statSync } from 'fs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -4623,6 +4626,92 @@ function testToolCountIncludesTraceConfig() {
   assert(toolNames.size >= 46, 'toolCount: at least 46 unique tool names');
 }
 
+// ─── PHP scan snapshot (shared between MCP instances of one root) ───
+
+async function testPhpScanSnapshot() {
+  console.log('\n-- PHP scan snapshot --');
+  const root = path.join(__dirname, 'tmp_php_scan_snapshot');
+  rmSync(root, { recursive: true, force: true });
+  mkdirSync(path.join(root, 'app'), { recursive: true });
+  const put = (rel, body) => writeFileSync(path.join(root, rel), body);
+  put('app/Child.php', '<?php class Child extends Base {}');
+  put('app/Plain.php', '<?php class Plain {}');
+  put('app/Gone.php', '<?php class Gone {}');
+  const stamp = rel => fileStampOf(path.join(root, rel));
+  const scan = {
+    stamps: new Map(['app/Child.php', 'app/Plain.php', 'app/Gone.php'].map(r => [r, stamp(r)])),
+    typeFiles: new Set(['app/Child.php']),
+    dispatchFiles: new Map(),
+    dispatchSites: [{ file: 'app/Child.php', line: 3, arg: "'x'" }],
+    traitUsers: new Map([['t', ['Child']]]),
+    hierarchy: { types: new Map([['child', { fqcn: 'Child', file: 'app/Child.php' }]]), children: new Map([['base', [{ child: 'Child', relation: 'extends' }]]]) },
+  };
+  try {
+    const meta = { root, version: '9.9.9' };
+    const back = deserializeScan(serializeScan(scan, meta), meta);
+    assert(back && back.hierarchy.types.get('child')?.fqcn === 'Child', 'snapshot: types survive the round trip (Map)');
+    assertEq(back?.hierarchy.children.get('base')?.[0]?.child, 'Child', 'snapshot: children survive the round trip');
+    assert(back?.typeFiles instanceof Set && back.typeFiles.has('app/Child.php'), 'snapshot: typeFiles come back as a Set');
+    assertEq(back?.stamps.get('app/Plain.php'), stamp('app/Plain.php'), 'snapshot: stamps come back as a Map');
+    assertEq(back?.dispatchSites.length, 1, 'snapshot: dispatch sites survive the round trip');
+    assertEq(deserializeScan(serializeScan(scan, meta), { root, version: '9.9.8' }), null, 'snapshot: another magector version is not read');
+    assertEq(deserializeScan(serializeScan(scan, meta), { root: root + 'x', version: '9.9.9' }), null, 'snapshot: another root is not read');
+    assertEq(deserializeScan(JSON.stringify({ format: SNAPSHOT_FORMAT + 1, root, version: '9.9.9' }), meta), null, 'snapshot: another format is not read');
+    assertEq(deserializeScan('{broken', meta), null, 'snapshot: a broken file is not read');
+
+    let c = checkSnapshot(root, back);
+    assert(!c.staleTypeFile && c.changed.length === 0 && c.deleted.length === 0, 'snapshot: unchanged tree — usable, nothing to read again');
+    put('app/Plain.php', '<?php class Plain extends Base {}');
+    rmSync(path.join(root, 'app/Gone.php'));
+    c = checkSnapshot(root, back);
+    assert(!c.staleTypeFile, 'snapshot: a changed file without classes with parents keeps it usable');
+    assert(c.changed.includes('app/Plain.php'), 'snapshot: … the changed file is listed to be read again');
+    assert(c.deleted.includes('app/Gone.php'), 'snapshot: a deleted file without classes is listed as deleted');
+    put('app/Child.php', '<?php class Child extends OtherBase {}');
+    c = checkSnapshot(root, back);
+    assertEq(c.staleTypeFile, 'app/Child.php', 'snapshot: a changed file with classes makes it unusable');
+
+    assertEq(loadSnapshot(root, '9.9.9').reason, 'no snapshot', 'load: no file — reason given');
+    assert(writeSnapshot(root, scan, '9.9.9'), 'write: snapshot written');
+    assertEq(statSync(snapshotPathFor(root)).mode & 0o777, 0o600, 'write: snapshot readable by the owner only (0600)');
+    assert(!readdirSync(path.join(root, '.magector')).some(f => f.endsWith('.tmp')), 'write: no temp file left');
+    assert(/changed since the snapshot: app\/Child\.php/.test(loadSnapshot(root, '9.9.9').reason || ''), 'load: stale class file — reason names it');
+    scan.stamps.set('app/Child.php', stamp('app/Child.php'));
+    scan.stamps.set('app/Plain.php', stamp('app/Plain.php'));
+    writeSnapshot(root, scan, '9.9.9');
+    const loaded = loadSnapshot(root, '9.9.9');
+    assert(loaded.scan && loaded.deleted.includes('app/Gone.php'), 'load: usable snapshot — scan and the deleted file');
+    assert(/another format, version or root/.test(loadSnapshot(root, '1.0.0').reason || ''), 'load: other version — reason given');
+
+    // the lock: one scanner per root, a dead holder does not block, a live one does
+    assert(acquireScanLock(root), 'lock: free — acquired');
+    assertEq(scanLockHolder(root), process.pid, 'lock: holder is this process');
+    assert(acquireScanLock(root), 'lock: already ours — acquired again');
+    releaseScanLock(root);
+    assert(!existsSync(scanLockPathFor(root)), 'lock: released — file removed');
+    writeFileSync(scanLockPathFor(root), '999999999');
+    assertEq(scanLockHolder(root), null, 'lock: a dead holder is no holder');
+    assert(acquireScanLock(root), 'lock: left by a dead process — taken over');
+    releaseScanLock(root);
+    const other = spawnChild(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });
+    try {
+      writeFileSync(scanLockPathFor(root), String(other.pid));
+      assert(!acquireScanLock(root), 'lock: held by a live process — not acquired');
+      releaseScanLock(root);
+      assert(existsSync(scanLockPathFor(root)), "lock: release does not remove another process's lock");
+      const t0 = Date.now();
+      assert(!(await waitForScanLock(root, 300, 50)), 'wait: a live holder — gives up after maxMs');
+      assert(Date.now() - t0 >= 250, 'wait: … after waiting');
+      setTimeout(() => other.kill(), 200);
+      assert(await waitForScanLock(root, 5000, 50), 'wait: the holder exits — wait ends');
+    } finally {
+      try { other.kill(); } catch {}
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   console.log('╔═══════════════════════════════════════════════════════════╗');
   console.log('║            MAGECTOR UNIT TESTS                          ║');
@@ -4678,6 +4767,7 @@ async function main() {
   testFormatSearchResultsTruncation();
   await testPluginMethodBodies();
   await testDiXmlSessionCache();
+  await testPhpScanSnapshot();
   await testFindPluginPartialMatch();
   await testFindObserverEventsXml();
   testServePidVersion();
