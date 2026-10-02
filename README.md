@@ -358,6 +358,7 @@ The `describe` command and `magento_describe` MCP tool require an Anthropic API 
 | `MAGECTOR_FILE_LIST_TTL_MS` | How long the list of the modules' `etc/` files is reused before it is listed again (files added mid-session show up after this); also how often composer's PSR-4 map and classmap are checked for a `composer dump-autoload`. Modules themselves are rediscovered as soon as `app/etc/config.php` or the composer registrations change. `0`: always fresh. | `2000` |
 | `MAGECTOR_PHP_LIST_TTL_MS` | How long the list of all PHP files (event dispatchers) is reused before the tree is walked again. | `30000` |
 | `MAGECTOR_AUTO_INDEX` | `0`: the MCP server never starts an index (none, or an incompatible one) — for CI and agent jobs that bring their own index. The structural tools work without one; semantic search reports it is missing. | `1` (index in the background) |
+| `MAGECTOR_PREWARM_PHP` | `1`: read the PHP class hierarchy and the event dispatch sites in the background after the MCP server starts, so `find_event_dispatchers` and `find_implementors` answer in milliseconds; `0`: never — their first call reads the tree (seconds on a large project). Unset: on, except with `MAGECTOR_AUTO_INDEX=0`, which keeps background CPU off. | on (off with `MAGECTOR_AUTO_INDEX=0`) |
 | `ANTHROPIC_API_KEY` | API key for description generation (`describe` command) | — |
 
 These defaults apply to the Node.js CLI and the MCP server. The Rust core's own `-d` flag (see above) defaults to `./.magector/index.db` in its working directory.

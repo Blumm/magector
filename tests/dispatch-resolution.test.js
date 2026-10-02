@@ -297,7 +297,31 @@ async function main() {
     await cc.stop();
   }
 
-  // ── 8. Mid-session changes ──────────────────────────────────────
+  // ── 8. The background read and MAGECTOR_AUTO_INDEX=0 ───────────
+  // A CI or agent job sets MAGECTOR_AUTO_INDEX=0 to keep background CPU off: no background PHP read
+  // either, unless MAGECTOR_PREWARM_PHP=1 asks for it.
+  const pw = mkdtempSync(path.join(os.tmpdir(), 'magector-dr-prewarm-'));
+  cpSync(FIXTURE, pw, { recursive: true });
+  rmSync(path.join(pw, '.magector'), { recursive: true, force: true });
+  const logOf = () => { try { return readFileSync(path.join(pw, '.magector', 'magector.log'), 'utf-8'); } catch { return ''; } };
+  const waitFor = async (pred, ms) => { const t0 = Date.now(); while (!pred() && Date.now() - t0 < ms) await new Promise(r => setTimeout(r, 200)); return pred(); };
+  try {
+    const off = new McpClient(pw, { MAGECTOR_PREWARM_PHP: '' });         // unset; MAGECTOR_AUTO_INDEX=0
+    await off.start();
+    await new Promise(r => setTimeout(r, 3500));                          // the read would start after 1.5 s
+    await off.stop();
+    ok('F10: MAGECTOR_AUTO_INDEX=0 and MAGECTOR_PREWARM_PHP unset — no background PHP read (was: read anyway)', !/PHP scan:/.test(logOf()) && /PHP prewarm skipped/.test(logOf()));
+    rmSync(path.join(pw, '.magector'), { recursive: true, force: true });
+    const on = new McpClient(pw, { MAGECTOR_PREWARM_PHP: '1' });
+    await on.start();
+    const warmed = await waitFor(() => /PHP scan and dispatch sites prewarmed/.test(logOf()), 15000);
+    await on.stop();
+    ok('F10: … MAGECTOR_PREWARM_PHP=1 turns it on', warmed);
+  } finally {
+    rmSync(pw, { recursive: true, force: true });
+  }
+
+  // ── 9. Mid-session changes ──────────────────────────────────────
   const live = mkdtempSync(path.join(os.tmpdir(), 'magector-dr-live-'));
   cpSync(FIXTURE, live, { recursive: true });
   const lc = new McpClient(live, { MAGECTOR_PHP_LIST_TTL_MS: '0', MAGECTOR_FILE_LIST_TTL_MS: '0' });

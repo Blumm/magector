@@ -9256,8 +9256,14 @@ async function main() {
   console.error('Magector MCP server connected (warming up...)');
 
   // The class hierarchy and the dispatch sites (find_event_dispatchers, find_implementors) take seconds
-  // to read on a large tree: prepared in the background, in slices, so requests in the meantime run
-  if (config.magentoRoot && process.env.MAGECTOR_PREWARM_PHP !== '0') {
+  // to read on a large tree: prepared in the background, in slices, so requests in the meantime run.
+  // MAGECTOR_PREWARM_PHP=1 always, =0 never; unset, only when the server may index on its own: a CI or
+  // agent job sets MAGECTOR_AUTO_INDEX=0 to keep background CPU off, and the first call reads the tree then.
+  const prewarmPhp = process.env.MAGECTOR_PREWARM_PHP === '1' || (process.env.MAGECTOR_PREWARM_PHP !== '0' && config.autoIndex);
+  if (config.magentoRoot && !prewarmPhp) {
+    logToFile('INFO', `PHP prewarm skipped (${process.env.MAGECTOR_PREWARM_PHP === '0' ? 'MAGECTOR_PREWARM_PHP=0' : 'MAGECTOR_AUTO_INDEX=0; MAGECTOR_PREWARM_PHP=1 turns it on'})`);
+  }
+  if (config.magentoRoot && prewarmPhp) {
     setTimeout(() => {
       const t0 = Date.now();
       prewarmDispatchSites(config.magentoRoot)
