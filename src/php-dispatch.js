@@ -426,19 +426,27 @@ export function createDispatchResolver({ typeOf, diStringArgs = () => [] }) {
     return [WILD];
   }
 
-  /** `$name` in the method before the call: every assignment there (a branch or a loop: all of them). */
+  /**
+   * `$name` in the method before the call: every assignment there (a branch or a loop: all of them),
+   * and `.=` appends to what it held — maybe in a branch, so the value without the suffix stays too.
+   */
   function localValues(name, ctx) {
-    const re = new RegExp(`\\$${name}\\s*=(?![=>])`, 'g');
-    const values = [];
-    let m, found = false;
+    const re = new RegExp(`\\$${name}\\s*(\\.?)=(?![=>])`, 'g');
+    const unset = () => unknown(ctx, (ctx.params || []).includes(name) ? `parameter $${name}` : `$${name}`);
+    let values = null;
+    let m;
     while ((m = re.exec(ctx.before || '')) !== null) {
-      found = true;
       const start = m.index + m[0].length;
       const end = expressionEnd(ctx.before, start, ';');
-      values.push(...evaluate(parseNameExpr(ctx.before.slice(start, end)), ctx));
+      const assigned = evaluate(parseNameExpr(ctx.before.slice(start, end)), ctx);
+      if (m[1] === '.') {
+        const base = values || unset();
+        values = [...new Set([...base, ...product([base, assigned])])];
+      } else {
+        values = [...new Set([...(values || []), ...assigned])];
+      }
     }
-    if (found) return [...new Set(values)];
-    return unknown(ctx, (ctx.params || []).includes(name) ? `parameter $${name}` : `$${name}`);
+    return values || unset();
   }
 
   /** The class a `self` / `static` / `parent` / named reference means in this context. */

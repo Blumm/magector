@@ -116,6 +116,9 @@ const expected = {
   acme_line_second: [at('app/code/Acme/Disp/Service/OneLine.php', 'acme_line_second'), null],
   acme_traitloud_save_after: [SAVE_AFTER, 'Acme\\Disp\\Model\\TraitLoud'],
   acme_ctorassigned_save_after: [SAVE_AFTER, 'Acme\\Disp\\Model\\CtorAssigned'],
+  // F6: `$name .= '_flagged'` in a branch — both names (was: only the one without the suffix)
+  acme_appended: [at('app/code/Acme/Disp/Service/Appended.php', 'dispatch('), null],
+  acme_appended_flagged: [at('app/code/Acme/Disp/Service/Appended.php', 'dispatch('), null],
 };
 // A value assigned in an ordinary method (not the constructor): PHP dispatches it only when that method
 // ran first — the site is listed under "Possible" for the class, naming the method (was: exact)

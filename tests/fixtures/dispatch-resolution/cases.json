@@ -195,5 +195,23 @@
     "ctor": [],
     "method": "afterSave",
     "em": "_eventManager"
+  },
+  {
+    "id": "F6 append, branch taken",
+    "class": "Acme\\Disp\\Service\\Appended",
+    "method": "run",
+    "args": [
+      true
+    ],
+    "em": "eventManager"
+  },
+  {
+    "id": "F6 append, branch not taken",
+    "class": "Acme\\Disp\\Service\\Appended",
+    "method": "run",
+    "args": [
+      false
+    ],
+    "em": "eventManager"
   }
 ]

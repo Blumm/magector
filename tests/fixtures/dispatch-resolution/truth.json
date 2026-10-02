@@ -93,6 +93,12 @@
         "F5 constructor assignment": [
             "acme_model_save_after",
             "acme_ctorassigned_save_after"
+        ],
+        "F6 append, branch taken": [
+            "acme_appended_flagged"
+        ],
+        "F6 append, branch not taken": [
+            "acme_appended"
         ]
     }
 }
