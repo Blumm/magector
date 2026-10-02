@@ -40,7 +40,7 @@ import {
   parseEventsXml, parseXml, areaFromPath, createAncestorResolver,
   buildModuleIndex, preferenceCascade, mergeNamedDeclarations, pluginDeclarationsOn,
   createMemberResolver, interceptionStatus, buildClassHierarchy, instancesOf, applyModuleOrder, parsePhpFile, qualifyPhpName,
-  checkXmlWellFormed, checkConfigValues, magentoInvalidXmlMessage, checkMergedConfig,
+  checkXmlWellFormed, checkConfigValues, magentoInvalidXmlMessage, mergedConfigErrors,
 } from './di-config.js';
 import {
   moduleConfigFiles, unreadModuleConfigFiles, buildWebapiModel, buildGraphqlModel, buildCronModel, buildDbSchemaModel,
@@ -8757,8 +8757,10 @@ const MERGED_LOADS_NOTE = 'Magento converts the merged configuration of the area
 const configAreaCache = new Map();            // `${root}|${kind}:${scope}` → { stamp, result, idx, checkedAt }
 /**
  * Built-in check of an area as Magento loads it: its files in Magento's order (configScopeFiles),
- * merged as Config\Dom merges them and converted (checkMergedConfig). { files, fileSet, error }:
- * error is the exception Magento stops at, or null when the area loads.
+ * merged as Config\Dom merges them and converted (mergedConfigErrors). { files, fileSet, error,
+ * failingFiles }: error is the exception Magento stops at, or null when the area loads; failingFiles
+ * the files any exception of the merged configuration comes from, null when it could not be merged
+ * (a file not well-formed, a merge exception).
  */
 function builtinAreaCheck(root, idx, kind, scope) {
   // Within MAGECTOR_FILE_LIST_TTL_MS the last answer stands (listing the area's files is ~3 ms per area)
@@ -8771,6 +8773,7 @@ function builtinAreaCheck(root, idx, kind, scope) {
   const stamp = files.map(f => { try { const st = statSync(path.join(root, f)); return `${f}:${st.mtimeMs}:${st.size}`; } catch { return `${f}:-`; } }).join('|');
   if (hit && hit.stamp === stamp) { hit.checkedAt = Date.now(); hit.idx = idx; return hit.result; }
   let error = null;
+  let failingFiles = null;
   const contents = [];
   for (const f of files) {
     let content;
@@ -8782,12 +8785,24 @@ function builtinAreaCheck(root, idx, kind, scope) {
     contents.push({ file: f, content });
   }
   if (!error) {
-    try { error = checkMergedConfig(contents, kind); } catch (e) { error = { message: `not checked: ${e.message}`, file: null, line: 0, unchecked: true }; }
+    try {
+      const merged = mergedConfigErrors(contents, kind);
+      error = merged.errors[0] || null;
+      if (merged.merged) failingFiles = new Set(merged.errors.flatMap(e => e.files));
+    } catch (e) {
+      error = { message: `not checked: ${e.message}`, file: null, line: 0, unchecked: true };
+    }
   }
-  const result = { files: files.length, fileSet: new Set(files), error };
+  const result = { files: files.length, fileSet: new Set(files), error, failingFiles };
   configAreaCache.set(key, { stamp, result, idx, checkedAt: Date.now() });
   return result;
 }
+
+/**
+ * A file whose converter exception the merged area does not raise: another file of the area sets what
+ * it leaves out or overrides it, so Magento loads it — also when the area fails for another file.
+ */
+const completedByArea = (area, rel) => area.fileSet.has(rel) && area.failingFiles !== null && !area.failingFiles.has(rel);
 
 function builtinConfigProblems(root, relPath) {
   const abs = path.join(root, relPath);
@@ -8963,7 +8978,7 @@ async function validateConfigText(root, { path: scope, engine = 'auto' }) {
       const enabled = idx.isEnabled(idx.moduleOf(rel)) !== false;
       for (const p of builtinConfigProblems(root, rel)) {
         if (p.severity === 'warning') { push('warning', rel, p.line, p.message); continue; }
-        if (p.source === 'convert' && read && enabled && read.fileSet.has(rel) && !read.error) {
+        if (p.source === 'convert' && read && enabled && completedByArea(read, rel)) {
           push('warning', rel, p.line, `${p.message}\n(${MERGED_LOADS_NOTE})`);
           continue;
         }
@@ -9035,7 +9050,7 @@ async function configProblemsNotice(root, answerText) {
       const loaded = !mod || idx.orderSource !== 'config.php' || idx.isEnabled(mod) === true;
       if (p.severity === 'error' && loaded && p.source === 'convert' && sc) {
         const a = area(sc);
-        if (!a.error && a.fileSet.has(rel)) {        // loads only because another file of the area completes it
+        if (completedByArea(a, rel)) {               // loads only because another file of the area completes it
           if (answerText.includes(rel)) misread.push(`${where} — ${first.trim()} (loads only merged with the area's other files)`);
           continue;
         }

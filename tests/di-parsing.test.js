@@ -17,7 +17,7 @@ import {
   applyModuleOrder, resolveInstance, resolveVirtualType, argumentInjectionsOf, parseEventsXml,
   parseConfigPhpModules, buildModuleIndex, effectivePluginDeclarations,
   checkXmlWellFormed, checkConfigValues, magentoInvalidXmlMessage, phpIntCast,
-  mergeConfigFiles, checkMergedConfig, CONFIG_MERGE, ConfigMergeError,
+  mergeConfigFiles, checkMergedConfig, mergedConfigErrors, CONFIG_MERGE, ConfigMergeError,
 } from '../src/di-config.js';
 
 let passed = 0;
@@ -322,6 +322,21 @@ eq('well-formedness as libxml: nested entities that amplify are an entity refere
   const ms = performance.now() - t0;
   eq(`parseXml: a "billion laughs" di.xml stays small and fast (${ms.toFixed(0)} ms, ${arg.text.length} characters)`, ms < 1000 && arg.text.length < 2_000_000, true);
   eq('parseXml: entities within the budget expand as libxml reads them', parseXml(entityDoc(2, 5, 'text')).children[0].children[0].children[0].children[0].text, 'x'.repeat(25));
+}
+// The exceptions of a merged area name every file the failing node holds data of: a file another file
+// completes loads even when the area fails for a third one (review of #33)
+{
+  const X = 'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"';
+  const area = mergedConfigErrors([
+    { file: 'good.xml', content: `<config ${X}><type name="L"><arguments><argument name="commands" xsi:type="array"><item name="a" xsi:type="string">A</item></argument></arguments></type><type name="N"><arguments><argument name="n" xsi:type="number">4</argument></arguments></type></config>` },
+    { file: 'completed.xml', content: `<config ${X}><type name="L"><arguments><argument name="commands"><item name="b" xsi:type="string">B</item></argument></arguments></type></config>` },
+    { file: 'value.xml', content: `<config ${X}><type name="N"><arguments><argument name="n">five</argument></arguments></type></config>` },
+    { file: 'other.xml', content: `<config ${X}><type name="U"><plugin name="p" type="P" disabled="yes"/></type></config>` },
+  ], 'di');
+  eq('merged area: each exception with the files of its node — the completed file is not among them', [area.merged, area.errors.map(e => [e.message.split(':')[0], e.files])], [true, [
+    ['<type name="N"> argument "n"', ['good.xml', 'value.xml']],          // the value comes from value.xml
+    ['<plugin name="p"> disabled="yes"', ['other.xml']],
+  ]]);
 }
 eq('well-formedness as libxml: a UTF-8 byte-order mark before the declaration is skipped',
   checkXmlWellFormed('\uFEFF<?xml version="1.0" encoding="UTF-8"?>\n<config/>\n'), []);

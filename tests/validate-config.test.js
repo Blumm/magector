@@ -114,6 +114,8 @@ const OFF = 'app/code/Acme/Off/etc/di.xml';
 // (merge-truth.php sets, Magento 2.4.5-p14): adminhtml loads, graphql fails ("Numeric value is
 // expected."), crontab fails ("More than one node matching the query") though both files load alone
 const MERGE_ADMIN = 'app/code/Acme/Merge/etc/adminhtml/di.xml';
+// Completed by Acme_Good in the global area, which fails for another file (Acme_Values) — review of #33
+const MERGE_GLOBAL = 'app/code/Acme/Merge/etc/di.xml';
 const MERGE_GRAPHQL = 'app/code/Acme/Merge/etc/graphql/di.xml';
 const VALUES_CRONTAB = 'app/code/Acme/Values/etc/crontab/di.xml';
 const MERGE_CRONTAB = 'app/code/Acme/Merge/etc/crontab/di.xml';
@@ -155,6 +157,10 @@ async function main() {
       has: [`- \`${MERGE_ADMIN}:6\``, 'Value for key "xsi:type" is missing in the argument data.', 'another file of it sets what this file leaves out'],
     });
     check('built-in: … and is not reported as failing', section(t, 'Fails in every mode'), { hasNot: [MERGE_ADMIN] });
+    check('built-in: … also when the area fails for another file — only the files the merged configuration fails for fail (was: every file of a failing area)', section(t, 'Loads, but not as written'), {
+      has: [`- \`${MERGE_GLOBAL}:7\``, 'Value for key "xsi:type" is missing in the argument data.', 'another file of it sets what this file leaves out'],
+    });
+    check('built-in: … the other file still fails, this one does not', section(t, 'Fails in every mode'), { has: [`- \`${VALUES_DI}:4\``], hasNot: [MERGE_GLOBAL] });
     check('built-in: merged, the other file\'s xsi:type="number" meets "five" — the area fails with Magento\'s message', section(t, 'Fails in every mode'), {
       has: [`- \`${MERGE_GRAPHQL}:6\``, '**DI configuration, area graphql**', "argument \"limit\": InvalidArgumentException 'Numeric value is expected.'"],
     });
@@ -176,7 +182,7 @@ async function main() {
     t = await builtin.call('magento_find_plugin', { targetClass: 'Acme\\Good\\Model\\Thing' });
     check('find_plugin: notice lists the rejected file of an enabled module', t, {
       has: ['**Magento rejects 3 configuration file(s)**', `\`${BROKEN}:5\` — Opening and ending tag mismatch: type line 3 and typ`, `\`${VALUES_DI}:4\``, `\`${MERGE_GRAPHQL}:6\``],
-      hasNot: [`\`${MERGE_ADMIN}`],
+      hasNot: [`\`${MERGE_ADMIN}`, `\`${MERGE_GLOBAL}`],
     });
     check('find_plugin: notice names areas whose merged configuration fails although each file loads alone', t, {
       has: ['**Magento fails to load the merged configuration of 2 area(s)**', "DI configuration, area crontab — LocalizedException 'More than one node matching the query"],

@@ -1585,13 +1585,13 @@ const nullAttributeMessage = (converter) =>
  */
 export function checkConfigValues(content, relPath) {
   const root = parseXml(String(content ?? '')).children[0];
-  return root ? checkConfigTree(root, /(^|\/)events\.xml$/.test(relPath || '')) : [];
+  return root ? checkConfigTree(root, /(^|\/)events\.xml$/.test(relPath || '')).map(({ node, ...p }) => p) : [];
 }
 
 /** checkConfigValues on a parsed root element — a file's, or an area's merged one (mergeConfigFiles). */
 function checkConfigTree(root, isEvents) {
   const out = [];
-  const add = (severity, node, message) => out.push({ severity, line: node.line || 0, file: node.file, message });
+  const add = (severity, node, message) => out.push({ severity, line: node.line || 0, file: node.file, message, node });
   const label = n => (n.attrs.name ? `<${n.name} name="${n.attrs.name}">` : `<${n.name}>`);
   const BOOLEAN = ['true', '1', 'false', '0'];
   if (isEvents) {
@@ -1808,6 +1808,9 @@ export function mergeConfigFiles(files, { idAttributes, typeAttribute }) {
     }
     return entry.byValue.get(attr ? value : '') || [];
   };
+  // A node another file changed (an attribute, the value): `from` lists every file it holds data of,
+  // so an exception of the merged configuration names all of them (mergedConfigErrors)
+  const contributed = n => (n.from ||= new Set([n.file])).add(file.file);
   // Nodes of a merged file are moved, not copied (importNode): each file is parsed for this merge only
   const mergeNode = (node, parent, parentPath) => {
     let xpath = `${parentPath}/${node.name}`;
@@ -1840,13 +1843,16 @@ export function mergeConfigFiles(files, { idAttributes, typeAttribute }) {
     const reindex = keyedBy && [...keyedBy.values()].some(e => e.attr && e.name === matched.name &&
       node.attrs[e.attr] !== undefined && matched.attrs[e.attr] !== node.attrs[e.attr]);
     if (reindex) indexRemove(parent, matched);
+    const changed = Object.entries(node.attrs).some(([k, v]) => matched.attrs[k] !== v);
     Object.assign(matched.attrs, node.attrs);
+    if (changed) contributed(matched);
     if (reindex) indexAdd(parent, matched);
     if (!node.seq.length) return;
     const setValue = v => {
       const warning = setElementValue(matched, v);
       index.delete(matched);
       if (warning) throw new ConfigMergeError(`Warning: Magento\\Framework\\Config\\Dom::_mergeNode(): ${warning}`, file.file);
+      contributed(matched);
     };
     if (isTextNode(node)) {
       if (!matched.seq.length || isTextNode(matched) || isCdataNode(matched)) setValue(node.seq[0].text ?? node.seq[0].cdata);
@@ -1856,7 +1862,7 @@ export function mergeConfigFiles(files, { idAttributes, typeAttribute }) {
     } else if (isCdataNode(node) && isCdataNode(matched)) {
       const from = node.seq.find(e => e.cdata !== undefined);
       const to = matched.seq.find(e => e.cdata !== undefined);
-      if (from && to) { to.cdata = from.cdata; matched.text = matched.seq.map(e => e.text ?? e.cdata ?? '').join(''); }
+      if (from && to) { to.cdata = from.cdata; matched.text = matched.seq.map(e => e.text ?? e.cdata ?? '').join(''); contributed(matched); }
     } else {
       for (const e of node.seq) if (e.node) mergeNode(e.node, matched, xpath);
     }
@@ -1874,17 +1880,27 @@ export function mergeConfigFiles(files, { idAttributes, typeAttribute }) {
 
 /**
  * An area's configuration as Magento loads it: the files merged (mergeConfigFiles), then converted
- * (checkConfigTree, Mapper\Dom / Event\Config\Converter order). Returns the exception Magento stops at
- * — { message, file, line } — or null when the area loads.
+ * (checkConfigTree, Mapper\Dom / Event\Config\Converter order). Returns { merged, errors }: every
+ * exception of the merged configuration, in that order — [] when the area loads; Magento stops at the
+ * first, the others show once it is fixed — each with the file of the node it comes from (`file`) and
+ * every file that holds data of that node or of the nodes under it (`files`). A merge
+ * exception (Config\Dom) stops the merge itself: merged false, errors [that one].
  */
-export function checkMergedConfig(files, kind) {
+export function mergedConfigErrors(files, kind) {
   let root;
   try {
     root = mergeConfigFiles(files, CONFIG_MERGE[kind]);
   } catch (e) {
-    if (e instanceof ConfigMergeError) return { message: `LocalizedException '${e.message}'`, file: e.file, line: 0 };
+    if (e instanceof ConfigMergeError) return { merged: false, errors: [{ message: `LocalizedException '${e.message}'`, file: e.file, line: 0 }] };
     throw e;
   }
-  const error = root ? checkConfigTree(root, kind === 'events').find(p => p.severity === 'error') : null;
-  return error ? { message: error.message, file: error.file, line: error.line } : null;
+  const errors = root ? checkConfigTree(root, kind === 'events').filter(p => p.severity === 'error') : [];
+  // the files of the failing node and of everything under it: what the converter read
+  const filesOf = n => [...new Set([n, ...walk(n)].flatMap(x => (x.from ? [...x.from] : [x.file])))];
+  return { merged: true, errors: errors.map(p => ({ message: p.message, file: p.file, line: p.line, files: filesOf(p.node) })) };
+}
+
+/** The exception Magento stops at when it loads the area — { message, file, line } — or null. */
+export function checkMergedConfig(files, kind) {
+  return mergedConfigErrors(files, kind).errors[0] || null;
 }
