@@ -6,6 +6,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/). Versions corresp
 
 ## [Unreleased]
 
+## [2.19.0] - 2026-10-02
+
 ### Added
 - **`magento_validate_config`: configuration Magento rejects, with Magento's messages.** The config readers were tolerant — a di.xml that is not well-formed, a plugin `disabled="yes"` or an argument `xsi:type="number"` with `12px` was read as far as possible and shown as if it applied, while Magento fails to load that area in every mode. The tool reports files Magento rejects in every mode, developer-mode (schema) failures, and values read differently than written (observer `disabled="1"`, non-integer `sortOrder`, text next to `<item>`s, which drops them). **Native** only on an explicit `MAGECTOR_PHP` (e.g. `docker exec -i -u www-data <container> php`, with `MAGECTOR_PHP_ROOT`), asynchronously: Magento's own `Config\Dom`, converters and argument interpreters per file, then `ObjectManager\Config\Reader\Dom` / `Event\Config\Reader` on every area in production and developer mode — developer-mode schema errors depend on the merged document and file order, so they come from Magento's readers, not a per-file guess. **Built-in** otherwise: the first libxml error with its line, and the converter / interpreter rules ported from Magento (`src/di-config.js`).
 - **The DI and event tools say when their answer is built from configuration Magento rejects**: `find_plugin`, `find_observer`, `find_preference`, `find_di_wiring`, `find_event_flow`, `trace_dependency`, `impact_analysis`, `find_class` and `batch` start with a notice listing rejected files of enabled modules and misread values in the answer's files.
