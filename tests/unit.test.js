@@ -19,6 +19,7 @@ import { shouldRespawnServe, MAX_RESPAWNS_PER_WINDOW, RESPAWN_WINDOW_MS, RESPAWN
 import { defaultDbPath, dbPathForRoot, manifestPath, tempDbPathFor, swapInIndex } from '../src/paths.js';
 import { modelDownloadDir, downloadFile } from '../src/model.js';
 import { binaryVersion, acceptPathBinary } from '../src/binary.js';
+import { extractJson } from '../src/cli-json.js';
 import { mcpServerEnv } from '../src/init.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -465,25 +466,7 @@ async function testMagentoPatterns() {
 function testExtractJson() {
   console.log('\n── extractJson ──');
 
-  // Re-implement extractJson from mcp-server.js (must stay in sync with src/mcp-server.js)
-  function extractJson(stdout) {
-    const lines = stdout.split('\n');
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i].trim();
-      if (!line) continue;
-      try { return JSON.parse(line); } catch { /* not JSON */ }
-    }
-    const logLineRe = /^\s*(\x1b\[|\[[\d\-T:.Z]+)/;
-    const jsonStartRe = /^\s*[\[{"\-0-9tfn]/;
-    let startIdx = lines.findIndex(l => l.trim() && !logLineRe.test(l) && jsonStartRe.test(l));
-    if (startIdx < 0) startIdx = 0;
-    const cleaned = lines
-      .slice(startIdx)
-      .filter(l => !logLineRe.test(l) && l.trim())
-      .join('\n').trim();
-    if (cleaned) return JSON.parse(cleaned);
-    throw new SyntaxError('No valid JSON found in command output');
-  }
+  // src/cli-json.js — the function mcp-server.js runs (this test used to keep a copy of it)
 
   // Clean JSON
   const r1 = extractJson('{"ok": true}');
@@ -541,6 +524,24 @@ function testExtractJson() {
   const r8 = extractJson(prefixObj);
   assertEq(r8.ok, true, 'HNSW prefix before object: object parsed correctly');
   assert(Array.isArray(r8.data), 'HNSW prefix before object: data is array');
+
+  // ── Bug fix: a line of pretty-printed output is valid JSON on its own ──
+  // `search -f json` prints serde_json::to_string_pretty; the last line that parsed was a fragment
+  // ("reindexEntity" in a methods list), so the cold-path search answered empty.
+  const results = [{
+    id: 7, score: 0.83,
+    metadata: { path: 'vendor/magento/module-indexer/Model/Indexer.php', methods: ['execute', 'reindexEntity'], is_plugin: false },
+  }];
+  const pretty = JSON.stringify(results, null, 2);
+  const ansi = '\x1b[2m2026-10-02T10:00:00Z\x1b[0m \x1b[32m INFO\x1b[0m magector_core: loading index';
+  const r9 = extractJson(['setting number of points 50000', ansi, pretty, ''].join('\n'));
+  assert(Array.isArray(r9) && r9.length === 1 && r9[0].id === 7,
+    'Pretty-printed results with a string line: the array, not the line', JSON.stringify(r9));
+  assertEq(JSON.stringify(extractJson(`${pretty}\n${ansi}\n`)), JSON.stringify(results), 'A tracing line after the JSON is ignored');
+  assertEq(extractJson('noise before\n[1,2]\nnoise after').length, 2, 'One-line array among other output');
+  threw = false;
+  try { extractJson('"reindexEntity"\n42\n'); } catch (e) { threw = e instanceof SyntaxError; }
+  assert(threw, 'Only scalar lines: SyntaxError instead of a fragment');
 }
 
 // ─── normalizeResult Tests ─────────────────────────────────────
