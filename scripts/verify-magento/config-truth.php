@@ -1,10 +1,10 @@
 <?php
 /**
- * Ground truth for compare.mjs webapi|graphql|cron|dbschema: what Magento itself reads from
+ * Ground truth for compare.mjs webapi|graphql|cron|dbschema|modules|trace_api: what Magento itself reads from
  * webapi.xml, schema.graphqls, crontab.xml (+ crontab config) and db_schema.xml, after merging.
  *
  * Usage (in the Magento root, inside the PHP container):
- *   php config-truth.php webapi|graphql|cron|dbschema > <kind>-truth.json
+ *   php config-truth.php webapi|graphql|cron|dbschema|modules|trace_api > <kind>-truth.json
  *
  * webapi   — Magento\Webapi\Model\Config::getServices() routes: url → method → service class/method, ACL
  * graphql  — GraphQlSchemaStitching\Reader::read(): type → kind, fields → resolver; fields GraphQlReader reads
@@ -13,6 +13,9 @@
  *            (crontab.xml merged with the `crontab` system config, as Magento's cron reads it)
  * dbschema — SchemaConfigInterface::getDeclarationConfig(): table → resource, columns, indexes, constraints
  * modules  — ComponentRegistrar: module → directory (relative to the root), enabled (ModuleList), load order
+ * trace_api — every route with its service and the class Magento creates for the service in the webapi_rest
+ *            area (preferences of global + webapi_rest, a virtual type's real class; the generated
+ *            \Interceptor reported as the class it wraps)
  */
 declare(strict_types=1);
 
@@ -97,8 +100,22 @@ switch ($kind) {
             ];
         }
         break;
+    case 'trace_api':
+        $routes = $om->get(\Magento\Webapi\Model\Config::class)->getServices()['routes'] ?? [];
+        $om->get(\Magento\Framework\App\State::class)->setAreaCode('webapi_rest');
+        $om->configure($om->get(\Magento\Framework\ObjectManager\ConfigLoaderInterface::class)->load('webapi_rest'));
+        $di = $om->get(\Magento\Framework\ObjectManager\ConfigInterface::class);
+        foreach ($routes as $url => $methods) {
+            foreach ($methods as $method => $route) {
+                $class = ltrim($route['service']['class'], '\\');
+                $runs = ltrim($di->getInstanceType($di->getPreference($class)), '\\');
+                $out[] = ['url' => $url, 'method' => $method, 'class' => $class, 'serviceMethod' => $route['service']['method'],
+                    'runs' => preg_replace('~\\\\Interceptor$~', '', $runs)];
+            }
+        }
+        break;
     default:
-        fwrite(STDERR, "usage: php config-truth.php webapi|graphql|cron|dbschema|modules\n");
+        fwrite(STDERR, "usage: php config-truth.php webapi|graphql|cron|dbschema|modules|trace_api\n");
         exit(2);
 }
 echo json_encode($out, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT), "\n";

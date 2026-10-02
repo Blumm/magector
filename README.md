@@ -2,7 +2,7 @@
 
 **Technology-aware MCP server for Magento 2 and Adobe Commerce with intelligent indexing and search.**
 
-Magector is a Model Context Protocol (MCP) server that deeply understands Magento 2 and Adobe Commerce. It builds a semantic vector index of your entire codebase — 18,000+ files across hundreds of modules — and exposes 47 tools that let AI assistants search, navigate, and understand the code with domain-specific intelligence. Instead of grepping for keywords, your AI asks *"how are checkout totals calculated?"* and gets ranked, relevant results in under 50ms, enriched with Magento pattern detection (plugins, observers, controllers, DI preferences, layout XML, and 20+ more).
+Magector is a Model Context Protocol (MCP) server that deeply understands Magento 2 and Adobe Commerce. It builds a semantic vector index of your entire codebase — 18,000+ files across hundreds of modules — and exposes 48 tools that let AI assistants search, navigate, and understand the code with domain-specific intelligence. Instead of grepping for keywords, your AI asks *"how are checkout totals calculated?"* and gets ranked, relevant results in under 50ms, enriched with Magento pattern detection (plugins, observers, controllers, DI preferences, layout XML, and 20+ more).
 
 [![Rust](https://img.shields.io/badge/rust-1.75+-orange.svg)](https://www.rust-lang.org)
 [![Node.js](https://img.shields.io/badge/node-18+-green.svg)](https://nodejs.org)
@@ -58,7 +58,7 @@ The result: your AI assistant calls one MCP tool and gets ranked, pattern-enrich
 - **Complexity analysis** -- cyclomatic complexity, function count, and hotspot detection across modules
 - **Fast** -- 10-45ms queries via persistent serve process, batched ONNX embedding with adaptive thread scaling
 - **LLM description enrichment** -- generate natural-language descriptions of di.xml files using Claude, stored in SQLite, and prepend them to embedding text so descriptions influence vector search ranking (not just post-retrieval display)
-- **MCP server** -- 47 tools integrating with Claude Code, Cursor, and any MCP-compatible AI tool
+- **MCP server** -- 48 tools integrating with Claude Code, Cursor, and any MCP-compatible AI tool
 - **Clean architecture** -- Rust core handles all indexing/search, Node.js MCP server delegates to it
 
 ---
@@ -70,7 +70,7 @@ flowchart LR
   subgraph node ["Node.js Layer"]
     direction TB
     G["CLI<br/>init · index · search · describe"]
-    E["MCP Server<br/>47 tools · LRU cache"]
+    E["MCP Server<br/>48 tools · LRU cache"]
     F["Persistent Serve Process"]
     G --> F
     E --> F
@@ -359,6 +359,10 @@ The `describe` command and `magento_describe` MCP tool require an Anthropic API 
 | `MAGECTOR_PHP_LIST_TTL_MS` | How long the list of all PHP files (event dispatchers) is reused before the tree is walked again. | `30000` |
 | `MAGECTOR_AUTO_INDEX` | `0`: the MCP server never starts an index (none, or an incompatible one) — for CI and agent jobs that bring their own index. The structural tools work without one; semantic search reports it is missing. | `1` (index in the background) |
 | `MAGECTOR_PREWARM_PHP` | `1`: read the PHP class hierarchy and the event dispatch sites in the background after the MCP server starts, so `find_event_dispatchers` and `find_implementors` answer in milliseconds; `0`: never — their first call reads the tree (seconds on a large project). Unset: on, except with `MAGECTOR_AUTO_INDEX=0`, which keeps background CPU off. | on (off with `MAGECTOR_AUTO_INDEX=0`) |
+| `MAGECTOR_PREWARM_CONFIG` | `1`: prepare the configuration notice of the DI / event answers (every `di.xml` / `events.xml` read, each area merged; 0.2–0.6 s on 300–600 modules) in the background, 1.5 s after the MCP server starts with no tool call in flight, so the first DI answer does not wait for it; `0`: never — the first DI or event answer prepares it. Unset: on, except with `MAGECTOR_AUTO_INDEX=0`, which keeps background CPU off. Only on a Magento install (`app/etc/config.php` under `MAGENTO_ROOT`). | on (off with `MAGECTOR_AUTO_INDEX=0`) |
+| `MAGECTOR_PHP` | Command that runs PHP 8.1+ able to load the Magento root, for the native `magento_validate_config` (the PHP program is piped to its stdin), e.g. `docker exec -i -u www-data <container> php`, `warden env exec -T php-fpm php`, `ddev exec php`. Only an explicit command is used — never `php` from `PATH`: the native check loads the project's autoloader and bootstraps Magento (which writes its DI config to the configured cache; with `var/.regenerate` present the areas are not read, as bootstrapping would delete `generated/` and `var/cache`). Unset: built-in check. | — |
+| `MAGECTOR_PHP_TIMEOUT_MS` | Time limit of one native check (it runs asynchronously; the server keeps answering). | `120000` |
+| `MAGECTOR_PHP_ROOT` | The Magento root as `MAGECTOR_PHP` sees it (inside the container) | `MAGENTO_ROOT` |
 | `ANTHROPIC_API_KEY` | API key for description generation (`describe` command) | — |
 
 These defaults apply to the Node.js CLI and the MCP server. The Rust core's own `-d` flag (see above) defaults to `./.magector/index.db` in its working directory.
@@ -421,7 +425,7 @@ npx magector index --force
 
 ## MCP Server Tools
 
-The MCP server exposes 47 tools for AI-assisted Magento 2 and Adobe Commerce development. All search tools return **structured JSON** with file paths, class names, methods, role badges, and content snippets -- enabling AI clients to parse results programmatically and minimize file-read round-trips.
+The MCP server exposes 48 tools for AI-assisted Magento 2 and Adobe Commerce development. All search tools return **structured JSON** with file paths, class names, methods, role badges, and content snippets -- enabling AI clients to parse results programmatically and minimize file-read round-trips.
 
 ### Output Format
 
@@ -504,6 +508,24 @@ with an update.
 | `magento_trace_config` | system.xml definition and PHP readers (constant or literal path) | the path is concatenated at runtime |
 | `magento_grep`, `magento_ast_search` | Exact text / AST matches | — |
 
+#### Configuration Magento rejects
+
+The DI and event tools read what the files **say**. When Magento cannot load a file, or reads a value
+differently than written, they say so first: the answers of `find_plugin`, `find_observer`,
+`find_preference`, `find_di_wiring`, `find_event_flow`, `trace_dependency`, `impact_analysis`,
+`find_class` and `batch` start with a notice listing the rejected files of enabled modules, and
+values in the answer's files that do not take effect as written. `magento_validate_config` gives the
+details, with Magento's own messages:
+
+| Engine | Checks | Verified |
+|--------|--------|----------|
+| **native** (`MAGECTOR_PHP` only) | Magento's classes on every file (`Config\Dom` — not well-formed XML fails in every mode; the DI / events converters and argument interpreters under Magento's `ErrorHandler`), then Magento's readers (`ObjectManager\Config\Reader\Dom`, `Event\Config\Reader`) on every area in production **and developer mode** — the merged configuration, as Magento validates it; other files against the schema they declare | is Magento |
+| **built-in** (no PHP) | per file: the first libxml error (message and line), the converter and argument-interpreter rules ported from Magento, values read differently than written (observer `disabled="1"`, non-integer `sortOrder`, text next to `<item>`s); per area: its files merged as `Config\Dom` merges them, then the same rules — a file another file completes loads, two files that load alone can fail together | against libxml 2.9.14 / Mage-OS 2.4.9 (`scripts/verify-magento`, mode `config`): same first fatal error on 2,000 files with syntax edits (1,384 not well-formed); same converter verdict on 3,000 files with value edits (2,518 converter exceptions; `const` names native only); nothing reported on the 3,075 unmodified config files of the project; merge (mode `merge`): the same merged document and verdict as Magento's readers on every DI / events area of a Mage-OS 2.4.9 and a Magento 2.4.5 project (30 areas) and on 15,008 merges of mutated files with their originals |
+
+The built-in check does not validate schemas (developer mode) and cannot check `const` /
+`init_parameter` arguments (PHP's `defined()`). The native check runs on PHP 8.1–8.4 (on Magento 2.4.5
+with PHP 8.4 it gives the same result as with PHP 8.1).
+
 The results are static analysis of the files. For a running installation, the object manager
 configuration read at runtime remains the reference — note that `bin/magento dev:di:info` lists plugins
 disabled with `disabled="true"` as active.
@@ -564,6 +586,7 @@ Auto-detects entry type from pattern (`/V1/...` → API, `snake_case` → event,
 |------|-------------|
 | `magento_error_parser` | Parse Magento error messages and map to root cause, affected files, and fix suggestions (10 known patterns) |
 | `magento_performance_profile` | Profile a Magento subsystem (checkout_totals, order_place, product_save, etc.) for performance bottlenecks -- plugins, observers, and complexity hotspots |
+| `magento_validate_config` | Configuration XML the way Magento loads it: files it rejects in every mode, developer-mode (schema) failures per area, values read differently than written — with Magento's messages. Native through PHP (`MAGECTOR_PHP`), otherwise built-in. See [Configuration Magento rejects](#configuration-magento-rejects) |
 
 ### Analysis Tools
 
@@ -779,7 +802,7 @@ cd rust-core && cargo run --release -- validate -m ./magento2 --skip-index
 magector/
 ├── src/                          # Node.js source
 │   ├── cli.js                    # CLI entry point (npx magector <command>)
-│   ├── mcp-server.js             # MCP server (47 tools, structured JSON output)
+│   ├── mcp-server.js             # MCP server (48 tools, structured JSON output)
 │   ├── binary.js                 # Platform binary resolver
 │   ├── model.js                  # ONNX model resolver/downloader
 │   ├── init.js                   # Full init command (index + IDE config)

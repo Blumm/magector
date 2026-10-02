@@ -76,7 +76,13 @@ class McpClient {
     const res = await this.request('tools/call', { name, arguments: args });
     return (res.result?.content || []).map(c => c.text || '').join('\n');
   }
-  stop() { try { this.child.kill(); } catch { /* exited */ } rmSync(this.dbDir, { recursive: true, force: true }); }
+  /** Waits for the server to exit: it logs its shutdown to <root>/.magector, which a caller removing the root races. */
+  async stop() {
+    if (this.child.exitCode === null && this.child.signalCode === null) {
+      await new Promise(resolve => { this.child.once('exit', resolve); this.child.kill(); });
+    }
+    rmSync(this.dbDir, { recursive: true, force: true });
+  }
 }
 
 async function main() {
@@ -284,7 +290,7 @@ async function main() {
     t = await c.call('magento_module_structure', { moduleName: 'Acme_Off' });
     check('module_structure: states a disabled module', t, { has: ['**disabled** in app/etc/config.php'] });
   } finally {
-    c.stop();
+    await c.stop();
   }
 
   // ── 3. Files changed mid-session (review of #31: session caches were never invalidated) ──
@@ -322,7 +328,7 @@ async function main() {
       has: ['**Magento rejects 1 webapi.xml file(s)**', '`app/code/Acme/Late/etc/webapi.xml:4` — Opening and ending tag mismatch: route line 3 and routes'],
     });
   } finally {
-    lc.stop();
+    await lc.stop();
     rmSync(live, { recursive: true, force: true });
   }
 
@@ -339,7 +345,7 @@ async function main() {
       ok(`no index: find_cron ${round} call answers at once (${ms} ms; was 5 s / 10 s — the serve respawn delay)`, ms < 3000 && t.includes('acme'));
     }
   } finally {
-    nc.stop();
+    await nc.stop();
   }
 
   console.log(`\n  ${passed} passed, ${failed} failed\n`);
