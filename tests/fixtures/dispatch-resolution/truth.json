@@ -108,6 +108,9 @@
         ],
         "F7 di.xml [adminhtml]": [
             "acme_ctoradmin_ran"
+        ],
+        "F11 required constructor argument": [
+            "acme_dyn_wired_ran"
         ]
     }
 }

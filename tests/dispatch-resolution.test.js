@@ -9,6 +9,13 @@
  * branches, interpolation, sprintf, a request value. Expected names: truth.json — what PHP dispatches
  * when the fixture's code runs (scripts/verify-magento/dispatch-fixture-truth.php), not what the
  * test's author thinks. Before this change, find_event_dispatchers found only literal names.
+ *
+ * F1–F11 (review of #34): a class no autoloader loads is not searched for in the tree; a site in a
+ * copy composer does not load is skipped (tests/fixtures/dispatch-composer); two sites on one line;
+ * a trait method overriding the dispatching one; a value assigned in an ordinary method is possible,
+ * not exact; `.=`; a constructor parameter's default; wildcard mode, `*` queries, an empty name, the
+ * tool description; find_implementors' order; no background read with MAGECTOR_AUTO_INDEX=0; a
+ * required constructor argument replaces the declared default.
  */
 
 import { spawn } from 'child_process';
@@ -133,6 +140,8 @@ const expectedPossible = {
   acme_predispatch_checkout_cart_add: [at('app/code/Acme/Disp/Service/FrontLike.php', 'dispatch('), 'acme_predispatch_*'],
   acme_alert_event_checkout: [at('app/code/Acme/Disp/Service/Alert.php', 'dispatch($moduleEvent)'), 'acme_alert_event_*'],
   acme_copy_fieldset_convert: [at('app/code/Acme/Disp/Service/Interp.php', 'sprintf('), 'acme_copy_fieldset_*'],
+  // F11: a required constructor argument without di.xml — runtime; the default it replaces never dispatches
+  acme_dyn_wired_ran: [at('app/code/Acme/Disp/Service/Wired.php', 'dispatch('), '*_wired_ran'],
 };
 
 async function main() {
@@ -187,6 +196,8 @@ async function main() {
       const t = await c.call('magento_find_event_dispatchers', { eventName: name });
       check(`runtime part: \`${name}\` — the site is listed as possible with \`${pattern}\``, t.split('\nPossible')[1] || '', { has: [where, `\`${pattern}\``] });
     }
+    check('F11: the declared default a required constructor argument replaces is not an exact name (was: `acme_wired_ran` exact)',
+      (await c.call('magento_find_event_dispatchers', { eventName: 'acme_wired_ran' })).split('\nPossible')[0], { hasNot: ['for `Acme\\Disp\\Service\\Wired`'] });
 
     // ── 3. Layers and areas ───────────────────────────────────────
     let t = await c.call('magento_find_event_dispatchers', { eventName: 'acme_product_save_after' });

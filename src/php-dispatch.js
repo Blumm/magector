@@ -524,7 +524,8 @@ export function createDispatchResolver({ typeOf, diStringArgs = () => [] }) {
           } else {
             values.push(...unknown(ctx, `$${param[1]} (constructor of ${l.via.fqcn})`));
           }
-          if ((di.length || defaultExpr !== undefined) && constructorRuns(K, l.via)) fromConstructor = true;
+          // the constructor assigns the parameter whatever it holds: the declared default no longer applies
+          if (constructorRuns(K, l.via)) fromConstructor = true;
         } else {
           const v = evaluate(parseNameExpr(a.expr), { ...ctx, self: l.via, lexical: l.rec, before: '', params: method?.params || [] });
           // the constructor always runs; any other method only if something called it before the dispatch

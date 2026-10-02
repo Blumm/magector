@@ -236,5 +236,14 @@
     ],
     "method": "run",
     "em": "eventManager"
+  },
+  {
+    "id": "F11 required constructor argument",
+    "class": "Acme\\Disp\\Service\\Wired",
+    "ctor": [
+      "acme_dyn"
+    ],
+    "method": "run",
+    "em": "eventManager"
   }
 ]
