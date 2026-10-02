@@ -283,6 +283,38 @@ async function main() {
     rmSync(live, { recursive: true, force: true });
   }
 
+  // ── Entity amplification (review of #33) ───────────────────────
+  // A 1 KB di.xml with 8 levels of nested entities: libxml rejects it ("Detected an entity reference
+  // loop"); the expanding parser took 170 s and 2.4 GB for a find_plugin, 29 s for validate_config
+  const lolRoot = mkdtempSync(path.join(os.tmpdir(), 'magector-vc-lol-'));
+  cpSync(FIXTURE_ROOT, lolRoot, { recursive: true });
+  let dtd = '<!ENTITY lol0 "lol">\n';
+  for (let i = 1; i <= 8; i++) dtd += `<!ENTITY lol${i} "${`&lol${i - 1};`.repeat(10)}">\n`;
+  writeFileSync(path.join(lolRoot, 'app/code/Acme/Good/etc/di.xml'), `<?xml version="1.0"?>\n<!DOCTYPE config [\n${dtd}]>\n` +
+    '<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">\n    <type name="Acme\\Good\\Model\\Thing">\n' +
+    '        <plugin name="good_thing" type="Acme\\Good\\Plugin\\ThingPlugin" sortOrder="10"/>\n' +
+    '        <arguments><argument name="lol" xsi:type="string">&lol8;</argument></arguments>\n    </type>\n</config>\n');
+  const lol = new McpClient({}, lolRoot);
+  await lol.start();
+  try {
+    let t0 = Date.now();
+    const plugins = await lol.call('magento_find_plugin', { targetClass: 'Acme\\Good\\Model\\Thing' });
+    const pluginMs = Date.now() - t0;
+    t0 = Date.now();
+    const v = await lol.call('magento_validate_config', { path: 'app/code/Acme/Good/etc/di.xml' });
+    const validateMs = Date.now() - t0;
+    ok(`entity amplification: find_plugin and validate_config answer at once (${pluginMs} ms, ${validateMs} ms; were 170 s and 29 s)`, pluginMs < 5000 && validateMs < 5000);
+    check('entity amplification: the file is rejected with libxml\'s message', v, {
+      has: ['### Fails in every mode', 'app/code/Acme/Good/etc/di.xml:1', 'Detected an entity reference loop'],
+    });
+    check('entity amplification: the DI answer names it in the notice', plugins, {
+      has: ['`app/code/Acme/Good/etc/di.xml:1` — Detected an entity reference loop', '### DI Plugin Registrations for Acme\\Good\\Model\\Thing'],
+    });
+  } finally {
+    await lol.stop();
+    rmSync(lolRoot, { recursive: true, force: true });
+  }
+
   console.log(`\n  ${passed} passed, ${failed} failed\n`);
   process.exit(failed ? 1 : 0);
 }

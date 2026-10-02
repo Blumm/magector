@@ -284,6 +284,45 @@ eq('merge as Config\\Dom: events: observers merge by name, attributes accumulate
 eq('merge as Config\\Dom: an id with an apostrophe breaks the XPath literal — DOMXPath warns, Magento\'s ErrorHandler throws', merged('di', ['g1.xml', 'g2.xml']), { error: 'Warning: DOMXPath::query(): Invalid predicate' });
 eq('merge as Config\\Dom: a value with a bare & set as nodeValue — libxml "unterminated entity reference" (%15s)', merged('di', ['h1.xml', 'h2.xml']), { error: 'Warning: Magento\\Framework\\Config\\Dom::_mergeNode(): unterminated entity reference               1' });
 eq('merge as Config\\Dom: … &amp; becomes &, another reference an entity reference node', merged('di', ['h1.xml', 'h3.xml']), ["e", "config", {}, [["e", "type", {"name": "T"}, [["e", "arguments", {}, [["e", "argument", {"name": "v", "xsi:type": "string"}, [["t", "a & b "], ["x", "DOMEntityReference"], ["t", " c"]]]]]]]]]);
+// ── Entity amplification ("billion laughs") ──────────────────────
+// libxml 2.9 limits it without LIBXML_NOENT (DOMDocument::loadXML, as Config\Dom does): expected =
+// PHP 8.4 / libxml 2.9.13, first fatal error. The emulation in checkXmlWellFormed agrees with it on
+// 13,708 generated documents (levels, fan-out, positions, cycles, text and attribute values).
+const entityDoc = (levels, width, where, base = 'x') => {
+  let dtd = `<!ENTITY e0 "${base}">\n`;
+  for (let i = 1; i <= levels; i++) dtd += `<!ENTITY e${i} "${`&e${i - 1};`.repeat(width)}">\n`;
+  const ref = `&e${levels};`;
+  return `<?xml version="1.0"?>\n<!DOCTYPE config [\n${dtd}]>\n<config>\n  <type name="A">${where === 'attr' ? `<plugin name="${ref}"/>` : `<arguments><argument name="a">${ref}</argument></arguments>`}</type>\n</config>\n`;
+};
+eq('well-formedness as libxml: nested entities that amplify are an entity reference loop; flat ones are not', [
+  entityDoc(1, 30, 'text'), entityDoc(2, 5, 'text'), entityDoc(2, 10, 'text'), entityDoc(3, 3, 'text'), entityDoc(8, 10, 'text'),
+  entityDoc(3, 2, 'attr'), entityDoc(2, 10, 'attr'), entityDoc(3, 10, 'attr'), entityDoc(8, 10, 'attr'),
+  '<?xml version="1.0"?>\n<!DOCTYPE config [\n<!ENTITY a "x&a;">\n]>\n<config>&a;</config>\n',
+  '<?xml version="1.0"?>\n<!DOCTYPE config [\n<!ENTITY c0 "&c1;">\n<!ENTITY c1 "\n&c2;">\n<!ENTITY c2 "\n\n&c0;">\n]>\n<config>&c0;</config>\n',
+  '<?xml version="1.0"?>\n<!DOCTYPE config [\n<!ENTITY m "<b/>">\n]>\n<config>\n  <a v="&m;"/>\n</config>\n',
+  `<?xml version="1.0"?>\n<!DOCTYPE config [\n<!ENTITY big "${'y'.repeat(100000)}">\n]>\n<config>${'&big;'.repeat(1000)}<a v="&big;&big;"/></config>\n`,
+].map(x => checkXmlWellFormed(x)[0]).map(e => e && [e.line, e.message]), [
+  null, null,
+  [1, 'Detected an entity reference loop'],            // in content: measured against the entity's own input
+  [1, 'Detected an entity reference loop'],
+  [1, 'Detected an entity reference loop'],
+  null, null, null,                                     // in an attribute value: against the document position
+  [14, 'Detected an entity reference loop'],
+  [1, 'Detected an entity reference loop'],            // recursion: depth over 40
+  [2, 'Detected an entity reference loop'],            // ctxt->depth grows by 2 per level in content
+  [6, "'<' in entity 'm' is not allowed in attributes values"],
+  null,                                                 // 100 MB if expanded, but not nested
+]);
+{
+  // The tolerant parser expands entities within a per-document budget: a 1 KB file was 300M characters,
+  // 15 s and 775 MB (8 levels), a RangeError after 1.3 GB (9 levels)
+  const lol = entityDoc(8, 10, 'text', 'lol');
+  const t0 = performance.now();
+  const arg = parseXml(lol).children[0].children[0].children[0].children[0];
+  const ms = performance.now() - t0;
+  eq(`parseXml: a "billion laughs" di.xml stays small and fast (${ms.toFixed(0)} ms, ${arg.text.length} characters)`, ms < 1000 && arg.text.length < 2_000_000, true);
+  eq('parseXml: entities within the budget expand as libxml reads them', parseXml(entityDoc(2, 5, 'text')).children[0].children[0].children[0].children[0].text, 'x'.repeat(25));
+}
 eq('well-formedness as libxml: a UTF-8 byte-order mark before the declaration is skipped',
   checkXmlWellFormed('\uFEFF<?xml version="1.0" encoding="UTF-8"?>\n<config/>\n'), []);
 eq('Magento\'s message for a file Config\\Dom rejects (Config\\Reader\\Filesystem, ERROR_FORMAT_DEFAULT)',

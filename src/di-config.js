@@ -20,26 +20,35 @@ const charRef = (m, e) => {
 
 /**
  * Character and entity references, as libxml substitutes them: the predefined entities and the
- * general entities the document's internal DTD subset declares (`declared`, name → replacement text).
- * In an attribute value the replacement text is normalized too (literal tab / newline → space).
+ * general entities the document's internal DTD subset declares (`declared`: { map: name → replacement
+ * text, left: expansion budget }). In an attribute value the replacement text is normalized too
+ * (literal tab / newline → space). The budget is per document (declaredEntities): nested entities
+ * expand exponentially (a 1 KB "billion laughs" di.xml is gigabytes), so once it is spent the
+ * references stay as written. libxml rejects such a document anyway ("Detected an entity reference
+ * loop", checkXmlWellFormed); its own nesting limit is 40.
  */
 function decodeEntities(s, declared = null, inAttribute = false, depth = 0) {
   return s.replace(/&(#x[0-9a-f]+|#\d+|[A-Za-z_:][\w.:-]*);/gi, (m, e) => {
     if (e[0] === '#') return charRef(m, e);
     if (ENTITIES[e] !== undefined) return ENTITIES[e];
-    const value = declared?.get(e);
-    if (value === undefined || depth > 8) return m;
-    return decodeEntities(inAttribute ? value.replace(/[\t\n]/g, ' ') : value, declared, inAttribute, depth + 1);
+    const value = declared?.map.get(e);
+    if (value === undefined || depth >= 40 || declared.left <= 0) return m;
+    const out = decodeEntities(inAttribute ? value.replace(/[\t\n]/g, ' ') : value, declared, inAttribute, depth + 1);
+    declared.left -= out.length;
+    return declared.left < 0 ? m : out;
   });
 }
 
+/** Expansion budget of a document's declared entities: 10 × its size + 1 MB (in UTF-16 units). */
+const entityBudget = size => 10 * size + (1 << 20);
+
 /** <!ENTITY name "value"> of an internal DTD subset; character references are replaced when declared. */
-function declaredEntities(doctype) {
-  const out = new Map();
+function declaredEntities(doctype, size) {
+  const map = new Map();
   for (const m of doctype.matchAll(/<!ENTITY\s+([A-Za-z_:][\w.:-]*)\s+(?:"([^"]*)"|'([^']*)')\s*>/g)) {
-    if (!out.has(m[1])) out.set(m[1], (m[2] ?? m[3]).replace(/\r\n?/g, '\n').replace(/&(#x[0-9a-f]+|#\d+);/gi, charRef));
+    if (!map.has(m[1])) map.set(m[1], (m[2] ?? m[3]).replace(/\r\n?/g, '\n').replace(/&(#x[0-9a-f]+|#\d+);/gi, charRef));
   }
-  return out;
+  return { map, left: entityBudget(size) };
 }
 
 /**
@@ -69,7 +78,7 @@ export function parseXml(content) {
       // in the DOM, which Config\Dom's merge looks at (hasChildNodes, a single text node)
       if (top !== root && m[0].startsWith('<!--')) top.seq.push({ comment: true });
       else if (top !== root && m[0].startsWith('<?')) top.seq.push({ pi: true });
-      else if (m[0].startsWith('<!DOCTYPE')) entities = declaredEntities(m[0]);
+      else if (m[0].startsWith('<!DOCTYPE')) entities = declaredEntities(m[0], src.length);
       continue;
     } else if (m[1] !== undefined) {    // CDATA
       top.text += m[1];
@@ -1118,6 +1127,126 @@ export const BOOLEAN_UTILS_MESSAGE = "Boolean value is expected, supported value
 
 const XML_NAME = /[A-Za-z_:][\w:.-]*/y;
 
+// libxml 2.9's guard against entity amplification, which DOMDocument::loadXML() applies without
+// LIBXML_NOENT (parser.c: xmlParseReference, xmlParseAttValueComplex, xmlStringDecodeEntities,
+// xmlParserEntityCheck). Each reference counts in nbentities; an entity's first reference measures it
+// (checked = 2 × the references its expansion parses) and fails with "Detected an entity reference
+// loop" when that count × 3 reaches 10 × the bytes consumed of the current input. In content the first
+// reference parses the entity as its own input (an error inside is on its line 1, the input is that
+// short); in an attribute value the entity is decoded as a string against the document's position.
+// Later references only add the count. Nesting deeper than 40 is a loop too. The first fatal error
+// agrees with PHP 8.4 / libxml 2.9.13 on 13,708 generated documents (levels, fan-out, lengths,
+// positions, cycles, text and attribute values, 8,000 of them random); libxml 2.10+ replaced this
+// guard with an amplification factor.
+const ENTITY_LOOP = 'Detected an entity reference loop';
+const ENTITY_REF = /&(#x[0-9a-fA-F]+|#\d+|[A-Za-z_:][\w.:-]*);/g;
+const ltInAttribute = name => `'<' in entity '${name}' is not allowed in attributes values`;
+
+function libxmlEntityLoops(entities) {
+  let nb = 0;                                   // ctxt->nbentities
+  let steps = 0;                                // work guard: libxml stops far earlier on real input
+  const utf8 = new TextEncoder();
+  const fail = (message = ENTITY_LOOP, line = null) => ({ message, line });
+  const refsOf = value => [...value.matchAll(ENTITY_REF)].filter(r => r[1][0] !== '#');
+  // An entity's content parsed as its own input (xmlParseBalancedChunkMemoryInternal): the positions
+  // and lines of the references in it are local to it
+  const parseContent = (ent, depth) => {
+    for (const r of refsOf(ent.value)) {
+      if (ENTITIES[r[1]] !== undefined) continue;
+      const at = r.index + r[0].length;
+      const innerLine = 1 + (ent.value.slice(0, at).match(/\n/g) || []).length;
+      const inner = entities.get(r[1]);
+      if (!inner) return fail(`Entity '${r[1]}' not defined`, innerLine);
+      if (inner.value === null) continue;
+      const e = contentReference(inner, utf8.encode(ent.value.slice(0, at)).length, innerLine, depth + 1);
+      if (e) return e;
+    }
+    return null;
+  };
+  const contentReference = (ent, consumed, line, depth) => {
+    nb++;                                       // xmlParseEntityRef
+    if (++steps > 1e6) return fail(ENTITY_LOOP, line);
+    // ctxt->depth grows by 2 per level (xmlParseReference, then the chunk's own context);
+    // xmlParseBalancedChunkMemoryInternal refuses a depth over 40
+    const tooDeep = 2 * depth - 1 > 40;
+    if (ent.checked === 0) {
+      const old = nb;
+      if (!tooDeep) {
+        const e = parseContent(ent, depth);
+        if (e) return e;
+      }
+      ent.checked = (nb - old + 1) * 2 + (ent.value.includes('<') ? 1 : 0);
+      if (tooDeep || Math.floor(ent.checked / 2) * 3 >= consumed * 10) return fail(ENTITY_LOOP, line);
+      return null;
+    }
+    if (ent.checked !== 1) nb += Math.floor(ent.checked / 2);
+    // An entity whose content gave no nodes (an empty one) is parsed again on every reference: past
+    // the depth limit that is a loop too
+    return ent.value === '' && tooDeep ? fail(ENTITY_LOOP, line) : null;
+  };
+  // xmlStringDecodeEntities(): returns { length } of the decoded string, or { error }
+  const decode = (value, depth, consumed) => {
+    if (depth > 40) return { error: fail() };
+    let length = 0, size = 300;                  // XML_PARSER_BIG_BUFFER_SIZE, grown by 2 × size + 100
+    const grow = () => { while (length + 100 > size) size = size * 2 + 100; };
+    let last = 0;
+    for (const r of value.matchAll(ENTITY_REF)) {
+      length += utf8.encode(value.slice(last, r.index)).length;
+      grow();
+      last = r.index + r[0].length;
+      if (r[1][0] === '#' || ENTITIES[r[1]] !== undefined) { length++; grow(); continue; }
+      const ent = entities.get(r[1]);
+      if (!ent) return { error: fail(`Entity '${r[1]}' not defined`) };
+      if (ent.value?.includes('<')) return { error: fail(ltInAttribute(r[1])) };   // [WFC: No < in Attribute Values]
+      nb++;                                      // xmlParseStringEntityRef
+      if (++steps > 1e6) return { error: fail() };
+      const e = check(ent, depth, consumed);
+      if (e) return { error: e };
+      nb += Math.floor(ent.checked / 2);
+      if (ent.value === null || ent.value === '') continue;
+      const inner = decode(ent.value, depth + 1, consumed);
+      if (inner.error) return inner;
+      // copied char by char; each time the buffer must grow (length + 100 > size) the size is checked
+      for (let left = inner.length; left > 0;) {
+        const toGrow = size - 99 - length;
+        if (toGrow > left) { length += left; break; }
+        length += toGrow;
+        left -= toGrow;
+        if (length >= 1000 && !(length < 10 * consumed && nb * 3 < 10 * consumed)) return { error: fail() };
+        size = size * 2 + 100;
+      }
+    }
+    length += utf8.encode(value.slice(last)).length;
+    return { length };
+  };
+  // xmlParserEntityCheck(ctxt, 0, ent, 0)
+  const check = (ent, depth, consumed) => {
+    if (ent.checked === 0 && ent.value !== null) {
+      ent.checked = 1;
+      const old = nb;
+      const r = decode(ent.value, depth + 1, consumed);
+      if (r.error) return r.error;
+      ent.checked = (nb - old + 1) * 2 + (ent.value.includes('<') ? 1 : 0);
+    }
+    return Math.floor(ent.checked / 2) * 3 >= consumed * 10 ? fail() : null;
+  };
+  return {
+    /** A reference in the document: content (xmlParseReference) or an attribute value. */
+    reference(name, ent, consumed, inAttribute) {
+      if (!inAttribute) return contentReference(ent, consumed, null, 1);
+      if (ent.value.includes('<')) return fail(ltInAttribute(name));               // [WFC: No < in Attribute Values]
+      nb++;                                      // xmlParseEntityRef
+      if (ent.checked === 0) {                   // "This may look absurd but is needed to detect entities problems"
+        const old = nb;
+        const r = decode(ent.value, 1, consumed);
+        if (r.error) return r.error;
+        ent.checked = (nb - old + 1) * 2 + (ent.value.includes('<') ? 1 : 0);
+      }
+      return null;
+    },
+  };
+}
+
 /**
  * Well-formedness check without PHP. Returns [] for a well-formed document, otherwise the first error
  * libxml reports, with libxml's wording and line (checked against libxml 2.9 — see
@@ -1126,6 +1255,7 @@ const XML_NAME = /[A-Za-z_:][\w:.-]*/y;
  */
 export function checkXmlWellFormed(content) {
   const src = String(content ?? '').replace(/^\uFEFF/, '');   // a UTF-8 BOM, which libxml skips
+  const bom = String(content ?? '').length - src.length ? 3 : 0;
   const lineAt = (() => {
     const starts = [0];
     for (let i = 0; i < src.length; i++) if (src[i] === '\n') starts.push(i + 1);
@@ -1181,10 +1311,20 @@ export function checkXmlWellFormed(content) {
     return { error: err(j, "parsing XML declaration: '?>' expected") };
   };
   const stack = [];
-  const declaredEntities = new Set();   // <!ENTITY name …> in the internal DTD subset
+  const declaredEntities = new Map();   // <!ENTITY name …> in the internal DTD subset → { value, checked }
+  const loops = libxmlEntityLoops(declaredEntities);
+  // libxml's "consumed" at a position: its UTF-8 offset (positions come in document order)
+  let utf8 = null, consumedOff = 0, consumedBytes = 0;
+  const consumedAt = off => {
+    utf8 ||= new TextEncoder();
+    if (off < consumedOff) { consumedOff = 0; consumedBytes = 0; }
+    consumedBytes += utf8.encode(src.slice(consumedOff, off)).length;
+    consumedOff = off;
+    return bom + consumedBytes;
+  };
   let rootClosed = false;
   let sawRoot = false;
-  const checkText = (from, to) => {
+  const checkText = (from, to, inAttribute = false) => {
     const t = src.slice(from, to);
     const amp = /&/g;
     let m;
@@ -1194,7 +1334,13 @@ export function checkXmlWellFormed(content) {
       const named = /^([A-Za-z_:][\w.:-]*)(;?)/.exec(rest);
       if (!named) return err(from + m.index, 'xmlParseEntityRef: no name');
       if (!named[2]) return err(from + m.index, "EntityRef: expecting ';'");
-      if (!['amp', 'lt', 'gt', 'quot', 'apos'].includes(named[1]) && !declaredEntities.has(named[1])) return err(from + m.index, `Entity '${named[1]}' not defined`);
+      if (['amp', 'lt', 'gt', 'quot', 'apos'].includes(named[1])) continue;
+      const ent = declaredEntities.get(named[1]);
+      if (!ent) return err(from + m.index, `Entity '${named[1]}' not defined`);
+      if (ent.value === null) continue;                          // external: not loaded
+      const after = from + m.index + 1 + named[0].length;
+      const loop = loops.reference(named[1], ent, consumedAt(after), inAttribute);
+      if (loop) return [{ line: loop.line ?? lineAt(after), message: loop.message }];
     }
     return null;
   };
@@ -1247,7 +1393,11 @@ export function checkXmlWellFormed(content) {
     if (src.startsWith('<!DOCTYPE', i)) {
       const m = /^<!DOCTYPE(?:[^[>]|\[[\s\S]*?\])*>/.exec(src.slice(i));
       if (!m) return err(i, 'DOCTYPE improperly terminated');
-      for (const d of m[0].matchAll(/<!ENTITY\s+([A-Za-z_][\w.-]*)\s/g)) declaredEntities.add(d[1]);
+      for (const d of m[0].matchAll(/<!ENTITY\s+([A-Za-z_][\w.-]*)\s+(?:"([^"]*)"|'([^']*)'|(SYSTEM|PUBLIC))/g)) {
+        if (declaredEntities.has(d[1])) continue;               // the first declaration binds
+        const value = d[4] ? null : (d[2] ?? d[3]).replace(/\r\n?/g, '\n').replace(/&(#x[0-9a-f]+|#\d+);/gi, charRef);
+        declaredEntities.set(d[1], { value, checked: 0 });
+      }
       i += m[0].length; continue;
     }
     if (src[i + 1] === '/') {                                   // closing tag
@@ -1292,7 +1442,7 @@ export function checkXmlWellFormed(content) {
       let close = j + 1;
       while (close < src.length && src[close] !== q && src[close] !== '<') close++;
       // libxml reads the value left to right: a bad entity reference comes before a '<' or the end
-      const e = checkText(j + 1, close);
+      const e = checkText(j + 1, close, true);
       if (e) return e;
       if (src[close] === '<') return err(close, "Unescaped '<' not allowed in attributes values");
       if (close >= src.length) return err(close, 'AttValue: \' expected');
